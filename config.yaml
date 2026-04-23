@@ -1,0 +1,71 @@
+clob:
+  sdk: "v1"
+  host: "https://clob.polymarket.com"
+  chain_id: 137
+  private_key_env: "POLY_PRIVATE_KEY"
+  api_key_env: "POLY_CLOB_API_KEY"
+  api_secret_env: "POLY_CLOB_SECRET"
+  api_passphrase_env: "POLY_CLOB_PASS_PHRASE"
+  signature_type: 2
+  funder: "0x9acddc1700e32024776557956a76763b676f146a"
+
+gamma:
+  host: "https://gamma-api.polymarket.com"
+
+runtime:
+  loop_interval_seconds: 8
+  dry_run: false
+  cancel_before_requote: true
+  log_dir: "data"
+  auto_scan_enabled: true
+  scan_limit: 200
+  scan_pages: 10
+  scan_candidate_cap: 100
+  rescan_interval_seconds: 900
+
+pricing:
+  min_half_spread: 0.001
+  max_half_spread: 0.03
+  inventory_skew_per_share: 0.002
+  resolution_risk_multiplier: 0.03
+  volatility_multiplier: 0.5
+  book_spread_multiplier: 1.25
+  probability_edge_multiplier: 0.02
+  size_per_order: 20.0
+  quote_improvement_ticks: 0
+
+risk:
+  max_yes_shares_per_market: 75
+  max_no_shares_per_market: 75
+  max_net_delta_per_market: 10
+  max_total_exposure_usdc: 500
+  max_drawdown_usdc: 100
+  min_days_to_resolution: 7
+  min_order_size: 5
+
+filters:
+  min_volume_24h: 10000
+  min_spread_bps: 0
+  categories:
+    - sports
+    - politics
+  excluded_categories:
+    - crypto
+  excluded_keywords:
+    - bitcoin
+    - btc
+    - ethereum
+    - eth
+    - solana
+    - sol
+    - xrp
+    - dogecoin
+    - doge
+    - crypto
+    - cryptocurrency
+    - coinbase
+    - binance
+    - tether
+    - usdt
+
+markets: []

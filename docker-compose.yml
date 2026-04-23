@@ -1,0 +1,21 @@
+version: "3.8"
+
+services:
+  polymarket-mm:
+    build: .
+    container_name: polymarket-mm
+    env_file: .env
+    restart: unless-stopped
+    networks:
+      - trading
+    volumes:
+      - ./data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  trading:
+    driver: bridge
