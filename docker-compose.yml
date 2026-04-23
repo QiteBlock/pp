@@ -5,6 +5,8 @@ services:
     build: .
     container_name: polymarket-mm
     env_file: .env
+    environment:
+      - PYTHONUNBUFFERED=1
     restart: unless-stopped
     networks:
       - trading

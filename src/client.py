@@ -31,11 +31,12 @@ try:
     from py_clob_client.clob_types import BalanceAllowanceParams as V1BalanceAllowanceParams
     from py_clob_client.clob_types import OrderArgs as V1OrderArgs
     from py_clob_client.clob_types import OrderType as V1OrderType
+    from py_clob_client.clob_types import OpenOrderParams as V1OpenOrderParams
     from py_clob_client.clob_types import PartialCreateOrderOptions as V1PartialCreateOrderOptions
     from py_clob_client.order_builder.constants import BUY as V1_BUY
     from py_clob_client.order_builder.constants import SELL as V1_SELL
 except ImportError:  # pragma: no cover
-    V1ClobClient = V1ApiCreds = V1AssetType = V1BalanceAllowanceParams = V1OrderArgs = V1OrderType = V1PartialCreateOrderOptions = None
+    V1ClobClient = V1ApiCreds = V1AssetType = V1BalanceAllowanceParams = V1OrderArgs = V1OrderType = V1OpenOrderParams = V1PartialCreateOrderOptions = None
     V1_BUY = V1_SELL = None
 
 
@@ -280,6 +281,15 @@ class PolymarketClient:
         return self.trading_client.update_balance_allowance(
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         )
+
+    def get_open_orders(self, asset_id: Optional[str] = None) -> Any:
+        self.ensure_api_credentials()
+        if self.trading_client is None:
+            raise RuntimeError("Trading client unavailable.")
+        if self.sdk == "v1":
+            params = V1OpenOrderParams(asset_id=asset_id) if asset_id else None
+            return self.trading_client.get_orders(params)
+        return self.trading_client.get_open_orders()
 
     def check_geoblock(self) -> dict[str, Any]:
         response = self.session.get("https://polymarket.com/api/geoblock", timeout=15)

@@ -7,7 +7,7 @@ clob:
   api_secret_env: "POLY_CLOB_SECRET"
   api_passphrase_env: "POLY_CLOB_PASS_PHRASE"
   signature_type: 2
-  funder: "0x9acddc1700e32024776557956a76763b676f146a"
+  funder: "0x2429CeEe3c7E2160614047AF03F3C3ddF14C0dF3"
 
 gamma:
   host: "https://gamma-api.polymarket.com"
@@ -25,12 +25,12 @@ runtime:
 
 pricing:
   min_half_spread: 0.001
-  max_half_spread: 0.03
+  max_half_spread: 0.015
   inventory_skew_per_share: 0.002
   resolution_risk_multiplier: 0.03
   volatility_multiplier: 0.5
-  book_spread_multiplier: 1.25
-  probability_edge_multiplier: 0.02
+  book_spread_multiplier: 0.75
+  probability_edge_multiplier: 0.005
   size_per_order: 20.0
   quote_improvement_ticks: 0
 

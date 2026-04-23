@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from src.market_maker import load_context, select_best_market
+from src.market_maker import load_context, round_no_bid_price, select_best_market
 from src.pricing import build_yes_quote
 from src.signals import build_signal
 from src.client import format_tick_size
@@ -37,25 +37,30 @@ def main() -> None:
         print("server_version=v1-sdk")
     print(f"tick_size={book.tick_size} formatted={format_tick_size(book.tick_size)}")
     print(f"top=({book.best_bid},{book.best_ask}) quote=({quote.bid},{quote.ask})")
-    for side, price in (("BUY", quote.bid), ("SELL", quote.ask)):
+    legs = (
+        ("BUY_YES", market.yes_token_id, quote.bid),
+        ("BUY_NO", market.no_token_id, round_no_bid_price(quote.ask, book.tick_size)),
+    )
+    for label, token_id, price in legs:
         if context.client.sdk == "v1":
-            order_side = context.client.v1_buy_sell(side)
+            order_side = context.client.v1_buy_sell("BUY")
             order = context.client.trading_client.create_order(
-                context.client.build_v1_order_args(market.yes_token_id, price, quote.size, order_side),
+                context.client.build_v1_order_args(token_id, price, quote.size, order_side),
                 context.client.v1_order_options(book.tick_size, market.neg_risk),
             )
         else:
             order = context.client.trading_client.create_order(
                 context.client.build_order_args(
-                    market.yes_token_id,
+                    token_id,
                     price,
                     quote.size,
-                    Side.BUY if side == "BUY" else Side.SELL,
+                    Side.BUY,
                 ),
                 PartialCreateOrderOptions(tick_size=format_tick_size(book.tick_size), neg_risk=market.neg_risk),
             )
-        print(f"{side} order_class={order.__class__.__name__}")
-        print(f"{side} signature_prefix={getattr(order, 'signature', '')[:12]}")
+        print(f"{label} token={token_id}")
+        print(f"{label} order_class={order.__class__.__name__}")
+        print(f"{label} signature_prefix={getattr(order, 'signature', '')[:12]}")
 
 
 if __name__ == "__main__":

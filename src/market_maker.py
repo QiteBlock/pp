@@ -142,10 +142,11 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             dry_run=context.dry_run,
             neg_risk=market.neg_risk,
         )
+        no_bid_price = round_no_bid_price(quote.ask, book.tick_size)
         ask_response = context.client.place_limit_order(
-            token_id=market.yes_token_id,
-            side="SELL",
-            price=quote.ask,
+            token_id=market.no_token_id,
+            side="BUY",
+            price=no_bid_price,
             size=quote.size,
             tick_size=book.tick_size,
             dry_run=context.dry_run,
@@ -166,6 +167,7 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             "fair_value": quote.fair_value,
             "bid": quote.bid,
             "ask": quote.ask,
+            "no_bid": no_bid_price,
             "half_spread": quote.half_spread,
             "inventory_yes": inventory.yes_shares,
             "inventory_no": inventory.no_shares,
@@ -173,13 +175,61 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
         },
     )
     print_quote_status(market, book, quote.fair_value, quote.bid, quote.ask, inventory.net_delta)
+    print_order_response("YES bid", bid_response)
+    print_order_response("NO bid", ask_response)
+    print_open_orders(context, market)
 
 
 def print_quote_status(market: MarketConfig, book: OrderBookSnapshot, fair_value: float, bid: float, ask: float, net_delta: float) -> None:
+    no_bid = round_no_bid_price(ask, book.tick_size)
     print(
         f"[{market.slug}] fair={fair_value:.3f} "
-        f"top=({book.best_bid},{book.best_ask}) quote=({bid:.3f},{ask:.3f}) delta={net_delta:.1f}"
+        f"top=({book.best_bid},{book.best_ask}) yes_bid={bid:.3f} yes_ask={ask:.3f} no_bid={no_bid:.3f} delta={net_delta:.1f}"
     )
+
+
+def print_order_response(label: str, response: Any) -> None:
+    if isinstance(response, dict):
+        order_id = response.get("orderID") or response.get("order_id") or response.get("id")
+        status = response.get("status") or response.get("success") or response.get("errorMsg") or response.get("error")
+        if order_id or status:
+            print(f"  {label}: status={status} order_id={order_id}")
+            return
+    print(f"  {label}: response={response}")
+
+
+def print_open_orders(context: BotContext, market: MarketConfig) -> None:
+    try:
+        yes_orders = normalize_open_orders(context.client.get_open_orders(asset_id=market.yes_token_id))
+        no_orders = normalize_open_orders(context.client.get_open_orders(asset_id=market.no_token_id))
+    except Exception as exc:
+        print(f"  open orders check failed: {exc}")
+        return
+    orders = yes_orders + no_orders
+    print(f"  open_orders={len(orders)}")
+    for order in orders[:6]:
+        print(
+            "   "
+            f"id={short_id(order.get('id'))} side={order.get('side')} outcome={order.get('outcome')} "
+            f"price={order.get('price')} size={order.get('original_size') or order.get('size')}"
+        )
+
+
+def normalize_open_orders(response: Any) -> list[dict[str, Any]]:
+    if isinstance(response, list):
+        return response
+    if isinstance(response, dict):
+        data = response.get("data") or response.get("orders") or response.get("results")
+        if isinstance(data, list):
+            return data
+    return []
+
+
+def short_id(value: Any) -> str:
+    text = str(value or "")
+    if len(text) <= 14:
+        return text
+    return f"{text[:8]}...{text[-6:]}"
 
 
 def passes_post_only_guard(book: OrderBookSnapshot, bid: float, ask: float) -> bool:
@@ -194,6 +244,12 @@ def passes_post_only_guard(book: OrderBookSnapshot, bid: float, ask: float) -> b
 
 def is_trading_restricted_error(exc: Exception) -> bool:
     return "Trading restricted in your region" in str(exc)
+
+
+def round_no_bid_price(yes_ask: float, tick_size: float) -> float:
+    tick = max(tick_size, 0.01)
+    raw = max(0.01, min(0.99, 1.0 - yes_ask))
+    return round(int(raw / tick) * tick, 4)
 
 
 def validate_market_config(markets: list[MarketConfig]) -> None:

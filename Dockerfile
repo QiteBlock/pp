@@ -2,6 +2,8 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
+ENV PYTHONUNBUFFERED=1
+
 ARG BUILD_DATE
 RUN echo "Build date: $BUILD_DATE"
 
