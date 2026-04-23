@@ -21,6 +21,8 @@ def main() -> None:
     market = select_best_market(context)
     if market is None:
         raise SystemExit("No market selected")
+    if market.neg_risk is None:
+        market.neg_risk = context.client.get_neg_risk(market.yes_token_id)
     book = context.client.get_orderbook(market.yes_token_id)
     recent_prices = context.client.fetch_market_history(market.yes_token_id)
     signal = build_signal(book.midpoint, book.last_trade_price, recent_prices, market.end_date)
@@ -39,7 +41,8 @@ def main() -> None:
         if context.client.sdk == "v1":
             order_side = context.client.v1_buy_sell(side)
             order = context.client.trading_client.create_order(
-                context.client.build_v1_order_args(market.yes_token_id, price, quote.size, order_side)
+                context.client.build_v1_order_args(market.yes_token_id, price, quote.size, order_side),
+                context.client.v1_order_options(book.tick_size, market.neg_risk),
             )
         else:
             order = context.client.trading_client.create_order(

@@ -31,10 +31,11 @@ try:
     from py_clob_client.clob_types import BalanceAllowanceParams as V1BalanceAllowanceParams
     from py_clob_client.clob_types import OrderArgs as V1OrderArgs
     from py_clob_client.clob_types import OrderType as V1OrderType
+    from py_clob_client.clob_types import PartialCreateOrderOptions as V1PartialCreateOrderOptions
     from py_clob_client.order_builder.constants import BUY as V1_BUY
     from py_clob_client.order_builder.constants import SELL as V1_SELL
 except ImportError:  # pragma: no cover
-    V1ClobClient = V1ApiCreds = V1AssetType = V1BalanceAllowanceParams = V1OrderArgs = V1OrderType = None
+    V1ClobClient = V1ApiCreds = V1AssetType = V1BalanceAllowanceParams = V1OrderArgs = V1OrderType = V1PartialCreateOrderOptions = None
     V1_BUY = V1_SELL = None
 
 
@@ -191,7 +192,7 @@ class PolymarketClient:
         if self.trading_client is None or OrderArgs is None:
             raise RuntimeError("py_clob_client_v2 is not installed.")
         if self.sdk == "v1":
-            return self.place_v1_limit_order(token_id, side, price, size, dry_run)
+            return self.place_v1_limit_order(token_id, side, price, size, tick_size, dry_run, neg_risk)
         order_side = Side.BUY if side.upper() == "BUY" else Side.SELL
         order_args = self.build_order_args(token_id, price, size, order_side)
         return self.trading_client.create_and_post_order(
@@ -206,13 +207,23 @@ class PolymarketClient:
             return OrderArgsV2(token_id=token_id, price=price, size=size, side=order_side)
         return OrderArgs(token_id=token_id, price=price, size=size, side=order_side)
 
-    def place_v1_limit_order(self, token_id: str, side: str, price: float, size: float, dry_run: bool) -> dict[str, Any]:
+    def place_v1_limit_order(
+        self,
+        token_id: str,
+        side: str,
+        price: float,
+        size: float,
+        tick_size: float,
+        dry_run: bool,
+        neg_risk: Optional[bool],
+    ) -> dict[str, Any]:
         if dry_run:
             return {"status": "dry_run", "token_id": token_id, "side": side, "price": price, "size": size}
-        if self.trading_client is None or V1OrderArgs is None:
+        if self.trading_client is None or V1OrderArgs is None or V1PartialCreateOrderOptions is None:
             raise RuntimeError("py-clob-client is not installed. Run `pip install -r requirements.txt`.")
         order_args = self.build_v1_order_args(token_id, price, size, self.v1_buy_sell(side))
-        signed_order = self.trading_client.create_order(order_args)
+        options = self.v1_order_options(tick_size, neg_risk)
+        signed_order = self.trading_client.create_order(order_args, options)
         try:
             return self.trading_client.post_order(signed_order, V1OrderType.GTC, post_only=True)
         except TypeError:
@@ -223,6 +234,9 @@ class PolymarketClient:
 
     def build_v1_order_args(self, token_id: str, price: float, size: float, order_side: Any) -> Any:
         return V1OrderArgs(token_id=token_id, price=price, size=size, side=order_side)
+
+    def v1_order_options(self, tick_size: float, neg_risk: Optional[bool]) -> Any:
+        return V1PartialCreateOrderOptions(tick_size=format_tick_size(tick_size), neg_risk=neg_risk)
 
     def cancel_all_orders(self, dry_run: bool = True) -> Any:
         if dry_run:
@@ -249,6 +263,11 @@ class PolymarketClient:
         return self.trading_client.get_balance_allowance(
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         )
+
+    def get_neg_risk(self, token_id: str) -> bool:
+        if self.trading_client is None:
+            raise RuntimeError("Trading client unavailable.")
+        return bool(self.trading_client.get_neg_risk(token_id))
 
     def update_collateral_balance_allowance(self) -> dict[str, Any]:
         self.ensure_api_credentials()

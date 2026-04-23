@@ -99,6 +99,8 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
         )
         print(f"[{market.slug}] skipped: failed to fetch YES orderbook for token {market.yes_token_id}")
         return
+    if market.neg_risk is None:
+        market.neg_risk = context.client.get_neg_risk(market.yes_token_id)
     recent_prices = context.client.fetch_market_history(market.yes_token_id)
     signal = build_signal(book.midpoint, book.last_trade_price, recent_prices, market.end_date)
     inventory = context.inventory.get(market.slug)
@@ -329,13 +331,20 @@ def select_best_market(context: BotContext) -> Optional[MarketConfig]:
         spread_bps = ((book.spread or 0.0) * 10000.0)
         if spread_bps < float(context.filters.get("min_spread_bps", 0.0)):
             continue
+        neg_risk = normalized.get("neg_risk")
+        if neg_risk is None:
+            try:
+                neg_risk = context.client.get_neg_risk(normalized["yes_token_id"])
+            except Exception as exc:
+                context.analytics.log_event("scan_neg_risk_error", {"market": normalized["slug"], "details": str(exc)})
+                neg_risk = None
         market = MarketConfig(
             slug=normalized["slug"],
             question=normalized["question"],
             yes_token_id=normalized["yes_token_id"],
             no_token_id=normalized["no_token_id"],
             end_date=parse_end_date(normalized.get("end_date")),
-            neg_risk=normalized.get("neg_risk"),
+            neg_risk=neg_risk,
         )
         score = score_market_candidate(normalized["volume_24h"], spread_bps)
         candidates.append((score, market))
