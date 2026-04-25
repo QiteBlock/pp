@@ -4,3 +4,6 @@ __pycache__/
 .vendor/
 data/*.csv
 data/*.jsonl
+data/fill_state.json
+data/bot_state.json
+data/telegram_state.json

@@ -317,6 +317,52 @@ class PolymarketClient:
         history = payload.get("history", payload if isinstance(payload, list) else [])
         return [_to_float(point.get("p")) for point in history if _to_float(point.get("p")) is not None]
 
+    def get_user_fills(self, since_ts: Optional[int] = None) -> list[dict[str, Any]]:
+        """Fetch fills for the authenticated user since a given timestamp (milliseconds).
+        If since_ts is None, fetches recent fills from the API (typically last 24-48 hours).
+        Returns list of fill records with structure: {id, token_id, symbol, price, size, side, timestamp, ...}
+        """
+        self.ensure_api_credentials()
+        if self.trading_client is None:
+            raise RuntimeError("Trading client unavailable.")
+        try:
+            if self.sdk == "v1":
+                if hasattr(self.trading_client, "get_fills"):
+                    return self.trading_client.get_fills()
+                if hasattr(self.trading_client, "get_trades"):
+                    return self.trading_client.get_trades()
+            else:
+                if hasattr(self.trading_client, "get_fills"):
+                    params = {"since_timestamp": since_ts} if since_ts is not None else {}
+                    return self.trading_client.get_fills(**params)
+                if hasattr(self.trading_client, "get_trades"):
+                    return self.trading_client.get_trades()
+        except Exception as exc:
+            print(f"Warning: Failed to fetch fills from trading client: {exc}")
+        return []
+
+    def get_user_positions(self) -> dict[str, Any]:
+        """Fetch user's current positions (balances of each outcome token).
+        Returns dict mapping token_id to balance amount.
+        """
+        self.ensure_api_credentials()
+        if self.trading_client is None:
+            raise RuntimeError("Trading client unavailable.")
+        try:
+            if self.sdk == "v1":
+                if hasattr(self.trading_client, "get_balances"):
+                    return self.trading_client.get_balances()
+                if hasattr(self.trading_client, "get_positions"):
+                    return self.trading_client.get_positions()
+            else:
+                if hasattr(self.trading_client, "get_user_balances"):
+                    return self.trading_client.get_user_balances()
+                if hasattr(self.trading_client, "get_positions"):
+                    return self.trading_client.get_positions()
+        except Exception as exc:
+            print(f"Warning: Failed to fetch positions from trading client: {exc}")
+        return {}
+
 
 def parse_market_configs(raw_markets: list[dict[str, Any]]) -> list[MarketConfig]:
     result: list[MarketConfig] = []

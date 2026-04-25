@@ -12,6 +12,14 @@ clob:
 gamma:
   host: "https://gamma-api.polymarket.com"
 
+telegram:
+  enabled: true
+  bot_token_env: "TELEGRAM_BOT_TOKEN"
+  chat_id_env: "TELEGRAM_CHAT_ID"
+  poll_timeout_seconds: 0
+  notify_fills: true
+  notify_market_switch: true
+
 runtime:
   loop_interval_seconds: 8
   dry_run: false

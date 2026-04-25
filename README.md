@@ -48,6 +48,23 @@ Create `.env` from `.env.example`, then run:
 docker compose up --build -d
 ```
 
+## Telegram Control
+
+Set these in `.env` and enable the section in `config.yaml`:
+
+```bash
+TELEGRAM_BOT_TOKEN=...
+TELEGRAM_CHAT_ID=...
+```
+
+Supported commands:
+
+- `/start` resumes trading
+- `/stop` pauses trading and cancels live orders
+- `/status` returns bot status and inventory
+
+When enabled, the bot also pushes fill notifications and market-switch notifications to Telegram.
+
 ## Scan markets
 
 ```bash

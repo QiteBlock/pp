@@ -10,10 +10,14 @@ import yaml
 
 from .analytics import AnalyticsWriter
 from .client import MarketConfig, PolymarketClient, OrderBookSnapshot, normalize_gamma_market, parse_market_configs
+from .fills import FillPoller
 from .inventory import InventoryBook
+from .order_duplicates import OrderDuplicateDetector
 from .pricing import PricingConfig, build_yes_quote
+from .reconcile import PositionReconciler
 from .risk import RiskConfig, can_quote_market, total_exposure
 from .signals import build_signal
+from .telegram_bot import BotControl, TelegramController
 
 
 @dataclass
@@ -24,6 +28,11 @@ class BotContext:
     risk: RiskConfig
     inventory: InventoryBook
     analytics: AnalyticsWriter
+    fill_poller: FillPoller
+    reconciler: PositionReconciler
+    duplicate_detector: OrderDuplicateDetector
+    control: BotControl
+    telegram: TelegramController
     loop_interval_seconds: int
     dry_run: bool
     cancel_before_requote: bool
@@ -39,28 +48,58 @@ class BotContext:
 
 def run_market_maker(config_path: str) -> None:
     context = load_context(config_path)
-    initialize_market_selection(context)
-    print(f"Loaded {len(context.markets)} configured markets. Dry run={context.dry_run}. Auto-scan={context.auto_scan_enabled}.")
-    if not context.dry_run:
-        preflight_live_auth(context)
-    while True:
-        refresh_market_selection(context)
-        mark_prices: dict[str, float] = {}
-        if context.cancel_before_requote:
-            context.client.cancel_all_orders(dry_run=context.dry_run)
-        markets_to_quote = get_markets_to_quote(context)
-        if not markets_to_quote:
-            print("No eligible market selected. Sleeping before next rescan.")
+    try:
+        initialize_market_selection(context)
+        print(f"Loaded {len(context.markets)} configured markets. Dry run={context.dry_run}. Auto-scan={context.auto_scan_enabled}.")
+        if not context.dry_run:
+            preflight_live_auth(context)
+            reconciliation_report = context.reconciler.reconcile_startup(context.markets)
+            print(f"Startup reconciliation: {reconciliation_report.summary()}")
+            context.analytics.log_event("startup_reconciliation", {
+                "status": reconciliation_report.status,
+                "discrepancies_count": len(reconciliation_report.discrepancies),
+                "adjustments_count": len(reconciliation_report.adjustments),
+                "error": reconciliation_report.error,
+            })
+            if not reconciliation_report.should_proceed_with_trading():
+                raise RuntimeError(f"Startup reconciliation failed - cannot proceed safely: {reconciliation_report.error}")
+        if context.telegram.is_enabled():
+            context.telegram.send_message(build_status_message(context, prefix="Bot process online"))
+        while True:
+            handle_telegram_commands(context)
+            refresh_market_selection(context)
+            mark_prices: dict[str, float] = {}
+
+            if not context.dry_run:
+                token_mapping = _build_token_mapping(context)
+                fills_processed = context.fill_poller.poll_fills(token_mapping)
+                if fills_processed > 0:
+                    print(f"Processed {fills_processed} new fill(s)")
+
+            if not context.control.trading_enabled:
+                print("Trading paused by Telegram control.")
+                time.sleep(context.loop_interval_seconds)
+                continue
+
+            if context.cancel_before_requote:
+                context.client.cancel_all_orders(dry_run=context.dry_run)
+            markets_to_quote = get_markets_to_quote(context)
+            if not markets_to_quote:
+                print("No eligible market selected. Sleeping before next rescan.")
+                time.sleep(context.loop_interval_seconds)
+                continue
+            for market in markets_to_quote:
+                process_market(context, market, mark_prices)
+            exposure = total_exposure(context.inventory, mark_prices)
+            context.analytics.log_event(
+                "portfolio_snapshot",
+                {"total_exposure_usdc": exposure, "markets": len(mark_prices), "active_market": context.active_market.slug if context.active_market else None},
+            )
             time.sleep(context.loop_interval_seconds)
-            continue
-        for market in markets_to_quote:
-            process_market(context, market, mark_prices)
-        exposure = total_exposure(context.inventory, mark_prices)
-        context.analytics.log_event(
-            "portfolio_snapshot",
-            {"total_exposure_usdc": exposure, "markets": len(mark_prices), "active_market": context.active_market.slug if context.active_market else None},
-        )
-        time.sleep(context.loop_interval_seconds)
+    except Exception as exc:
+        if "context" in locals() and context.telegram.is_enabled():
+            context.telegram.send_message(f"Bot stopped with error\nerror={exc}")
+        raise
 
 
 def load_context(config_path: str) -> BotContext:
@@ -68,13 +107,28 @@ def load_context(config_path: str) -> BotContext:
     with config_file.open("r", encoding="utf-8") as handle:
         config = yaml.safe_load(handle)
     runtime = config["runtime"]
+    client = PolymarketClient(config)
+    markets = parse_market_configs(config.get("markets", []))
+    inventory = InventoryBook()
+    analytics = AnalyticsWriter(runtime["log_dir"])
+    control = BotControl(runtime["log_dir"])
+    telegram = TelegramController(config.get("telegram", {}), runtime["log_dir"])
+    fill_poller = FillPoller(client, inventory, analytics, runtime["log_dir"], fill_handler=telegram.notify_fill)
+    reconciler = PositionReconciler(client, inventory)
+    duplicate_detector = OrderDuplicateDetector(runtime["log_dir"])
+    
     return BotContext(
-        client=PolymarketClient(config),
-        markets=parse_market_configs(config.get("markets", [])),
+        client=client,
+        markets=markets,
         pricing=PricingConfig(**config["pricing"]),
         risk=RiskConfig(**config["risk"]),
-        inventory=InventoryBook(),
-        analytics=AnalyticsWriter(runtime["log_dir"]),
+        inventory=inventory,
+        analytics=analytics,
+        fill_poller=fill_poller,
+        reconciler=reconciler,
+        duplicate_detector=duplicate_detector,
+        control=control,
+        telegram=telegram,
         loop_interval_seconds=int(runtime["loop_interval_seconds"]),
         dry_run=bool(runtime["dry_run"]),
         cancel_before_requote=bool(runtime.get("cancel_before_requote", True)),
@@ -87,6 +141,21 @@ def load_context(config_path: str) -> BotContext:
         active_market=None,
         filters=config.get("filters", {}),
     )
+
+
+def _build_token_mapping(context: BotContext) -> dict[str, tuple[str, str]]:
+    """Build mapping from token_id to (market_slug, outcome).
+    
+    Used for mapping API fills to inventory positions.
+    """
+    mapping = {}
+    markets = list(context.markets)
+    if context.active_market is not None and all(market.slug != context.active_market.slug for market in markets):
+        markets.append(context.active_market)
+    for market in markets:
+        mapping[market.yes_token_id] = (market.slug, "YES")
+        mapping[market.no_token_id] = (market.slug, "NO")
+    return mapping
 
 
 def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[str, float]) -> None:
@@ -132,6 +201,32 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
         )
         print(f"[{market.slug}] skipped: post-only guard blocked marketable quote ({quote.bid:.3f},{quote.ask:.3f})")
         return
+    
+    # Check for duplicate orders before placing new ones
+    if not context.dry_run:
+        no_bid_price = round_no_bid_price(quote.ask, book.tick_size)
+        duplicate_check = context.duplicate_detector.detect_duplicates(
+            context.client,
+            market.slug,
+            market.yes_token_id,
+            market.no_token_id,
+            quote.bid,
+            no_bid_price,
+            quote.size,
+        )
+        if duplicate_check.has_duplicates:
+            context.analytics.log_event(
+                "duplicate_order_skip",
+                {
+                    "market": market.slug,
+                    "reason": "duplicate_orders_detected",
+                    "duplicate_count": len(duplicate_check.duplicate_orders),
+                    "duplicates": duplicate_check.duplicate_orders,
+                },
+            )
+            print(f"[{market.slug}] skipped: found {len(duplicate_check.duplicate_orders)} duplicate order(s)")
+            return
+    
     try:
         bid_response = context.client.place_limit_order(
             token_id=market.yes_token_id,
@@ -213,6 +308,63 @@ def print_open_orders(context: BotContext, market: MarketConfig) -> None:
             f"id={short_id(order.get('id'))} side={order.get('side')} outcome={order.get('outcome')} "
             f"price={order.get('price')} size={order.get('original_size') or order.get('size')}"
         )
+
+
+def handle_telegram_commands(context: BotContext) -> None:
+    commands = context.telegram.poll_commands()
+    for command in commands:
+        context.analytics.log_event("telegram_command", {"command": command})
+        if command == "help":
+            context.telegram.send_message(
+                "Commands\n"
+                "/start resume trading\n"
+                "/stop pause trading and cancel live orders\n"
+                "/status show current bot status"
+            )
+            continue
+        if command == "status":
+            context.telegram.send_message(build_status_message(context, prefix="Bot status"))
+            continue
+        if command == "start":
+            already_running = context.control.trading_enabled
+            context.control.enable("telegram:/start")
+            prefix = "Trading already running" if already_running else "Trading resumed"
+            context.telegram.send_message(build_status_message(context, prefix=prefix))
+            continue
+        if command == "stop":
+            already_stopped = not context.control.trading_enabled
+            context.control.disable("telegram:/stop")
+            cancel_result = "dry_run_no_cancel" if context.dry_run else "cancel_all_ok"
+            if not context.dry_run:
+                try:
+                    context.client.cancel_all_orders(dry_run=False)
+                except Exception as exc:
+                    cancel_result = f"cancel_all_failed: {exc}"
+                    context.analytics.log_event("telegram_stop_cancel_error", {"error": str(exc)})
+            prefix = "Trading already paused" if already_stopped else "Trading paused"
+            context.telegram.send_message(build_status_message(context, prefix=f"{prefix}\n{cancel_result}"))
+
+
+def build_status_message(context: BotContext, prefix: str) -> str:
+    active_market = context.active_market.slug if context.active_market else "none"
+    inventory_lines: list[str] = []
+    for market_key, market_inventory in sorted(context.inventory.markets.items()):
+        if market_inventory.gross_shares <= 0:
+            continue
+        inventory_lines.append(
+            f"{market_key}: YES={market_inventory.yes_shares:.4f} "
+            f"NO={market_inventory.no_shares:.4f} delta={market_inventory.net_delta:.4f}"
+        )
+    inventory_text = "\n".join(inventory_lines[:5]) if inventory_lines else "flat"
+    return (
+        f"{prefix}\n"
+        f"trading_enabled={context.control.trading_enabled}\n"
+        f"dry_run={context.dry_run}\n"
+        f"active_market={active_market}\n"
+        f"loop_interval_seconds={context.loop_interval_seconds}\n"
+        f"last_control_source={context.control.state.source}\n"
+        f"inventory={inventory_text}"
+    )
 
 
 def normalize_open_orders(response: Any) -> list[dict[str, Any]]:
@@ -300,6 +452,7 @@ def refresh_market_selection(context: BotContext, force: bool = False) -> None:
             {"previous_market": previous, "new_market": selected.slug, "question": selected.question},
         )
         print(f"Selected market: {selected.slug} | {selected.question}")
+        context.telegram.notify_market_switch(previous, selected.slug, selected.question)
     else:
         context.active_market = selected
 
