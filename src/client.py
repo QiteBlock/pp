@@ -397,6 +397,7 @@ def normalize_gamma_market(item: dict[str, Any]) -> Optional[dict[str, Any]]:
         "no_token_id": parsed_token_ids[1],
         "accepting_orders": bool(item.get("acceptingOrders", True)),
         "neg_risk": _to_bool(item.get("negRisk") or item.get("neg_risk")),
+        "reference_price": _extract_reference_price(item),
     }
 
 
@@ -416,6 +417,34 @@ def _parse_token_ids(token_ids: Any) -> list[str]:
                 return []
         return [part.strip() for part in stripped.split(",") if part.strip()]
     return []
+
+
+def _extract_reference_price(item: dict[str, Any]) -> Optional[float]:
+    direct_candidates = (
+        item.get("lastTradePrice"),
+        item.get("last_trade_price"),
+        item.get("price"),
+        item.get("yesPrice"),
+        item.get("yes_price"),
+    )
+    for candidate in direct_candidates:
+        parsed = _to_float(candidate)
+        if parsed is not None:
+            return parsed
+
+    outcome_prices = item.get("outcomePrices") or item.get("outcome_prices")
+    if isinstance(outcome_prices, list) and outcome_prices:
+        return _to_float(outcome_prices[0])
+    if isinstance(outcome_prices, str):
+        stripped = outcome_prices.strip()
+        if stripped.startswith("["):
+            try:
+                parsed = json.loads(stripped)
+                if isinstance(parsed, list) and parsed:
+                    return _to_float(parsed[0])
+            except json.JSONDecodeError:
+                return None
+    return None
 
 
 def _parse_datetime(value: Any) -> Optional[datetime]:

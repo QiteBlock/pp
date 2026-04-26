@@ -15,7 +15,7 @@ from .inventory import InventoryBook
 from .order_duplicates import OrderDuplicateDetector
 from .pricing import PricingConfig, build_yes_quote, clamp_probability, round_to_tick
 from .reconcile import PositionReconciler
-from .risk import RiskConfig, can_quote_market, total_exposure
+from .risk import RiskConfig, can_quote_market, exposure_by_market, total_exposure
 from .signals import build_signal
 from .telegram_bot import BotControl, TelegramController
 
@@ -41,6 +41,7 @@ class BotContext:
     scan_pages: int
     scan_candidate_cap: int
     max_active_markets: int
+    unwind_escalation_cycles: int
     rescan_interval_seconds: int
     last_scan_ts: float
     active_market: Optional[MarketConfig]
@@ -144,6 +145,7 @@ def load_context(config_path: str) -> BotContext:
         scan_pages=int(runtime.get("scan_pages", 3)),
         scan_candidate_cap=int(runtime.get("scan_candidate_cap", 25)),
         max_active_markets=max(int(runtime.get("max_active_markets", 1)), 1),
+        unwind_escalation_cycles=max(int(runtime.get("unwind_escalation_cycles", 3)), 1),
         rescan_interval_seconds=int(runtime.get("rescan_interval_seconds", 900)),
         last_scan_ts=0.0,
         active_market=None,
@@ -190,9 +192,28 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
     inventory = context.inventory.get(market.slug)
     inventory_bias = inventory.net_delta
     quote = build_yes_quote(context.pricing, signal, inventory_bias, book.tick_size, book.spread)
-    allowed, reason = can_quote_market(context.risk, inventory, quote.fair_value, signal.time_to_resolution_days)
     mark_prices[market.slug] = quote.fair_value
+    portfolio_exposure = total_exposure(context.inventory, mark_prices)
+    contribution_map = exposure_by_market(context.inventory, mark_prices)
+    largest_contributor = max(contribution_map, key=contribution_map.get, default=None)
+    allowed, reason = can_quote_market(context.risk, inventory, quote.fair_value, signal.time_to_resolution_days)
     if not allowed:
+        if (
+            should_trim_position(reason)
+            and portfolio_exposure > context.risk.max_total_exposure_usdc
+            and largest_contributor == market.slug
+        ):
+            process_unwind_market(
+                context,
+                market,
+                inventory,
+                quote,
+                book,
+                f"{reason} escalated by portfolio exposure",
+                mode="flatten",
+                aggressive=True,
+            )
+            return
         if should_trim_position(reason):
             process_unwind_market(context, market, inventory, quote, book, reason, mode="trim", aggressive=False)
             return
@@ -214,7 +235,6 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             f"yes={inventory.yes_shares:.4f} no={inventory.no_shares:.4f} delta={inventory.net_delta:.4f}"
         )
         return
-    portfolio_exposure = total_exposure(context.inventory, mark_prices)
     if portfolio_exposure > context.risk.max_total_exposure_usdc:
         if inventory.gross_shares > 0.01:
             process_unwind_market(
@@ -342,7 +362,18 @@ def process_unwind_market(
                 f"reason={reason}\n"
                 "trading paused, attempting unwind"
             )
-    order_request = build_unwind_order_request(context, market, inventory, quote, yes_book, mode=mode, aggressive=aggressive)
+    effective_aggressive = aggressive or (
+        mode == "trim" and inventory.unwind_cycles_without_fill >= context.unwind_escalation_cycles
+    )
+    order_request = build_unwind_order_request(
+        context,
+        market,
+        inventory,
+        quote,
+        yes_book,
+        mode=mode,
+        aggressive=effective_aggressive,
+    )
     if order_request is None:
         context.analytics.log_event(
             "unwind_skip",
@@ -350,7 +381,7 @@ def process_unwind_market(
                 "market": market.slug,
                 "reason": reason,
                 "mode": mode,
-                "aggressive": aggressive,
+                "aggressive": effective_aggressive,
                 "inventory_yes": inventory.yes_shares,
                 "inventory_no": inventory.no_shares,
                 "delta": inventory.net_delta,
@@ -380,7 +411,7 @@ def process_unwind_market(
                 "market": market.slug,
                 "reason": reason,
                 "mode": mode,
-                "aggressive": aggressive,
+                "aggressive": effective_aggressive,
                 "order_request": order_request,
             },
         )
@@ -392,7 +423,7 @@ def process_unwind_market(
             "market": market.slug,
             "reason": reason,
             "mode": mode,
-            "aggressive": aggressive,
+            "aggressive": effective_aggressive,
             "inventory_yes": inventory.yes_shares,
             "inventory_no": inventory.no_shares,
             "delta": inventory.net_delta,
@@ -401,9 +432,11 @@ def process_unwind_market(
         },
     )
     print(
-        f"[{market.slug}] unwind-only: mode={mode} aggressive={aggressive} reason={reason} "
+        f"[{market.slug}] unwind-only: mode={mode} aggressive={effective_aggressive} reason={reason} "
         f"placing {order_request['label']} price={order_request['price']:.3f} size={order_request['size']:.4f}"
     )
+    if mode == "trim":
+        inventory.unwind_cycles_without_fill += 1
     print_order_response(order_request["label"], response)
     print_open_orders(context, market)
 
@@ -958,12 +991,29 @@ def market_passes_filters(market: dict[str, Any], filters: dict[str, Any], min_d
         return False
     if float(market.get("volume_24h", 0.0)) < float(filters.get("min_volume_24h", 0.0)):
         return False
+    reference_price = market.get("reference_price")
+    min_fair_value = _to_optional_float(filters.get("min_fair_value"))
+    max_fair_value = _to_optional_float(filters.get("max_fair_value"))
+    if reference_price is not None:
+        if min_fair_value is not None and reference_price < min_fair_value:
+            return False
+        if max_fair_value is not None and reference_price > max_fair_value:
+            return False
     end_date = parse_end_date(market.get("end_date"))
     if end_date is not None:
         days_left = max((end_date - datetime.now(timezone.utc)).total_seconds() / 86400.0, 0.0)
         if days_left < min_days:
             return False
     return True
+
+
+def _to_optional_float(value: Any) -> Optional[float]:
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def score_market_candidate(volume_24h: float, spread_bps: float) -> float:

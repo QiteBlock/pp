@@ -29,6 +29,13 @@ def total_exposure(book: InventoryBook, mark_prices: dict[str, float]) -> float:
     return total
 
 
+def exposure_by_market(book: InventoryBook, mark_prices: dict[str, float]) -> dict[str, float]:
+    result: dict[str, float] = {}
+    for market_key, inventory in book.markets.items():
+        result[market_key] = compute_market_exposure(inventory, mark_prices.get(market_key, 0.5))
+    return result
+
+
 def can_quote_market(config: RiskConfig, inventory: MarketInventory, fair_value: float, days_to_resolution: float) -> tuple[bool, str]:
     if inventory.yes_shares > config.max_yes_shares_per_market:
         return False, "yes inventory limit breached"
