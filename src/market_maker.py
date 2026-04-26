@@ -332,6 +332,16 @@ def process_unwind_market(
     mode: str,
     aggressive: bool,
 ) -> None:
+    if reason == "drawdown limit breached":
+        context.control.disable("risk:drawdown")
+        context.analytics.log_event("drawdown_kill_switch", {"market": market.slug, "reason": reason})
+        if context.telegram.is_enabled():
+            context.telegram.send_message(
+                "Drawdown kill switch triggered\n"
+                f"market={market.slug}\n"
+                f"reason={reason}\n"
+                "trading paused, attempting unwind"
+            )
     order_request = build_unwind_order_request(context, market, inventory, quote, yes_book, mode=mode, aggressive=aggressive)
     if order_request is None:
         context.analytics.log_event(
@@ -361,6 +371,7 @@ def process_unwind_market(
             tick_size=order_request["tick_size"],
             dry_run=context.dry_run,
             neg_risk=market.neg_risk,
+            post_only=not aggressive,
         )
     except Exception:
         context.analytics.log_event(
@@ -502,23 +513,21 @@ def build_flatten_order_request(
 
     if unwind_no_first:
         no_book = get_market_book(context, market.no_token_id)
-        if no_book is None:
-            return None
-        size = bounded_unwind_size(
-            requested_size=inventory.no_shares,
-            available_size=inventory.no_shares,
-            min_order_size=context.risk.min_order_size,
-        )
-        if size is None:
-            return None
-        return {
-            "token_id": market.no_token_id,
-            "side": "SELL",
-            "price": derive_sell_price(no_book, 1.0 - quote.fair_value, quote.half_spread, aggressive=aggressive),
-            "size": size,
-            "tick_size": no_book.tick_size,
-            "label": "NO flatten ask",
-        }
+        if no_book is not None:
+            size = bounded_unwind_size(
+                requested_size=inventory.no_shares,
+                available_size=inventory.no_shares,
+                min_order_size=context.risk.min_order_size,
+            )
+            if size is not None:
+                return {
+                    "token_id": market.no_token_id,
+                    "side": "SELL",
+                    "price": derive_sell_price(no_book, 1.0 - quote.fair_value, quote.half_spread, aggressive=aggressive),
+                    "size": size,
+                    "tick_size": no_book.tick_size,
+                    "label": "NO flatten ask",
+                }
 
     if inventory.yes_shares > 0:
         size = bounded_unwind_size(
@@ -575,11 +584,10 @@ def get_market_book(context: BotContext, token_id: str) -> Optional[OrderBookSna
 
 
 def derive_sell_price(book: OrderBookSnapshot, fair_value: float, half_spread: float, aggressive: bool) -> float:
+    if aggressive and book.best_bid is not None:
+        return clamp_probability(round_to_tick(book.best_bid, book.tick_size, down=True))
     target = clamp_probability(fair_value + half_spread)
     price = round_to_tick(target, book.tick_size, down=False)
-    if aggressive and book.best_ask is not None:
-        inside_ask = round_to_tick(max(book.best_ask - max(book.tick_size, 0.01), 0.01), book.tick_size, down=True)
-        price = min(price, inside_ask)
     if book.best_bid is not None:
         min_post_only = round_to_tick(book.best_bid + max(book.tick_size, 0.01), book.tick_size, down=False)
         price = max(price, min_post_only)

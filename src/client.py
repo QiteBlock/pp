@@ -186,6 +186,7 @@ class PolymarketClient:
         tick_size: float,
         dry_run: bool = True,
         neg_risk: Optional[bool] = None,
+        post_only: bool = True,
     ) -> dict[str, Any]:
         if dry_run:
             return {"status": "dry_run", "token_id": token_id, "side": side, "price": price, "size": size}
@@ -193,14 +194,14 @@ class PolymarketClient:
         if self.trading_client is None or OrderArgs is None:
             raise RuntimeError("py_clob_client_v2 is not installed.")
         if self.sdk == "v1":
-            return self.place_v1_limit_order(token_id, side, price, size, tick_size, dry_run, neg_risk)
+            return self.place_v1_limit_order(token_id, side, price, size, tick_size, dry_run, neg_risk, post_only)
         order_side = Side.BUY if side.upper() == "BUY" else Side.SELL
         order_args = self.build_order_args(token_id, price, size, order_side)
         return self.trading_client.create_and_post_order(
             order_args=order_args,
             options=PartialCreateOrderOptions(tick_size=format_tick_size(tick_size), neg_risk=neg_risk),
             order_type=OrderType.GTC,
-            post_only=True,
+            post_only=post_only,
         )
 
     def build_order_args(self, token_id: str, price: float, size: float, order_side: Any) -> Any:
@@ -217,6 +218,7 @@ class PolymarketClient:
         tick_size: float,
         dry_run: bool,
         neg_risk: Optional[bool],
+        post_only: bool,
     ) -> dict[str, Any]:
         if dry_run:
             return {"status": "dry_run", "token_id": token_id, "side": side, "price": price, "size": size}
@@ -226,7 +228,7 @@ class PolymarketClient:
         options = self.v1_order_options(tick_size, neg_risk)
         signed_order = self.trading_client.create_order(order_args, options)
         try:
-            return self.trading_client.post_order(signed_order, V1OrderType.GTC, post_only=True)
+            return self.trading_client.post_order(signed_order, V1OrderType.GTC, post_only=post_only)
         except TypeError:
             return self.trading_client.post_order(signed_order, V1OrderType.GTC)
 
