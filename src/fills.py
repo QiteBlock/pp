@@ -19,12 +19,15 @@ from .analytics import AnalyticsWriter, FillRecord
 from .client import PolymarketClient
 from .inventory import InventoryBook, MarketInventory
 
+RECENT_FILL_ID_LIMIT = 500
+
 
 @dataclass
 class FillState:
     """Tracks the state of fill polling."""
     last_fetch_ts: int = 0  # milliseconds since epoch when we last successfully fetched fills
     last_processed_fill_id: Optional[str] = None  # ID of the last fill we processed
+    recent_fill_ids: list[str] | None = None  # Rolling window of recently seen fill identities
 
 
 class FillPoller:
@@ -54,7 +57,9 @@ class FillPoller:
         try:
             with self.state_path.open("r", encoding="utf-8") as handle:
                 data = json.load(handle)
-            return FillState(**data)
+            state = FillState(**data)
+            state.recent_fill_ids = list(state.recent_fill_ids or [])
+            return state
         except Exception as exc:
             print(f"Failed to load fill state: {exc}, starting fresh")
             return FillState()
@@ -87,10 +92,15 @@ class FillPoller:
             return 0
 
         processed_count = 0
-        current_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        max_fill_ts = self.state.last_fetch_ts
+        recent_ids = set(self.state.recent_fill_ids or [])
 
-        for fill in fills:
-            if self._should_skip_fill(fill):
+        for fill in self._sort_fills(fills):
+            fill_ts = self._extract_timestamp(fill) or 0
+            max_fill_ts = max(max_fill_ts, fill_ts)
+            fill_identity = self._fill_identity(fill)
+
+            if self._should_skip_fill(fill, recent_ids):
                 continue
 
             if not self._apply_fill(fill, market_slug_mapping):
@@ -98,25 +108,36 @@ class FillPoller:
 
             processed_count += 1
             self.state.last_processed_fill_id = fill.get("id") or fill.get("orderId")
+            if fill_identity:
+                self._remember_fill_id(fill_identity)
+                recent_ids.add(fill_identity)
 
-        # Update last fetch timestamp
-        if fills:
-            last_fill_ts = self._extract_timestamp(fills[-1])
-            if last_fill_ts:
-                self.state.last_fetch_ts = last_fill_ts
-
-        self.state.last_fetch_ts = max(self.state.last_fetch_ts, current_time_ms)
+        self.state.last_fetch_ts = max_fill_ts
         if processed_count > 0:
             self._save_state()
 
         return processed_count
 
-    def _should_skip_fill(self, fill: dict[str, Any]) -> bool:
+    def _should_skip_fill(self, fill: dict[str, Any], recent_ids: set[str]) -> bool:
         """Check if we should skip processing this fill (already processed)."""
-        fill_id = fill.get("id") or fill.get("orderId")
+        fill_ts = self._extract_timestamp(fill) or 0
+        if self.state.last_fetch_ts and fill_ts and fill_ts < self.state.last_fetch_ts:
+            return True
+        fill_id = self._fill_identity(fill)
+        if fill_id and fill_id in recent_ids:
+            return True
         if fill_id and self.state.last_processed_fill_id == fill_id:
             return True
         return False
+
+    def _sort_fills(self, fills: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return sorted(
+            fills,
+            key=lambda fill: (
+                self._extract_timestamp(fill) or 0,
+                str(fill.get("id") or fill.get("orderId") or ""),
+            ),
+        )
 
     def _extract_timestamp(self, fill: dict[str, Any]) -> Optional[int]:
         """Extract timestamp from fill record in milliseconds."""
@@ -138,6 +159,27 @@ class FillPoller:
                     continue
         return None
 
+    def _fill_identity(self, fill: dict[str, Any]) -> Optional[str]:
+        fill_id = fill.get("id") or fill.get("fillId") or fill.get("tradeID") or fill.get("tradeId")
+        if fill_id:
+            return str(fill_id)
+        order_id = fill.get("orderId") or fill.get("order_id") or ""
+        token_id = fill.get("token_id") or fill.get("tokenId") or fill.get("asset_id") or ""
+        side = fill.get("side") or fill.get("Side") or ""
+        size = fill.get("size") or fill.get("Size") or fill.get("amount") or ""
+        price = fill.get("price") or fill.get("Price") or ""
+        timestamp = self._extract_timestamp(fill) or ""
+        if order_id or token_id:
+            return f"{order_id}|{token_id}|{side}|{size}|{price}|{timestamp}"
+        return None
+
+    def _remember_fill_id(self, fill_id: str) -> None:
+        recent = list(self.state.recent_fill_ids or [])
+        recent.append(fill_id)
+        if len(recent) > RECENT_FILL_ID_LIMIT:
+            recent = recent[-RECENT_FILL_ID_LIMIT:]
+        self.state.recent_fill_ids = recent
+
     def _apply_fill(self, fill: dict[str, Any], market_slug_mapping: dict[str, tuple[str, str]]) -> bool:
         """Apply a fill to inventory and log it.
 
@@ -147,7 +189,7 @@ class FillPoller:
         if not token_id or token_id not in market_slug_mapping:
             return False
 
-        side = (fill.get("side") or fill.get("Side") or "").upper()
+        side = self._normalize_fill_side(fill)
         if side not in ("BUY", "SELL"):
             return False
 
@@ -183,6 +225,8 @@ class FillPoller:
                     "side": side,
                     "size": size,
                     "price": price,
+                    "raw_side": fill.get("side") or fill.get("Side"),
+                    "trader_side": fill.get("trader_side") or fill.get("traderSide"),
                 },
             )
             if self.fill_handler is not None:
@@ -195,6 +239,16 @@ class FillPoller:
             print(f"Error applying fill for {market_slug}: {exc}")
             self.analytics.log_event("fill_apply_error", {"market": market_slug, "error": str(exc)})
             return False
+
+    def _normalize_fill_side(self, fill: dict[str, Any]) -> str:
+        side = str(fill.get("side") or fill.get("Side") or "").upper()
+        trader_side = str(fill.get("trader_side") or fill.get("traderSide") or "").upper()
+        if trader_side == "MAKER":
+            if side == "BUY":
+                return "SELL"
+            if side == "SELL":
+                return "BUY"
+        return side
 
 
 def _to_float(value: Any) -> Optional[float]:

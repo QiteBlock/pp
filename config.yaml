@@ -29,6 +29,7 @@ runtime:
   scan_limit: 200
   scan_pages: 10
   scan_candidate_cap: 100
+  max_active_markets: 3
   rescan_interval_seconds: 900
 
 pricing:
@@ -39,15 +40,15 @@ pricing:
   volatility_multiplier: 0.5
   book_spread_multiplier: 0.75
   probability_edge_multiplier: 0.005
-  size_per_order: 20.0
+  size_per_order: 25.0
   quote_improvement_ticks: 0
 
 risk:
-  max_yes_shares_per_market: 75
-  max_no_shares_per_market: 75
-  max_net_delta_per_market: 10
-  max_total_exposure_usdc: 500
-  max_drawdown_usdc: 100
+  max_yes_shares_per_market: 125
+  max_no_shares_per_market: 125
+  max_net_delta_per_market: 40
+  max_total_exposure_usdc: 800
+  max_drawdown_usdc: 150
   min_days_to_resolution: 7
   min_order_size: 5
 
