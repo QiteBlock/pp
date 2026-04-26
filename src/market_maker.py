@@ -204,6 +204,9 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
         return
     portfolio_exposure = total_exposure(context.inventory, mark_prices)
     if portfolio_exposure > context.risk.max_total_exposure_usdc:
+        if inventory.gross_shares > 0.01:
+            process_unwind_market(context, market, inventory, quote, book, "portfolio exposure limit breached")
+            return
         context.analytics.log_event(
             "risk_skip",
             {"market": market.slug, "reason": "portfolio exposure limit breached", "exposure": portfolio_exposure},
@@ -373,12 +376,17 @@ def build_unwind_order_request(
     yes_book: OrderBookSnapshot,
 ) -> Optional[dict[str, Any]]:
     tick = max(yes_book.tick_size, 0.01)
-    size = min(context.pricing.size_per_order, max(abs(inventory.net_delta), context.risk.min_order_size))
     if inventory.no_shares > max(context.risk.max_no_shares_per_market, context.risk.max_net_delta_per_market):
         no_book = get_market_book(context, market.no_token_id)
         if no_book is None:
             return None
-        size = min(size, inventory.no_shares)
+        size = bounded_unwind_size(
+            requested_size=context.pricing.size_per_order,
+            available_size=inventory.no_shares,
+            min_order_size=context.risk.min_order_size,
+        )
+        if size is None:
+            return None
         return {
             "token_id": market.no_token_id,
             "side": "SELL",
@@ -388,7 +396,13 @@ def build_unwind_order_request(
             "label": "NO unwind ask",
         }
     if inventory.yes_shares > max(context.risk.max_yes_shares_per_market, context.risk.max_net_delta_per_market):
-        size = min(size, inventory.yes_shares)
+        size = bounded_unwind_size(
+            requested_size=context.pricing.size_per_order,
+            available_size=inventory.yes_shares,
+            min_order_size=context.risk.min_order_size,
+        )
+        if size is None:
+            return None
         return {
             "token_id": market.yes_token_id,
             "side": "SELL",
@@ -401,26 +415,51 @@ def build_unwind_order_request(
         no_book = get_market_book(context, market.no_token_id)
         if no_book is None:
             return None
-        size = min(size, inventory.no_shares, abs(inventory.net_delta) - context.risk.max_net_delta_per_market)
+        size = bounded_unwind_size(
+            requested_size=min(
+                context.pricing.size_per_order,
+                abs(inventory.net_delta) - context.risk.max_net_delta_per_market,
+            ),
+            available_size=inventory.no_shares,
+            min_order_size=context.risk.min_order_size,
+        )
+        if size is None:
+            return None
         return {
             "token_id": market.no_token_id,
             "side": "SELL",
             "price": derive_sell_price(no_book, 1.0 - quote.fair_value, quote.half_spread),
-            "size": max(size, context.risk.min_order_size),
+            "size": size,
             "tick_size": no_book.tick_size,
             "label": "NO unwind ask",
         }
     if inventory.net_delta > context.risk.max_net_delta_per_market and inventory.yes_shares > 0:
-        size = min(size, inventory.yes_shares, inventory.net_delta - context.risk.max_net_delta_per_market)
+        size = bounded_unwind_size(
+            requested_size=min(
+                context.pricing.size_per_order,
+                inventory.net_delta - context.risk.max_net_delta_per_market,
+            ),
+            available_size=inventory.yes_shares,
+            min_order_size=context.risk.min_order_size,
+        )
+        if size is None:
+            return None
         return {
             "token_id": market.yes_token_id,
             "side": "SELL",
             "price": derive_sell_price(yes_book, quote.fair_value, quote.half_spread),
-            "size": max(size, context.risk.min_order_size),
+            "size": size,
             "tick_size": tick,
             "label": "YES unwind ask",
         }
     return None
+
+
+def bounded_unwind_size(requested_size: float, available_size: float, min_order_size: float) -> Optional[float]:
+    available = max(float(available_size), 0.0)
+    if available < min_order_size:
+        return None
+    return min(max(float(requested_size), min_order_size), available)
 
 
 def get_market_book(context: BotContext, token_id: str) -> Optional[OrderBookSnapshot]:
@@ -445,6 +484,9 @@ def should_unwind_only(reason: str) -> bool:
         "yes inventory limit breached",
         "no inventory limit breached",
         "delta neutrality limit breached",
+        "drawdown limit breached",
+        "market is too close to resolution",
+        "portfolio exposure limit breached",
     }
 
 
@@ -762,10 +804,11 @@ def select_best_markets(context: BotContext) -> Optional[list[MarketConfig]]:
 def merge_selected_markets(context: BotContext, ranked_candidates: list[MarketConfig]) -> list[MarketConfig]:
     selected: list[MarketConfig] = []
     selected_slugs: set[str] = set()
+    ranked_by_slug = {market.slug: market for market in ranked_candidates}
 
     for market in context.active_markets:
         if context.inventory.get(market.slug).gross_shares > 0.01 and market.slug not in selected_slugs:
-            selected.append(market)
+            selected.append(ranked_by_slug.get(market.slug, market))
             selected_slugs.add(market.slug)
 
     for market in ranked_candidates:

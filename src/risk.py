@@ -30,8 +30,6 @@ def total_exposure(book: InventoryBook, mark_prices: dict[str, float]) -> float:
 
 
 def can_quote_market(config: RiskConfig, inventory: MarketInventory, fair_value: float, days_to_resolution: float) -> tuple[bool, str]:
-    if days_to_resolution < config.min_days_to_resolution:
-        return False, "market is too close to resolution"
     if inventory.yes_shares > config.max_yes_shares_per_market:
         return False, "yes inventory limit breached"
     if inventory.no_shares > config.max_no_shares_per_market:
@@ -40,4 +38,6 @@ def can_quote_market(config: RiskConfig, inventory: MarketInventory, fair_value:
         return False, "delta neutrality limit breached"
     if inventory.realized_pnl < -config.max_drawdown_usdc:
         return False, "drawdown limit breached"
+    if days_to_resolution < config.min_days_to_resolution:
+        return False, "market is too close to resolution"
     return True, ""
