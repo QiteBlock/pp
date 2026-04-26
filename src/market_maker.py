@@ -193,8 +193,20 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
     allowed, reason = can_quote_market(context.risk, inventory, quote.fair_value, signal.time_to_resolution_days)
     mark_prices[market.slug] = quote.fair_value
     if not allowed:
-        if should_unwind_only(reason):
-            process_unwind_market(context, market, inventory, quote, book, reason)
+        if should_trim_position(reason):
+            process_unwind_market(context, market, inventory, quote, book, reason, mode="trim", aggressive=False)
+            return
+        if should_flatten_position(reason):
+            process_unwind_market(
+                context,
+                market,
+                inventory,
+                quote,
+                book,
+                reason,
+                mode="flatten",
+                aggressive=(reason == "drawdown limit breached"),
+            )
             return
         context.analytics.log_event("risk_skip", {"market": market.slug, "reason": reason})
         print(
@@ -205,7 +217,16 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
     portfolio_exposure = total_exposure(context.inventory, mark_prices)
     if portfolio_exposure > context.risk.max_total_exposure_usdc:
         if inventory.gross_shares > 0.01:
-            process_unwind_market(context, market, inventory, quote, book, "portfolio exposure limit breached")
+            process_unwind_market(
+                context,
+                market,
+                inventory,
+                quote,
+                book,
+                "portfolio exposure limit breached",
+                mode="flatten",
+                aggressive=False,
+            )
             return
         context.analytics.log_event(
             "risk_skip",
@@ -308,14 +329,18 @@ def process_unwind_market(
     quote: Any,
     yes_book: OrderBookSnapshot,
     reason: str,
+    mode: str,
+    aggressive: bool,
 ) -> None:
-    order_request = build_unwind_order_request(context, market, inventory, quote, yes_book)
+    order_request = build_unwind_order_request(context, market, inventory, quote, yes_book, mode=mode, aggressive=aggressive)
     if order_request is None:
         context.analytics.log_event(
             "unwind_skip",
             {
                 "market": market.slug,
                 "reason": reason,
+                "mode": mode,
+                "aggressive": aggressive,
                 "inventory_yes": inventory.yes_shares,
                 "inventory_no": inventory.no_shares,
                 "delta": inventory.net_delta,
@@ -343,6 +368,8 @@ def process_unwind_market(
             {
                 "market": market.slug,
                 "reason": reason,
+                "mode": mode,
+                "aggressive": aggressive,
                 "order_request": order_request,
             },
         )
@@ -353,6 +380,8 @@ def process_unwind_market(
         {
             "market": market.slug,
             "reason": reason,
+            "mode": mode,
+            "aggressive": aggressive,
             "inventory_yes": inventory.yes_shares,
             "inventory_no": inventory.no_shares,
             "delta": inventory.net_delta,
@@ -361,7 +390,7 @@ def process_unwind_market(
         },
     )
     print(
-        f"[{market.slug}] unwind-only: {reason} "
+        f"[{market.slug}] unwind-only: mode={mode} aggressive={aggressive} reason={reason} "
         f"placing {order_request['label']} price={order_request['price']:.3f} size={order_request['size']:.4f}"
     )
     print_order_response(order_request["label"], response)
@@ -374,8 +403,12 @@ def build_unwind_order_request(
     inventory: Any,
     quote: Any,
     yes_book: OrderBookSnapshot,
+    mode: str,
+    aggressive: bool,
 ) -> Optional[dict[str, Any]]:
     tick = max(yes_book.tick_size, 0.01)
+    if mode == "flatten":
+        return build_flatten_order_request(context, market, inventory, quote, yes_book, aggressive)
     if inventory.no_shares > max(context.risk.max_no_shares_per_market, context.risk.max_net_delta_per_market):
         no_book = get_market_book(context, market.no_token_id)
         if no_book is None:
@@ -390,10 +423,10 @@ def build_unwind_order_request(
         return {
             "token_id": market.no_token_id,
             "side": "SELL",
-            "price": derive_sell_price(no_book, 1.0 - quote.fair_value, quote.half_spread),
+            "price": derive_sell_price(no_book, 1.0 - quote.fair_value, quote.half_spread, aggressive=aggressive),
             "size": size,
             "tick_size": no_book.tick_size,
-            "label": "NO unwind ask",
+            "label": "NO trim ask",
         }
     if inventory.yes_shares > max(context.risk.max_yes_shares_per_market, context.risk.max_net_delta_per_market):
         size = bounded_unwind_size(
@@ -406,10 +439,10 @@ def build_unwind_order_request(
         return {
             "token_id": market.yes_token_id,
             "side": "SELL",
-            "price": derive_sell_price(yes_book, quote.fair_value, quote.half_spread),
+            "price": derive_sell_price(yes_book, quote.fair_value, quote.half_spread, aggressive=aggressive),
             "size": size,
             "tick_size": tick,
-            "label": "YES unwind ask",
+            "label": "YES trim ask",
         }
     if inventory.net_delta < -context.risk.max_net_delta_per_market and inventory.no_shares > 0:
         no_book = get_market_book(context, market.no_token_id)
@@ -428,10 +461,10 @@ def build_unwind_order_request(
         return {
             "token_id": market.no_token_id,
             "side": "SELL",
-            "price": derive_sell_price(no_book, 1.0 - quote.fair_value, quote.half_spread),
+            "price": derive_sell_price(no_book, 1.0 - quote.fair_value, quote.half_spread, aggressive=aggressive),
             "size": size,
             "tick_size": no_book.tick_size,
-            "label": "NO unwind ask",
+            "label": "NO trim ask",
         }
     if inventory.net_delta > context.risk.max_net_delta_per_market and inventory.yes_shares > 0:
         size = bounded_unwind_size(
@@ -447,10 +480,81 @@ def build_unwind_order_request(
         return {
             "token_id": market.yes_token_id,
             "side": "SELL",
-            "price": derive_sell_price(yes_book, quote.fair_value, quote.half_spread),
+            "price": derive_sell_price(yes_book, quote.fair_value, quote.half_spread, aggressive=aggressive),
             "size": size,
             "tick_size": tick,
-            "label": "YES unwind ask",
+            "label": "YES trim ask",
+        }
+    return None
+
+
+def build_flatten_order_request(
+    context: BotContext,
+    market: MarketConfig,
+    inventory: Any,
+    quote: Any,
+    yes_book: OrderBookSnapshot,
+    aggressive: bool,
+) -> Optional[dict[str, Any]]:
+    yes_notional = inventory.yes_shares * quote.fair_value
+    no_notional = inventory.no_shares * (1.0 - quote.fair_value)
+    unwind_no_first = inventory.no_shares > 0 and no_notional >= yes_notional
+
+    if unwind_no_first:
+        no_book = get_market_book(context, market.no_token_id)
+        if no_book is None:
+            return None
+        size = bounded_unwind_size(
+            requested_size=inventory.no_shares,
+            available_size=inventory.no_shares,
+            min_order_size=context.risk.min_order_size,
+        )
+        if size is None:
+            return None
+        return {
+            "token_id": market.no_token_id,
+            "side": "SELL",
+            "price": derive_sell_price(no_book, 1.0 - quote.fair_value, quote.half_spread, aggressive=aggressive),
+            "size": size,
+            "tick_size": no_book.tick_size,
+            "label": "NO flatten ask",
+        }
+
+    if inventory.yes_shares > 0:
+        size = bounded_unwind_size(
+            requested_size=inventory.yes_shares,
+            available_size=inventory.yes_shares,
+            min_order_size=context.risk.min_order_size,
+        )
+        if size is None:
+            return None
+        return {
+            "token_id": market.yes_token_id,
+            "side": "SELL",
+            "price": derive_sell_price(yes_book, quote.fair_value, quote.half_spread, aggressive=aggressive),
+            "size": size,
+            "tick_size": max(yes_book.tick_size, 0.01),
+            "label": "YES flatten ask",
+        }
+
+    if inventory.no_shares > 0:
+        no_book = get_market_book(context, market.no_token_id)
+        if no_book is None:
+            return None
+        size = bounded_unwind_size(
+            requested_size=inventory.no_shares,
+            available_size=inventory.no_shares,
+            min_order_size=context.risk.min_order_size,
+        )
+        if size is None:
+            return None
+        return {
+            "token_id": market.no_token_id,
+            "side": "SELL",
+            "price": derive_sell_price(no_book, 1.0 - quote.fair_value, quote.half_spread, aggressive=aggressive),
+            "size": size,
+            "tick_size": no_book.tick_size,
+            "label": "NO flatten ask",
         }
     return None
 
@@ -470,20 +574,28 @@ def get_market_book(context: BotContext, token_id: str) -> Optional[OrderBookSna
         return None
 
 
-def derive_sell_price(book: OrderBookSnapshot, fair_value: float, half_spread: float) -> float:
+def derive_sell_price(book: OrderBookSnapshot, fair_value: float, half_spread: float, aggressive: bool) -> float:
     target = clamp_probability(fair_value + half_spread)
     price = round_to_tick(target, book.tick_size, down=False)
+    if aggressive and book.best_ask is not None:
+        inside_ask = round_to_tick(max(book.best_ask - max(book.tick_size, 0.01), 0.01), book.tick_size, down=True)
+        price = min(price, inside_ask)
     if book.best_bid is not None:
         min_post_only = round_to_tick(book.best_bid + max(book.tick_size, 0.01), book.tick_size, down=False)
         price = max(price, min_post_only)
     return clamp_probability(price)
 
 
-def should_unwind_only(reason: str) -> bool:
+def should_trim_position(reason: str) -> bool:
     return reason in {
         "yes inventory limit breached",
         "no inventory limit breached",
         "delta neutrality limit breached",
+    }
+
+
+def should_flatten_position(reason: str) -> bool:
+    return reason in {
         "drawdown limit breached",
         "market is too close to resolution",
         "portfolio exposure limit breached",
