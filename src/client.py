@@ -64,6 +64,7 @@ class OrderBookSnapshot:
 class PolymarketClient:
     def __init__(self, config: dict[str, Any]) -> None:
         load_dotenv()
+        self.clob_config = config["clob"]
         self.sdk = config["clob"].get("sdk", "v2")
         self.clob_host = config["clob"]["host"]
         self.chain_id = int(config["clob"]["chain_id"])
@@ -84,7 +85,7 @@ class PolymarketClient:
         adapter = HTTPAdapter(max_retries=retries)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
-        self.trading_client = self._build_trading_client(config["clob"])
+        self.trading_client = self._build_trading_client(self.clob_config)
 
     def _build_trading_client(self, clob_config: dict[str, Any]) -> Any:
         if self.sdk == "v1":
@@ -230,7 +231,34 @@ class PolymarketClient:
         try:
             return self.trading_client.post_order(signed_order, V1OrderType.GTC, post_only=post_only)
         except TypeError:
-            return self.trading_client.post_order(signed_order, V1OrderType.GTC)
+            try:
+                return self.trading_client.post_order(signed_order, V1OrderType.GTC)
+            except Exception as exc:
+                if self.try_upgrade_from_v1_order_version_mismatch(exc):
+                    return self.place_limit_order(
+                        token_id=token_id,
+                        side=side,
+                        price=price,
+                        size=size,
+                        tick_size=tick_size,
+                        dry_run=dry_run,
+                        neg_risk=neg_risk,
+                        post_only=post_only,
+                    )
+                raise
+        except Exception as exc:
+            if self.try_upgrade_from_v1_order_version_mismatch(exc):
+                return self.place_limit_order(
+                    token_id=token_id,
+                    side=side,
+                    price=price,
+                    size=size,
+                    tick_size=tick_size,
+                    dry_run=dry_run,
+                    neg_risk=neg_risk,
+                    post_only=post_only,
+                )
+            raise
 
     def v1_buy_sell(self, side: str) -> Any:
         return V1_BUY if side.upper() == "BUY" else V1_SELL
@@ -377,6 +405,22 @@ class PolymarketClient:
             print(f"Warning: Failed to fetch positions from trading client: {exc}")
         return {}
 
+    def try_upgrade_from_v1_order_version_mismatch(self, exc: Exception) -> bool:
+        if self.sdk != "v1":
+            return False
+        if not is_order_version_mismatch_error(exc):
+            return False
+        if ClobClient is None:
+            return False
+        self.sdk = "v2"
+        self.api_creds = None
+        self.trading_client = self._build_trading_client(self.clob_config)
+        if self.trading_client is None:
+            self.sdk = "v1"
+            self.trading_client = self._build_v1_trading_client(self.clob_config)
+            return False
+        return True
+
 
 def parse_market_configs(raw_markets: list[dict[str, Any]]) -> list[MarketConfig]:
     result: list[MarketConfig] = []
@@ -466,6 +510,10 @@ def _parse_datetime(value: Any) -> Optional[datetime]:
         return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def is_order_version_mismatch_error(exc: Exception) -> bool:
+    return "order_version_mismatch" in str(exc).lower()
 
 
 def _to_float(value: Any) -> Optional[float]:

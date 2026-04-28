@@ -34,6 +34,7 @@ class BotContext:
     control: BotControl
     telegram: TelegramController
     loop_interval_seconds: int
+    fill_cooldown_seconds: int
     dry_run: bool
     cancel_before_requote: bool
     auto_scan_enabled: bool
@@ -147,6 +148,7 @@ def load_context(config_path: str) -> BotContext:
         control=control,
         telegram=telegram,
         loop_interval_seconds=int(runtime["loop_interval_seconds"]),
+        fill_cooldown_seconds=max(int(runtime.get("fill_cooldown_seconds", 60)), 0),
         dry_run=bool(runtime["dry_run"]),
         cancel_before_requote=bool(runtime.get("cancel_before_requote", True)),
         auto_scan_enabled=bool(runtime.get("auto_scan_enabled", True)),
@@ -329,10 +331,27 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
         )
         print(f"[{market.slug}] skipped: post-only guard blocked marketable quote ({quote.bid:.3f},{quote.ask:.3f})")
         return
-    
+    place_yes_bid, place_no_bid, quote_reason = determine_quote_sides(context, inventory)
+    if not place_yes_bid and not place_no_bid:
+        context.analytics.log_event(
+            "risk_skip",
+            {
+                "market": market.slug,
+                "reason": quote_reason,
+                "inventory_yes": inventory.yes_shares,
+                "inventory_no": inventory.no_shares,
+                "last_fill_ts": inventory.last_fill_ts,
+            },
+        )
+        print(f"[{market.slug}] skipped: {quote_reason}")
+        return
+
+    no_bid_price = round_no_bid_price(quote.ask, book.tick_size)
+    bid_response: Any = None
+    ask_response: Any = None
+
     # Check for duplicate orders before placing new ones
-    if not context.dry_run:
-        no_bid_price = round_no_bid_price(quote.ask, book.tick_size)
+    if not context.dry_run and place_yes_bid and place_no_bid:
         duplicate_check = context.duplicate_detector.detect_duplicates(
             context.client,
             market.slug,
@@ -354,45 +373,69 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             )
             print(f"[{market.slug}] skipped: found {len(duplicate_check.duplicate_orders)} duplicate order(s)")
             return
-    
-    try:
-        bid_response = context.client.place_limit_order(
-            token_id=market.yes_token_id,
-            side="BUY",
-            price=quote.bid,
-            size=quote.size,
-            tick_size=book.tick_size,
-            dry_run=context.dry_run,
-            neg_risk=market.neg_risk,
-        )
-        no_bid_price = round_no_bid_price(quote.ask, book.tick_size)
-        ask_response = context.client.place_limit_order(
-            token_id=market.no_token_id,
-            side="BUY",
-            price=no_bid_price,
-            size=quote.size,
-            tick_size=book.tick_size,
-            dry_run=context.dry_run,
-            neg_risk=market.neg_risk,
-        )
-    except Exception as exc:
-        if is_trading_restricted_error(exc):
-            raise RuntimeError(
-                "Polymarket rejected live order placement due to regional trading restrictions. "
-                "The bot has stopped before placing further orders. Use dry_run=true unless you are in an eligible region."
-            ) from exc
-        context.analytics.log_event(
-            "quote_error",
-            {
-                "market": market.slug,
-                "details": str(exc),
-                "fair_value": quote.fair_value,
-                "bid": quote.bid,
-                "ask": quote.ask,
-            },
-        )
-        run_recovery_reconciliation(context, "quote_error", market=market.slug, details=str(exc))
-        print(f"[{market.slug}] quote placement failed: {exc}")
+
+    if place_yes_bid:
+        try:
+            bid_response = context.client.place_limit_order(
+                token_id=market.yes_token_id,
+                side="BUY",
+                price=quote.bid,
+                size=quote.size,
+                tick_size=book.tick_size,
+                dry_run=context.dry_run,
+                neg_risk=market.neg_risk,
+            )
+        except Exception as exc:
+            if is_trading_restricted_error(exc):
+                raise RuntimeError(
+                    "Polymarket rejected live order placement due to regional trading restrictions. "
+                    "The bot has stopped before placing further orders. Use dry_run=true unless you are in an eligible region."
+                ) from exc
+            context.analytics.log_event(
+                "quote_error",
+                {
+                    "market": market.slug,
+                    "details": str(exc),
+                    "fair_value": quote.fair_value,
+                    "bid": quote.bid,
+                    "ask": quote.ask,
+                    "side": "YES_BID",
+                },
+            )
+            run_recovery_reconciliation(context, "quote_error", market=market.slug, details=str(exc), side="YES_BID")
+            print(f"[{market.slug}] YES bid placement failed: {exc}")
+    if place_no_bid:
+        try:
+            ask_response = context.client.place_limit_order(
+                token_id=market.no_token_id,
+                side="BUY",
+                price=no_bid_price,
+                size=quote.size,
+                tick_size=book.tick_size,
+                dry_run=context.dry_run,
+                neg_risk=market.neg_risk,
+            )
+        except Exception as exc:
+            if is_trading_restricted_error(exc):
+                raise RuntimeError(
+                    "Polymarket rejected live order placement due to regional trading restrictions. "
+                    "The bot has stopped before placing further orders. Use dry_run=true unless you are in an eligible region."
+                ) from exc
+            context.analytics.log_event(
+                "quote_error",
+                {
+                    "market": market.slug,
+                    "details": str(exc),
+                    "fair_value": quote.fair_value,
+                    "bid": quote.bid,
+                    "ask": quote.ask,
+                    "side": "NO_BID",
+                },
+            )
+            run_recovery_reconciliation(context, "quote_error", market=market.slug, details=str(exc), side="NO_BID")
+            print(f"[{market.slug}] NO bid placement failed: {exc}")
+
+    if bid_response is None and ask_response is None:
         return
     context.analytics.log_event(
         "quote_cycle",
@@ -406,14 +449,25 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             "half_spread": quote.half_spread,
             "inventory_yes": inventory.yes_shares,
             "inventory_no": inventory.no_shares,
+            "place_yes_bid": place_yes_bid,
+            "place_no_bid": place_no_bid,
+            "quote_side_reason": quote_reason,
             "responses": {"bid": bid_response, "ask": ask_response},
         },
     )
-    log_rejected_order_response(context, market, "YES bid", bid_response, kind="quote")
-    log_rejected_order_response(context, market, "NO bid", ask_response, kind="quote")
+    if bid_response is not None:
+        log_rejected_order_response(context, market, "YES bid", bid_response, kind="quote")
+    if ask_response is not None:
+        log_rejected_order_response(context, market, "NO bid", ask_response, kind="quote")
     print_quote_status(market, book, quote.fair_value, quote.bid, quote.ask, inventory.net_delta)
-    print_order_response("YES bid", bid_response)
-    print_order_response("NO bid", ask_response)
+    if bid_response is not None:
+        print_order_response("YES bid", bid_response)
+    else:
+        print("  YES bid: skipped")
+    if ask_response is not None:
+        print_order_response("NO bid", ask_response)
+    else:
+        print("  NO bid: skipped")
     print_open_orders(context, market)
 
 

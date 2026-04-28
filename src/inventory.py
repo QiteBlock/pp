@@ -12,6 +12,7 @@ class MarketInventory:
     no_shares: float = 0.0
     realized_pnl: float = 0.0
     unwind_cycles_without_fill: int = 0
+    last_fill_ts: float = 0.0
 
     @property
     def net_delta(self) -> float:

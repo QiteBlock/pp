@@ -14,6 +14,7 @@ class RiskConfig:
     max_drawdown_usdc: float
     min_days_to_resolution: float
     min_order_size: float
+    requote_inventory_fraction_limit: float = 0.5
 
 
 def compute_market_exposure(inventory: MarketInventory, mark_price: float) -> float:

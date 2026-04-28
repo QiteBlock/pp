@@ -18,7 +18,6 @@ from typing import Any, Callable, Optional
 from .analytics import AnalyticsWriter, FillRecord
 from .client import PolymarketClient
 from .inventory import InventoryBook, MarketInventory
-from .units import parse_optional_token_amount
 
 RECENT_FILL_ID_LIMIT = 500
 
@@ -161,6 +160,14 @@ class FillPoller:
         return None
 
     def _fill_identity(self, fill: dict[str, Any]) -> Optional[str]:
+        maker_order = self._extract_own_maker_order(fill)
+        if maker_order is not None:
+            tx_hash = fill.get("transaction_hash") or fill.get("transactionHash") or ""
+            order_id = maker_order.get("order_id") or maker_order.get("orderId") or ""
+            token_id = maker_order.get("asset_id") or maker_order.get("assetId") or ""
+            side = maker_order.get("side") or ""
+            size = maker_order.get("matched_amount") or maker_order.get("matchedAmount") or ""
+            return f"{tx_hash}|{order_id}|{token_id}|{side}|{size}"
         fill_id = fill.get("id") or fill.get("fillId") or fill.get("tradeID") or fill.get("tradeId")
         if fill_id:
             return str(fill_id)
@@ -186,26 +193,31 @@ class FillPoller:
 
         Returns True if successfully applied, False otherwise.
         """
-        token_id = fill.get("token_id") or fill.get("tokenId") or fill.get("asset_id")
+        normalized = self._normalize_fill(fill)
+        if normalized is None:
+            return False
+        token_id = normalized["token_id"]
         if not token_id or token_id not in market_slug_mapping:
             return False
 
-        side = self._normalize_fill_side(fill)
+        side = normalized["side"]
         if side not in ("BUY", "SELL"):
             return False
 
-        size = parse_optional_token_amount(fill.get("size") or fill.get("Size") or fill.get("amount"))
+        size = normalized["size"]
         price = _to_float(fill.get("price") or fill.get("Price"))
         if size is None or price is None or size <= 0:
             return False
 
-        market_slug, outcome = market_slug_mapping[token_id]
+        market_slug, default_outcome = market_slug_mapping[token_id]
+        outcome = normalized.get("outcome") or default_outcome
         timestamp = self._extract_timestamp(fill)
         ts_str = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc).isoformat() if timestamp else datetime.now(timezone.utc).isoformat()
 
         try:
             # Apply to inventory
             inventory = self.inventory.apply_fill(market_slug, outcome, side, size, price)
+            inventory.last_fill_ts = (timestamp / 1000.0) if timestamp else datetime.now(timezone.utc).timestamp()
 
             # Log fill
             record = FillRecord(
@@ -228,6 +240,8 @@ class FillPoller:
                     "price": price,
                     "raw_side": fill.get("side") or fill.get("Side"),
                     "trader_side": fill.get("trader_side") or fill.get("traderSide"),
+                    "normalized_token_id": token_id,
+                    "normalized_outcome": outcome,
                 },
             )
             if self.fill_handler is not None:
@@ -244,6 +258,45 @@ class FillPoller:
     def _normalize_fill_side(self, fill: dict[str, Any]) -> str:
         side = str(fill.get("side") or fill.get("Side") or "").upper()
         return side
+
+    def _normalize_fill(self, fill: dict[str, Any]) -> Optional[dict[str, Any]]:
+        maker_order = self._extract_own_maker_order(fill)
+        if maker_order is not None:
+            token_id = maker_order.get("asset_id") or maker_order.get("assetId")
+            side = str(maker_order.get("side") or "").upper()
+            size = _to_float(maker_order.get("matched_amount") or maker_order.get("matchedAmount"))
+            outcome = str(maker_order.get("outcome") or "").upper()
+            return {
+                "token_id": token_id,
+                "side": side,
+                "size": size,
+                "outcome": outcome,
+            }
+        token_id = fill.get("token_id") or fill.get("tokenId") or fill.get("asset_id")
+        side = self._normalize_fill_side(fill)
+        size = _to_float(fill.get("size") or fill.get("Size") or fill.get("amount"))
+        outcome = str(fill.get("outcome") or "").upper()
+        return {
+            "token_id": token_id,
+            "side": side,
+            "size": size,
+            "outcome": outcome,
+        }
+
+    def _extract_own_maker_order(self, fill: dict[str, Any]) -> Optional[dict[str, Any]]:
+        trader_side = str(fill.get("trader_side") or fill.get("traderSide") or "").upper()
+        if trader_side != "MAKER":
+            return None
+        maker_orders = fill.get("maker_orders") or fill.get("makerOrders") or []
+        if not isinstance(maker_orders, list):
+            return None
+        our_maker = str(self.client.funder or "").lower()
+        if our_maker:
+            for order in maker_orders:
+                maker_address = str(order.get("maker_address") or order.get("makerAddress") or "").lower()
+                if maker_address == our_maker:
+                    return order
+        return maker_orders[0] if maker_orders else None
 
 
 def _to_float(value: Any) -> Optional[float]:

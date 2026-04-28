@@ -1,5 +1,5 @@
 clob:
-  sdk: "v1"
+  sdk: "v2"
   host: "https://clob.polymarket.com"
   chain_id: 137
   private_key_env: "POLY_PRIVATE_KEY"
@@ -42,7 +42,7 @@ pricing:
   volatility_multiplier: 0.5
   book_spread_multiplier: 0.75
   probability_edge_multiplier: 0.005
-  size_per_order: 50.0
+  size_per_order: 25.0
   quote_improvement_ticks: 1
 
 risk:
