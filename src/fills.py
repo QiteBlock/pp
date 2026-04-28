@@ -18,6 +18,7 @@ from typing import Any, Callable, Optional
 from .analytics import AnalyticsWriter, FillRecord
 from .client import PolymarketClient
 from .inventory import InventoryBook, MarketInventory
+from .units import parse_optional_token_amount
 
 RECENT_FILL_ID_LIMIT = 500
 
@@ -193,7 +194,7 @@ class FillPoller:
         if side not in ("BUY", "SELL"):
             return False
 
-        size = _to_float(fill.get("size") or fill.get("Size") or fill.get("amount"))
+        size = parse_optional_token_amount(fill.get("size") or fill.get("Size") or fill.get("amount"))
         price = _to_float(fill.get("price") or fill.get("Price"))
         if size is None or price is None or size <= 0:
             return False
@@ -242,12 +243,6 @@ class FillPoller:
 
     def _normalize_fill_side(self, fill: dict[str, Any]) -> str:
         side = str(fill.get("side") or fill.get("Side") or "").upper()
-        trader_side = str(fill.get("trader_side") or fill.get("traderSide") or "").upper()
-        if trader_side == "MAKER":
-            if side == "BUY":
-                return "SELL"
-            if side == "SELL":
-                return "BUY"
         return side
 
 

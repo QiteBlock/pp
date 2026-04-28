@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 from .client import PolymarketClient, MarketConfig
 from .inventory import InventoryBook
+from .units import parse_token_amount
 
 
 class PositionReconciler:
@@ -39,8 +40,7 @@ class PositionReconciler:
             return report
 
         if not api_positions:
-            report.status = "no_positions_found"
-            return report
+            api_positions = {}
 
         # Build token ID to market mapping
         token_to_market = {}
@@ -50,11 +50,12 @@ class PositionReconciler:
 
         # Check each position reported by the API
         for token_id, api_balance in api_positions.items():
-            if not isinstance(api_balance, (int, float)):
+            normalized_balance = parse_token_amount(api_balance)
+            if api_balance not in (0, 0.0, "0", "0.0") and normalized_balance == 0.0:
                 continue
 
             if token_id not in token_to_market:
-                report.unknown_positions[token_id] = float(api_balance)
+                report.unknown_positions[token_id] = normalized_balance
                 continue
 
             market_slug, outcome = token_to_market[token_id]
@@ -64,13 +65,13 @@ class PositionReconciler:
             current_balance = inventory.yes_shares if outcome == "YES" else inventory.no_shares
 
             # Check for discrepancy
-            balance_diff = float(api_balance) - current_balance
+            balance_diff = normalized_balance - current_balance
             if abs(balance_diff) > 0.01:  # tolerance of 0.01 shares
                 report.discrepancies.append({
                     "market": market_slug,
                     "outcome": outcome,
                     "token_id": token_id,
-                    "api_balance": float(api_balance),
+                    "api_balance": normalized_balance,
                     "inventory_balance": current_balance,
                     "difference": balance_diff,
                 })
@@ -78,47 +79,59 @@ class PositionReconciler:
                 # Update inventory to match API
                 if outcome == "YES":
                     adjustment = balance_diff
-                    inventory.yes_shares = float(api_balance)
+                    inventory.yes_shares = normalized_balance
                 else:
                     adjustment = balance_diff
-                    inventory.no_shares = float(api_balance)
+                    inventory.no_shares = normalized_balance
 
                 report.adjustments.append({
                     "market": market_slug,
                     "outcome": outcome,
                     "token_id": token_id,
                     "adjustment": adjustment,
-                    "new_balance": float(api_balance),
+                    "new_balance": normalized_balance,
                 })
 
-        # Check for positions in inventory that aren't in API (shouldn't happen, but flag it)
-        for market_slug, inv in self.inventory.markets.items():
-            for market in markets:
-                if market.slug == market_slug:
-                    yes_token = market.yes_token_id
-                    no_token = market.no_token_id
-
-                    if yes_token not in api_positions and inv.yes_shares > 0.01:
-                        report.orphaned_positions.append({
-                            "market": market_slug,
-                            "outcome": "YES",
-                            "token_id": yes_token,
-                            "balance": inv.yes_shares,
-                        })
-
-                    if no_token not in api_positions and inv.no_shares > 0.01:
-                        report.orphaned_positions.append({
-                            "market": market_slug,
-                            "outcome": "NO",
-                            "token_id": no_token,
-                            "balance": inv.no_shares,
-                        })
-                    break
+        # Zero tracked positions that are absent from the API response.
+        for market in markets:
+            inventory = self.inventory.get(market.slug)
+            if market.yes_token_id not in api_positions and inventory.yes_shares > 0.01:
+                report.orphaned_positions.append({
+                    "market": market.slug,
+                    "outcome": "YES",
+                    "token_id": market.yes_token_id,
+                    "balance": inventory.yes_shares,
+                })
+                report.adjustments.append({
+                    "market": market.slug,
+                    "outcome": "YES",
+                    "token_id": market.yes_token_id,
+                    "adjustment": -inventory.yes_shares,
+                    "new_balance": 0.0,
+                })
+                inventory.yes_shares = 0.0
+            if market.no_token_id not in api_positions and inventory.no_shares > 0.01:
+                report.orphaned_positions.append({
+                    "market": market.slug,
+                    "outcome": "NO",
+                    "token_id": market.no_token_id,
+                    "balance": inventory.no_shares,
+                })
+                report.adjustments.append({
+                    "market": market.slug,
+                    "outcome": "NO",
+                    "token_id": market.no_token_id,
+                    "adjustment": -inventory.no_shares,
+                    "new_balance": 0.0,
+                })
+                inventory.no_shares = 0.0
 
         # Determine overall status
         if report.error:
             report.status = "error"
-        elif report.discrepancies:
+        elif not api_positions and not report.adjustments:
+            report.status = "no_positions_found"
+        elif report.discrepancies or report.adjustments:
             report.status = "reconciled"
         else:
             report.status = "consistent"

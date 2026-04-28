@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict
 
+NEGATIVE_BALANCE_TOLERANCE = 1e-6
+
 
 @dataclass
 class MarketInventory:
@@ -33,10 +35,22 @@ class InventoryBook:
         inventory = self.get(market_key)
         signed_size = size if side.upper() == "BUY" else -size
         if outcome.upper() == "YES":
-            inventory.yes_shares += signed_size
+            new_balance = inventory.yes_shares + signed_size
+            if new_balance < -NEGATIVE_BALANCE_TOLERANCE:
+                raise ValueError(
+                    f"Fill would create negative YES balance for {market_key}: "
+                    f"current={inventory.yes_shares:.6f} delta={signed_size:.6f}"
+                )
+            inventory.yes_shares = max(new_balance, 0.0)
             inventory.realized_pnl -= signed_size * price
         else:
-            inventory.no_shares += signed_size
+            new_balance = inventory.no_shares + signed_size
+            if new_balance < -NEGATIVE_BALANCE_TOLERANCE:
+                raise ValueError(
+                    f"Fill would create negative NO balance for {market_key}: "
+                    f"current={inventory.no_shares:.6f} delta={signed_size:.6f}"
+                )
+            inventory.no_shares = max(new_balance, 0.0)
             inventory.realized_pnl -= signed_size * price
         inventory.unwind_cycles_without_fill = 0
         return inventory

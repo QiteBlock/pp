@@ -89,7 +89,12 @@ def run_market_maker(config_path: str) -> None:
                 continue
 
             if context.cancel_before_requote:
-                context.client.cancel_all_orders(dry_run=context.dry_run)
+                try:
+                    context.client.cancel_all_orders(dry_run=context.dry_run)
+                except Exception as exc:
+                    context.analytics.log_event("cancel_all_error", {"details": str(exc)})
+                    run_recovery_reconciliation(context, "cancel_all_error", details=str(exc))
+                    print(f"Cancel-all failed: {exc}")
             markets_to_quote = get_markets_to_quote(context)
             if not markets_to_quote:
                 print("No eligible market selected. Sleeping before next rescan.")
@@ -1310,6 +1315,6 @@ def parse_usdc_amount(value: Any) -> float:
     try:
         if value is None:
             return 0.0
-        return float(value)
+        return float(value) / 1_000_000.0
     except (TypeError, ValueError):
         return 0.0
