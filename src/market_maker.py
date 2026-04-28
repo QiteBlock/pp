@@ -1096,6 +1096,40 @@ def round_no_bid_price(yes_ask: float, tick_size: float) -> float:
     return round(int(raw / tick) * tick, 4)
 
 
+def determine_quote_sides(context: BotContext, inventory: Any) -> tuple[bool, bool, str]:
+    yes_limit = max(
+        context.risk.min_order_size,
+        context.risk.max_yes_shares_per_market * context.risk.requote_inventory_fraction_limit,
+    )
+    no_limit = max(
+        context.risk.min_order_size,
+        context.risk.max_no_shares_per_market * context.risk.requote_inventory_fraction_limit,
+    )
+    now = time.time()
+    if (
+        context.fill_cooldown_seconds > 0
+        and inventory.last_fill_ts > 0
+        and now - inventory.last_fill_ts < context.fill_cooldown_seconds
+    ):
+        remaining = int(max(context.fill_cooldown_seconds - (now - inventory.last_fill_ts), 0))
+        if inventory.net_delta > 0.01:
+            return False, True, f"post_fill_cooldown_rebalance_yes({remaining}s)"
+        if inventory.net_delta < -0.01:
+            return True, False, f"post_fill_cooldown_rebalance_no({remaining}s)"
+        return False, False, f"post_fill_cooldown_flat({remaining}s)"
+
+    place_yes_bid = inventory.yes_shares < yes_limit
+    place_no_bid = inventory.no_shares < no_limit
+
+    if place_yes_bid and place_no_bid:
+        return True, True, "normal_quote"
+    if place_yes_bid and not place_no_bid:
+        return True, False, "inventory_rebalance_only_no_side_full"
+    if place_no_bid and not place_yes_bid:
+        return False, True, "inventory_rebalance_only_yes_side_full"
+    return False, False, "inventory_limits_block_both_sides"
+
+
 def validate_market_config(markets: list[MarketConfig]) -> None:
     if not markets:
         raise RuntimeError("No markets configured in config.yaml")

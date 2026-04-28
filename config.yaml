@@ -29,8 +29,9 @@ runtime:
   scan_limit: 200
   scan_pages: 10
   scan_candidate_cap: 100
-  max_active_markets: 5
+  max_active_markets: 2
   unwind_escalation_cycles: 3
+  fill_cooldown_seconds: 90
   reconciliation_interval_loops: 25
   rescan_interval_seconds: 900
 
@@ -42,22 +43,23 @@ pricing:
   volatility_multiplier: 0.5
   book_spread_multiplier: 0.75
   probability_edge_multiplier: 0.005
-  size_per_order: 25.0
+  size_per_order: 5.0
   quote_improvement_ticks: 1
 
 risk:
-  max_yes_shares_per_market: 125
-  max_no_shares_per_market: 125
-  max_net_delta_per_market: 40
-  max_total_exposure_usdc: 800
-  max_drawdown_usdc: 150
+  max_yes_shares_per_market: 25
+  max_no_shares_per_market: 25
+  max_net_delta_per_market: 10
+  max_total_exposure_usdc: 150
+  max_drawdown_usdc: 75
   min_days_to_resolution: 7
   min_order_size: 5
+  requote_inventory_fraction_limit: 0.4
 
 filters:
-  min_volume_24h: 5000
+  min_volume_24h: 25000
   max_volume_24h: 100000
-  min_spread_bps: 100
+  min_spread_bps: 150
   min_fair_value: 0.15
   max_fair_value: 0.85
   categories:
