@@ -50,12 +50,28 @@ def compute_half_spread(config: PricingConfig, signal: PriceSignal, inventory_bi
     return min(max(raw, config.min_half_spread), config.max_half_spread)
 
 
-def build_yes_quote(config: PricingConfig, signal: PriceSignal, inventory_bias: float, tick_size: float, book_spread: float | None = None) -> Quote:
+def build_yes_quote(
+    config: PricingConfig,
+    signal: PriceSignal,
+    inventory_bias: float,
+    tick_size: float,
+    book_spread: float | None = None,
+    best_bid: float | None = None,
+    best_ask: float | None = None,
+) -> Quote:
     fair_value = derive_fair_value(signal)
     half_spread = compute_half_spread(config, signal, inventory_bias, book_spread, fair_value)
     skew = inventory_bias * config.inventory_skew_per_share
     bid = clamp_probability(fair_value - half_spread - skew)
     ask = clamp_probability(fair_value + half_spread - skew)
+    bid, ask = apply_quote_improvement(
+        bid,
+        ask,
+        best_bid=best_bid,
+        best_ask=best_ask,
+        tick_size=tick_size,
+        improvement_ticks=config.quote_improvement_ticks,
+    )
     if ask <= bid:
         ask = clamp_probability(bid + max(tick_size, 0.01))
     return Quote(
@@ -65,6 +81,27 @@ def build_yes_quote(config: PricingConfig, signal: PriceSignal, inventory_bias: 
         half_spread=half_spread,
         size=config.size_per_order,
     )
+
+
+def apply_quote_improvement(
+    bid: float,
+    ask: float,
+    best_bid: float | None,
+    best_ask: float | None,
+    tick_size: float,
+    improvement_ticks: int,
+) -> tuple[float, float]:
+    ticks = max(int(improvement_ticks), 0)
+    if ticks <= 0:
+        return bid, ask
+    tick = max(tick_size, 0.01)
+    if best_bid is not None:
+        bid = max(bid, best_bid + ticks * tick)
+        bid = clamp_probability(bid)
+    if best_ask is not None:
+        ask = min(ask, best_ask - ticks * tick)
+        ask = clamp_probability(ask)
+    return bid, ask
 
 
 def round_to_tick(price: float, tick_size: float, down: bool) -> float:

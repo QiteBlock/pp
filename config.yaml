@@ -21,7 +21,7 @@ telegram:
   notify_market_switch: true
 
 runtime:
-  loop_interval_seconds: 8
+  loop_interval_seconds: 4
   dry_run: false
   cancel_before_requote: true
   log_dir: "data"
@@ -29,7 +29,7 @@ runtime:
   scan_limit: 200
   scan_pages: 10
   scan_candidate_cap: 100
-  max_active_markets: 3
+  max_active_markets: 5
   unwind_escalation_cycles: 3
   reconciliation_interval_loops: 25
   rescan_interval_seconds: 900
@@ -43,7 +43,7 @@ pricing:
   book_spread_multiplier: 0.75
   probability_edge_multiplier: 0.005
   size_per_order: 50.0
-  quote_improvement_ticks: 0
+  quote_improvement_ticks: 1
 
 risk:
   max_yes_shares_per_market: 125

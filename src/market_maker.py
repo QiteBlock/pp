@@ -219,7 +219,15 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
     signal = build_signal(book.midpoint, book.last_trade_price, recent_prices, market.end_date)
     inventory = context.inventory.get(market.slug)
     inventory_bias = inventory.net_delta
-    quote = build_yes_quote(context.pricing, signal, inventory_bias, book.tick_size, book.spread)
+    quote = build_yes_quote(
+        context.pricing,
+        signal,
+        inventory_bias,
+        book.tick_size,
+        book.spread,
+        best_bid=book.best_bid,
+        best_ask=book.best_ask,
+    )
     mark_prices[market.slug] = quote.fair_value
     fair_value_breach = fair_value_band_breach(quote.fair_value, context.filters)
     if fair_value_breach:
