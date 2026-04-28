@@ -73,8 +73,12 @@ def build_yes_quote(
         tick_size=tick_size,
         improvement_ticks=config.quote_improvement_ticks,
     )
+    tick = max(tick_size, 0.01)
+    if best_bid is not None:
+        ask = max(ask, best_bid + tick)
+        ask = clamp_probability(ask)
     if ask <= bid:
-        ask = clamp_probability(bid + max(tick_size, 0.01))
+        ask = clamp_probability(bid + tick)
     return Quote(
         bid=round_to_tick(bid, tick_size, down=True),
         ask=round_to_tick(ask, tick_size, down=False),
