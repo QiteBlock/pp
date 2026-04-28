@@ -42,6 +42,7 @@ class BotContext:
     scan_candidate_cap: int
     max_active_markets: int
     unwind_escalation_cycles: int
+    reconciliation_interval_loops: int
     rescan_interval_seconds: int
     last_scan_ts: float
     active_market: Optional[MarketConfig]
@@ -56,19 +57,15 @@ def run_market_maker(config_path: str) -> None:
         print(f"Loaded {len(context.markets)} configured markets. Dry run={context.dry_run}. Auto-scan={context.auto_scan_enabled}.")
         if not context.dry_run:
             preflight_live_auth(context)
-            reconciliation_report = context.reconciler.reconcile_startup(markets_for_state_tracking(context))
+            reconciliation_report = perform_reconciliation(context, trigger="startup")
             print(f"Startup reconciliation: {reconciliation_report.summary()}")
-            context.analytics.log_event("startup_reconciliation", {
-                "status": reconciliation_report.status,
-                "discrepancies_count": len(reconciliation_report.discrepancies),
-                "adjustments_count": len(reconciliation_report.adjustments),
-                "error": reconciliation_report.error,
-            })
             if not reconciliation_report.should_proceed_with_trading():
                 raise RuntimeError(f"Startup reconciliation failed - cannot proceed safely: {reconciliation_report.error}")
         if context.telegram.is_enabled():
             context.telegram.send_message(build_status_message(context, prefix="Bot process online"))
+        loop_count = 0
         while True:
+            loop_count += 1
             handle_telegram_commands(context)
             refresh_market_selection(context)
             mark_prices: dict[str, float] = {}
@@ -78,6 +75,13 @@ def run_market_maker(config_path: str) -> None:
                 fills_processed = context.fill_poller.poll_fills(token_mapping)
                 if fills_processed > 0:
                     print(f"Processed {fills_processed} new fill(s)")
+                if context.reconciliation_interval_loops > 0 and loop_count % context.reconciliation_interval_loops == 0:
+                    reconciliation_report = perform_reconciliation(
+                        context,
+                        trigger="periodic",
+                        loop_count=loop_count,
+                    )
+                    print(f"Periodic reconciliation: {reconciliation_report.summary()}")
 
             if not context.control.trading_enabled:
                 print("Trading paused by Telegram control.")
@@ -146,6 +150,7 @@ def load_context(config_path: str) -> BotContext:
         scan_candidate_cap=int(runtime.get("scan_candidate_cap", 25)),
         max_active_markets=max(int(runtime.get("max_active_markets", 1)), 1),
         unwind_escalation_cycles=max(int(runtime.get("unwind_escalation_cycles", 3)), 1),
+        reconciliation_interval_loops=max(int(runtime.get("reconciliation_interval_loops", 25)), 0),
         rescan_interval_seconds=int(runtime.get("rescan_interval_seconds", 900)),
         last_scan_ts=0.0,
         active_market=None,
@@ -173,6 +178,29 @@ def markets_for_state_tracking(context: BotContext) -> list[MarketConfig]:
         if all(market.slug != active_market.slug for market in markets):
             markets.append(active_market)
     return markets
+
+
+def perform_reconciliation(context: BotContext, trigger: str, **details: Any) -> Any:
+    report = context.reconciler.reconcile_positions(markets_for_state_tracking(context))
+    payload = {
+        "trigger": trigger,
+        "status": report.status,
+        "discrepancies_count": len(report.discrepancies),
+        "adjustments_count": len(report.adjustments),
+        "unknown_positions_count": len(report.unknown_positions),
+        "orphaned_positions_count": len(report.orphaned_positions),
+        "error": report.error,
+    }
+    payload.update(details)
+    context.analytics.log_event("reconciliation", payload)
+    return report
+
+
+def run_recovery_reconciliation(context: BotContext, trigger: str, **details: Any) -> None:
+    if context.dry_run:
+        return
+    report = perform_reconciliation(context, trigger=trigger, **details)
+    print(f"Recovery reconciliation ({trigger}): {report.summary()}")
 
 
 def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[str, float]) -> None:
@@ -340,7 +368,19 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
                 "Polymarket rejected live order placement due to regional trading restrictions. "
                 "The bot has stopped before placing further orders. Use dry_run=true unless you are in an eligible region."
             ) from exc
-        raise
+        context.analytics.log_event(
+            "quote_error",
+            {
+                "market": market.slug,
+                "details": str(exc),
+                "fair_value": quote.fair_value,
+                "bid": quote.bid,
+                "ask": quote.ask,
+            },
+        )
+        run_recovery_reconciliation(context, "quote_error", market=market.slug, details=str(exc))
+        print(f"[{market.slug}] quote placement failed: {exc}")
+        return
     context.analytics.log_event(
         "quote_cycle",
         {
@@ -444,8 +484,25 @@ def process_unwind_market(
         )
         if order_request["side"].upper() == "SELL" and is_insufficient_balance_error(exc):
             recover_from_sell_balance_rejection(context, market, inventory, order_request, reason, mode, str(exc))
+            run_recovery_reconciliation(
+                context,
+                "unwind_error",
+                market=market.slug,
+                reason=reason,
+                mode=mode,
+                details=str(exc),
+            )
             return
-        raise
+        run_recovery_reconciliation(
+            context,
+            "unwind_error",
+            market=market.slug,
+            reason=reason,
+            mode=mode,
+            details=str(exc),
+        )
+        print(f"[{market.slug}] unwind placement failed: {exc}")
+        return
 
     context.analytics.log_event(
         "unwind_quote_cycle",

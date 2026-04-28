@@ -18,8 +18,8 @@ class PositionReconciler:
         self.client = client
         self.inventory = inventory
 
-    def reconcile_startup(self, markets: list[MarketConfig]) -> ReconciliationReport:
-        """Perform startup reconciliation against API positions.
+    def reconcile_positions(self, markets: list[MarketConfig]) -> ReconciliationReport:
+        """Reconcile inventory against API positions.
 
         Fetches current positions from Polymarket and reconciles against inventory.
         For any discrepancies, updates inventory to match API state.
@@ -124,6 +124,10 @@ class PositionReconciler:
             report.status = "consistent"
 
         return report
+
+    def reconcile_startup(self, markets: list[MarketConfig]) -> ReconciliationReport:
+        """Backward-compatible startup entrypoint."""
+        return self.reconcile_positions(markets)
 
 
 class ReconciliationReport:
