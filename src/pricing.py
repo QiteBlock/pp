@@ -67,6 +67,7 @@ def build_yes_quote(
     bid, ask = apply_quote_improvement(
         bid,
         ask,
+        inventory_bias=inventory_bias,
         best_bid=best_bid,
         best_ask=best_ask,
         tick_size=tick_size,
@@ -86,6 +87,7 @@ def build_yes_quote(
 def apply_quote_improvement(
     bid: float,
     ask: float,
+    inventory_bias: float,
     best_bid: float | None,
     best_ask: float | None,
     tick_size: float,
@@ -95,10 +97,12 @@ def apply_quote_improvement(
     if ticks <= 0:
         return bid, ask
     tick = max(tick_size, 0.01)
-    if best_bid is not None:
+    improve_bid = inventory_bias <= 0
+    improve_ask = inventory_bias >= 0
+    if improve_bid and best_bid is not None:
         bid = max(bid, best_bid + ticks * tick)
         bid = clamp_probability(bid)
-    if best_ask is not None:
+    if improve_ask and best_ask is not None:
         ask = min(ask, best_ask - ticks * tick)
         ask = clamp_probability(ask)
     return bid, ask
