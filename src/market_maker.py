@@ -193,6 +193,26 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
     inventory_bias = inventory.net_delta
     quote = build_yes_quote(context.pricing, signal, inventory_bias, book.tick_size, book.spread)
     mark_prices[market.slug] = quote.fair_value
+    fair_value_breach = fair_value_band_breach(quote.fair_value, context.filters)
+    if fair_value_breach:
+        if inventory.gross_shares > 0.01:
+            process_unwind_market(
+                context,
+                market,
+                inventory,
+                quote,
+                book,
+                fair_value_breach,
+                mode="flatten",
+                aggressive=False,
+            )
+            return
+        context.analytics.log_event(
+            "risk_skip",
+            {"market": market.slug, "reason": fair_value_breach, "fair_value": quote.fair_value},
+        )
+        print(f"[{market.slug}] skipped: {fair_value_breach} fair={quote.fair_value:.3f}")
+        return
     portfolio_exposure = total_exposure(context.inventory, mark_prices)
     contribution_map = exposure_by_market(context.inventory, mark_prices)
     largest_contributor = max(contribution_map, key=contribution_map.get, default=None)
@@ -336,6 +356,8 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             "responses": {"bid": bid_response, "ask": ask_response},
         },
     )
+    log_rejected_order_response(context, market, "YES bid", bid_response, kind="quote")
+    log_rejected_order_response(context, market, "NO bid", ask_response, kind="quote")
     print_quote_status(market, book, quote.fair_value, quote.bid, quote.ask, inventory.net_delta)
     print_order_response("YES bid", bid_response)
     print_order_response("NO bid", ask_response)
@@ -393,6 +415,10 @@ def process_unwind_market(
         )
         return
 
+    if not context.dry_run and order_request["side"].upper() == "SELL":
+        if not prepare_sell_unwind_order(context, market, inventory, order_request):
+            return
+
     try:
         response = context.client.place_limit_order(
             token_id=order_request["token_id"],
@@ -402,9 +428,9 @@ def process_unwind_market(
             tick_size=order_request["tick_size"],
             dry_run=context.dry_run,
             neg_risk=market.neg_risk,
-            post_only=not aggressive,
+            post_only=not effective_aggressive,
         )
-    except Exception:
+    except Exception as exc:
         context.analytics.log_event(
             "unwind_error",
             {
@@ -413,8 +439,12 @@ def process_unwind_market(
                 "mode": mode,
                 "aggressive": effective_aggressive,
                 "order_request": order_request,
+                "details": str(exc),
             },
         )
+        if order_request["side"].upper() == "SELL" and is_insufficient_balance_error(exc):
+            recover_from_sell_balance_rejection(context, market, inventory, order_request, reason, mode, str(exc))
+            return
         raise
 
     context.analytics.log_event(
@@ -430,6 +460,15 @@ def process_unwind_market(
             "order_request": order_request,
             "response": response,
         },
+    )
+    log_rejected_order_response(
+        context,
+        market,
+        order_request["label"],
+        response,
+        kind="unwind",
+        mode=mode,
+        reason=reason,
     )
     print(
         f"[{market.slug}] unwind-only: mode={mode} aggressive={effective_aggressive} reason={reason} "
@@ -608,6 +647,104 @@ def bounded_unwind_size(requested_size: float, available_size: float, min_order_
     return min(max(float(requested_size), min_order_size), available)
 
 
+def prepare_sell_unwind_order(
+    context: BotContext,
+    market: MarketConfig,
+    inventory: Any,
+    order_request: dict[str, Any],
+) -> bool:
+    live_balance = get_live_conditional_balance(context, order_request["token_id"])
+    if live_balance is None:
+        return True
+    sync_inventory_balance(market, inventory, order_request["token_id"], live_balance)
+    adjusted_size = bounded_unwind_size(
+        requested_size=min(order_request["size"], live_balance),
+        available_size=live_balance,
+        min_order_size=context.risk.min_order_size,
+    )
+    if adjusted_size is None:
+        context.analytics.log_event(
+            "unwind_skip",
+            {
+                "market": market.slug,
+                "reason": "live balance below min order size for sell unwind",
+                "token_id": order_request["token_id"],
+                "requested_size": order_request["size"],
+                "live_balance": live_balance,
+                "label": order_request["label"],
+            },
+        )
+        print(
+            f"[{market.slug}] skipped: {order_request['label']} live balance {live_balance:.4f} "
+            f"below min order size {context.risk.min_order_size:.4f}"
+        )
+        return False
+    if adjusted_size + 1e-9 < order_request["size"]:
+        context.analytics.log_event(
+            "unwind_size_adjusted",
+            {
+                "market": market.slug,
+                "token_id": order_request["token_id"],
+                "label": order_request["label"],
+                "requested_size": order_request["size"],
+                "adjusted_size": adjusted_size,
+                "live_balance": live_balance,
+            },
+        )
+        order_request["size"] = adjusted_size
+    return True
+
+
+def get_live_conditional_balance(context: BotContext, token_id: str) -> Optional[float]:
+    try:
+        payload = context.client.get_conditional_balance_allowance(token_id)
+    except Exception as exc:
+        context.analytics.log_event(
+            "conditional_balance_check_error",
+            {"token_id": token_id, "details": str(exc)},
+        )
+        return None
+    return parse_usdc_amount(payload.get("balance"))
+
+
+def sync_inventory_balance(market: MarketConfig, inventory: Any, token_id: str, live_balance: float) -> None:
+    normalized_balance = max(float(live_balance), 0.0)
+    if token_id == market.yes_token_id:
+        inventory.yes_shares = normalized_balance
+        return
+    if token_id == market.no_token_id:
+        inventory.no_shares = normalized_balance
+
+
+def recover_from_sell_balance_rejection(
+    context: BotContext,
+    market: MarketConfig,
+    inventory: Any,
+    order_request: dict[str, Any],
+    reason: str,
+    mode: str,
+    details: str,
+) -> None:
+    live_balance = get_live_conditional_balance(context, order_request["token_id"])
+    if live_balance is not None:
+        sync_inventory_balance(market, inventory, order_request["token_id"], live_balance)
+    context.analytics.log_event(
+        "unwind_balance_rejected",
+        {
+            "market": market.slug,
+            "reason": reason,
+            "mode": mode,
+            "order_request": order_request,
+            "live_balance": live_balance,
+            "details": details,
+        },
+    )
+    print(
+        f"[{market.slug}] {order_request['label']} rejected for insufficient balance/allowance; "
+        f"live_balance={live_balance if live_balance is not None else 'unknown'}"
+    )
+
+
 def get_market_book(context: BotContext, token_id: str) -> Optional[OrderBookSnapshot]:
     try:
         return context.client.get_orderbook(token_id)
@@ -652,13 +789,69 @@ def print_quote_status(market: MarketConfig, book: OrderBookSnapshot, fair_value
 
 
 def print_order_response(label: str, response: Any) -> None:
-    if isinstance(response, dict):
-        order_id = response.get("orderID") or response.get("order_id") or response.get("id")
-        status = response.get("status") or response.get("success") or response.get("errorMsg") or response.get("error")
-        if order_id or status:
-            print(f"  {label}: status={status} order_id={order_id}")
-            return
+    order_id, status, reason = extract_order_response_metadata(response)
+    if order_id or status or reason:
+        reason_text = f" reason={reason}" if reason and reason != status else ""
+        print(f"  {label}: status={status or '-'} order_id={order_id or '-'}{reason_text}")
+        return
     print(f"  {label}: response={response}")
+
+
+def extract_order_response_metadata(response: Any) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    if not isinstance(response, dict):
+        return None, None, None
+    order_id = response.get("orderID") or response.get("order_id") or response.get("id")
+    status_value = response.get("status")
+    success_value = response.get("success")
+    if status_value in (None, "") and isinstance(success_value, bool):
+        status_value = "success" if success_value else "failed"
+    elif status_value in (None, "") and success_value not in (None, ""):
+        status_value = success_value
+    reason = (
+        response.get("errorMsg")
+        or response.get("error")
+        or response.get("error_message")
+        or response.get("message")
+        or response.get("reason")
+        or response.get("rejectReason")
+        or response.get("details")
+    )
+    status = str(status_value) if status_value not in (None, "") else None
+    reason_text = str(reason) if reason not in (None, "") else None
+    return order_id, status, reason_text
+
+
+def is_rejected_order_response(response: Any) -> bool:
+    if not isinstance(response, dict):
+        return False
+    if response.get("success") is False:
+        return True
+    _, status, reason = extract_order_response_metadata(response)
+    if status is None:
+        return reason is not None
+    return status.strip().lower() not in {"dry_run", "live", "matched", "pending", "ok", "success"}
+
+
+def log_rejected_order_response(
+    context: BotContext,
+    market: MarketConfig,
+    label: str,
+    response: Any,
+    **details: Any,
+) -> None:
+    if not is_rejected_order_response(response):
+        return
+    _, status, reason = extract_order_response_metadata(response)
+    payload = {
+        "market": market.slug,
+        "label": label,
+        "status": status,
+        "reason": reason,
+        "response": response,
+    }
+    payload.update(details)
+    context.analytics.log_event("order_rejected", payload)
+    print(f"[{market.slug}] {label} rejected: status={status or 'unknown'} reason={reason or 'n/a'}")
 
 
 def print_open_orders(context: BotContext, market: MarketConfig) -> None:
@@ -766,6 +959,11 @@ def passes_post_only_guard(book: OrderBookSnapshot, bid: float, ask: float) -> b
 
 def is_trading_restricted_error(exc: Exception) -> bool:
     return "Trading restricted in your region" in str(exc)
+
+
+def is_insufficient_balance_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "not enough balance / allowance" in message or "balance is not enough" in message
 
 
 def round_no_bid_price(yes_ask: float, tick_size: float) -> float:
@@ -921,6 +1119,9 @@ def select_best_markets(context: BotContext) -> Optional[list[MarketConfig]]:
         spread_bps = ((book.spread or 0.0) * 10000.0)
         if spread_bps < float(context.filters.get("min_spread_bps", 0.0)):
             continue
+        live_reference_price = book.midpoint if book.midpoint is not None else normalized.get("reference_price")
+        if fair_value_band_breach(live_reference_price, context.filters) is not None:
+            continue
         neg_risk = normalized.get("neg_risk")
         if neg_risk is None:
             try:
@@ -992,19 +1193,26 @@ def market_passes_filters(market: dict[str, Any], filters: dict[str, Any], min_d
     if float(market.get("volume_24h", 0.0)) < float(filters.get("min_volume_24h", 0.0)):
         return False
     reference_price = market.get("reference_price")
-    min_fair_value = _to_optional_float(filters.get("min_fair_value"))
-    max_fair_value = _to_optional_float(filters.get("max_fair_value"))
-    if reference_price is not None:
-        if min_fair_value is not None and reference_price < min_fair_value:
-            return False
-        if max_fair_value is not None and reference_price > max_fair_value:
-            return False
+    if fair_value_band_breach(reference_price, filters) is not None:
+        return False
     end_date = parse_end_date(market.get("end_date"))
     if end_date is not None:
         days_left = max((end_date - datetime.now(timezone.utc)).total_seconds() / 86400.0, 0.0)
         if days_left < min_days:
             return False
     return True
+
+
+def fair_value_band_breach(fair_value: Optional[float], filters: dict[str, Any]) -> Optional[str]:
+    if fair_value is None:
+        return None
+    min_fair_value = _to_optional_float(filters.get("min_fair_value"))
+    max_fair_value = _to_optional_float(filters.get("max_fair_value"))
+    if min_fair_value is not None and fair_value < min_fair_value:
+        return f"fair value below min bound ({fair_value:.3f} < {min_fair_value:.3f})"
+    if max_fair_value is not None and fair_value > max_fair_value:
+        return f"fair value above max bound ({fair_value:.3f} > {max_fair_value:.3f})"
+    return None
 
 
 def _to_optional_float(value: Any) -> Optional[float]:

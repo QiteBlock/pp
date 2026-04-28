@@ -267,6 +267,18 @@ class PolymarketClient:
             BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         )
 
+    def get_conditional_balance_allowance(self, token_id: str) -> dict[str, Any]:
+        self.ensure_api_credentials()
+        if self.trading_client is None or BalanceAllowanceParams is None or AssetType is None:
+            raise RuntimeError("Trading client unavailable.")
+        if self.sdk == "v1":
+            return self.trading_client.get_balance_allowance(
+                V1BalanceAllowanceParams(asset_type=V1AssetType.CONDITIONAL, token_id=token_id)
+            )
+        return self.trading_client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+        )
+
     def get_neg_risk(self, token_id: str) -> bool:
         if self.trading_client is None:
             raise RuntimeError("Trading client unavailable.")
