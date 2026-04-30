@@ -7,7 +7,6 @@ use crate::{
 };
 use chrono::{DateTime, Duration, Timelike, Utc};
 use rust_decimal::{prelude::ToPrimitive, Decimal, MathematicalOps};
-use tracing::info;
 
 // ─── VPIN tracker ────────────────────────────────────────────────────────────
 
@@ -139,23 +138,10 @@ impl FactorEngine {
         fill_tracker: &FillTracker,
     ) -> Option<FactorSnapshot> {
         let Some(market) = state.market.symbols.get(&pair.symbol) else {
-            info!(
-                symbol = %pair.symbol,
-                known_market_symbols = state.market.symbols.len(),
-                "compute() returned None: missing market symbol state"
-            );
             return None;
         };
         // Use microprice (BBO size-weighted mid) when available, blended by config weight.
         let Some(raw_mid) = market.mid_price() else {
-            info!(
-                symbol = %pair.symbol,
-                best_bid = ?market.best_bid,
-                best_ask = ?market.best_ask,
-                mark_price = ?market.mark_price,
-                spot_price = ?market.spot_price,
-                "compute() returned None: market.mid_price() unavailable"
-            );
             return None;
         };
         let mid = if let Some(mp) = market.microprice() {
@@ -165,11 +151,6 @@ impl FactorEngine {
             raw_mid
         };
         let Some(now) = market.last_updated else {
-            info!(
-                symbol = %pair.symbol,
-                market_last_updated_at = ?state.market.last_updated_at,
-                "compute() returned None: market.last_updated unavailable"
-            );
             return None;
         };
         let symbol_state = self.symbol_state.entry(pair.symbol.clone()).or_default();
@@ -345,10 +326,6 @@ impl FactorEngine {
         // Formula: pos_ratio * (1 + convexity * |pos_ratio|) * effective_base
         // where effective_base = vol_floor * inventory_risk_constant (preserves existing scale).
         let Some(pair_parsed) = parsed.pair(&pair.symbol) else {
-            info!(
-                symbol = %pair.symbol,
-                "compute() returned None: parsed pair config missing"
-            );
             return None;
         };
         let current_position = state
@@ -439,11 +416,6 @@ impl FactorEngine {
                 if let Some(mark_price) = market.mark_price {
                     mark_price
                 } else {
-                    info!(
-                        symbol = %pair.symbol,
-                        microprice = %microprice,
-                        "compute() missing mark_price; using microprice fallback"
-                    );
                     microprice
                 }
             }
@@ -477,12 +449,6 @@ impl FactorEngine {
         let effective_volatility_addon = volatility_addon.max(symbol_state.spread_floor);
 
         if symbol_state.bbo_spread_ewma.is_none() {
-            info!(
-                symbol = %pair.symbol,
-                best_bid = ?market.best_bid,
-                best_ask = ?market.best_ask,
-                "compute() returned None: bbo_spread_ewma not initialized yet"
-            );
             return None;
         }
         let inventory_lean_bps = (bbo_spread_ewma_bps / Decimal::TWO) * Decimal::new(7, 1);
@@ -530,7 +496,7 @@ impl FactorEngine {
         // Track how many consecutive cycles the flow direction has been spiking above
         // the pause threshold.  We use the same threshold from config so the counter
         // is always consistent with the pause decision in the engine.
-        let flow_direction_clamped = combined_flow_direction.clamp(-Decimal::ONE, Decimal::ONE);
+        let flow_direction_clamped = smooth_flow_direction(combined_flow_direction);
         let spike_threshold = parsed.factors.flow_spike_pause_threshold;
         if spike_threshold > Decimal::ZERO && flow_direction_clamped.abs() > spike_threshold {
             symbol_state.consecutive_flow_spike += 1;
@@ -672,6 +638,14 @@ fn candidate_regime(
         return MarketRegime::VolatileBalanced;
     }
     MarketRegime::Quiet
+}
+
+fn smooth_flow_direction(value: Decimal) -> Decimal {
+    if value.is_zero() {
+        Decimal::ZERO
+    } else {
+        value / (Decimal::ONE + value.abs())
+    }
 }
 
 /// S8: GRVT/Asia-aware time-of-day spread multiplier.

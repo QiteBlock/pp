@@ -29,7 +29,7 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{client::IntoClientRequest, Message as WsMessage},
 };
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 use crate::{
     adapters::{
@@ -113,7 +113,6 @@ impl GrvtClient {
         }
 
         let (login_url, payload) = if !self.config.grvt_api_key.trim().is_empty() {
-            info!("grvt api-key login starting");
             (
                 self.auth_endpoint("/auth/api_key/login"),
                 json!({
@@ -121,7 +120,6 @@ impl GrvtClient {
                 }),
             )
         } else {
-            info!("grvt wallet login starting");
             let wallet: LocalWallet = self
                 .config
                 .grvt_private_key
@@ -130,8 +128,6 @@ impl GrvtClient {
             let signer = format!("{:#x}", wallet.address());
             let nonce = self.now_grvt_nonce();
             let expiration = self.server_time_nanos().await? + 300_000_000_000i64;
-            info!(signer = %signer, nonce, expiration, chain_id = %self.config.grvt_chain_id, "grvt wallet login payload prepared");
-            info!("grvt wallet login signing typed data");
             let signature: EvmSignature = match sign_grvt_wallet_login(
                 &wallet,
                 &signer,
@@ -145,10 +141,6 @@ impl GrvtClient {
                     return Err(err).context("grvt wallet login signing failed");
                 }
             };
-            info!(
-                v = signature.v as u64,
-                "grvt wallet login signature created"
-            );
             (
                 self.auth_endpoint("/auth/wallet/login"),
                 json!({
@@ -165,7 +157,6 @@ impl GrvtClient {
                 }),
             )
         };
-        info!(url = %login_url, "grvt auth request sending");
         self.rest_governor.until_ready().await;
         let response = self
             .http
@@ -181,7 +172,6 @@ impl GrvtClient {
         let cookie = extract_grvt_cookie(response.headers());
         let account_id = extract_grvt_account_id(response.headers());
         let body = response.text().await.unwrap_or_default();
-        info!(%status, body = %body, "grvt auth response received");
         if !status.is_success() {
             error!(%status, body = %body, "grvt auth failed");
             bail!("grvt auth failed with HTTP {status}: {body}");
@@ -193,7 +183,6 @@ impl GrvtClient {
         let account_id = account_id.unwrap_or_else(|| self.config.grvt_account_id.clone());
         *self.session_cookie.write().await = Some(cookie.clone());
         *self.session_account_id.write().await = Some(account_id.clone());
-        info!(account_id = %account_id, "grvt auth succeeded");
         Ok((cookie, account_id))
     }
 
@@ -211,11 +200,6 @@ impl GrvtClient {
             .checked_mul(1_000_000)
             .context("grvt server time nanoseconds overflow")?;
         let nanos = i64::try_from(nanos).context("grvt server time does not fit i64")?;
-        info!(
-            server_time_ms = response.server_time,
-            server_time_ns = nanos,
-            "grvt server time fetched"
-        );
         Ok(nanos)
     }
 
@@ -383,15 +367,6 @@ impl GrvtClient {
             let notional = position.quantity.abs() * reference_price;
             if notional >= min_close_notional {
                 active.push(position.clone());
-            } else {
-                info!(
-                    symbol = %position.symbol,
-                    quantity = %position.quantity,
-                    reference_price = %reference_price,
-                    notional = %notional,
-                    min_close_notional = %min_close_notional,
-                    "treating grvt cleanup position as dust below live minimum notional"
-                );
             }
         }
         Ok(active)
@@ -447,7 +422,6 @@ impl GrvtClient {
     }
 
     async fn load_instruments_uncached(&self) -> Result<Vec<GrvtInstrument>> {
-        info!("grvt loading instruments");
         let response: GrvtAllInstrumentsResponse = self
             .request_policy
             .send_with_retry(&self.rest_governor, "grvt_all_instruments", || {
@@ -463,10 +437,6 @@ impl GrvtClient {
             .await?
             .json()
             .await?;
-        info!(
-            count = response.result.len(),
-            "grvt instruments response received"
-        );
 
         response
             .result
@@ -505,7 +475,6 @@ impl GrvtClient {
             .map(|instrument| (instrument.meta.symbol.clone(), instrument))
             .collect::<HashMap<_, _>>();
         *self.instrument_cache.write().await = Some(by_symbol.clone());
-        info!(count = by_symbol.len(), "grvt instrument cache seeded");
         Ok(by_symbol)
     }
 
@@ -525,7 +494,6 @@ impl GrvtClient {
                     async move {
                         let raw_frame_count = AtomicUsize::new(0);
                         let parsed_frame_count = AtomicUsize::new(0);
-                        info!(stream = stream_name, selectors = ?selectors, "grvt market websocket connecting");
                         let (mut ws_stream, _) = connect_async(&url).await?;
                         let subscribe = serde_json::to_string(&json!({
                             "jsonrpc": "2.0",
@@ -537,7 +505,6 @@ impl GrvtClient {
                             "id": grvt_request_id(stream_name),
                         }))?;
                         ws_stream.send(WsMessage::Text(subscribe.into())).await?;
-                        info!(stream = stream_name, "grvt market websocket subscribed");
 
                         let mut keepalive = {
                             let mut t = tokio::time::interval(Duration::from_secs(10));
@@ -880,7 +847,6 @@ impl MarketDataSource for GrvtClient {
 #[async_trait]
 impl PrivateDataSource for GrvtClient {
     async fn stream_private_data(&self, sender: mpsc::Sender<PrivateEvent>) -> Result<()> {
-        info!("grvt private websocket loop starting");
         self.request_policy
             .run_ws_loop(
                 "grvt_private",
@@ -901,7 +867,6 @@ impl PrivateDataSource for GrvtClient {
     }
 
     async fn fetch_open_orders(&self) -> Result<Vec<OpenOrder>> {
-        info!("grvt fetching open orders");
         let response = self
             .post_trading(
                 "/full/v1/open_orders",
@@ -913,12 +878,10 @@ impl PrivateDataSource for GrvtClient {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        info!(count = orders.len(), "grvt open orders fetched");
         Ok(orders.iter().filter_map(parse_grvt_open_order).collect())
     }
 
     async fn fetch_positions(&self) -> Result<Vec<Position>> {
-        info!("grvt fetching positions");
         let response = self
             .post_trading(
                 "/full/v1/positions",
@@ -933,7 +896,6 @@ impl PrivateDataSource for GrvtClient {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        info!(count = positions.len(), "grvt positions fetched");
         Ok(positions.iter().filter_map(parse_grvt_position).collect())
     }
 }
@@ -955,7 +917,6 @@ impl GrvtClient {
             .insert("X-Grvt-Account-Id", HeaderValue::from_str(&account_id)?);
 
         let (mut ws_stream, _) = connect_async(request).await?;
-        info!("grvt private websocket connected");
 
         self.send_private_snapshot(&sender).await?;
         let replay_fill_cutoff = Utc::now();
@@ -1022,7 +983,6 @@ impl GrvtClient {
 
     async fn send_private_snapshot(&self, sender: &mpsc::Sender<PrivateEvent>) -> Result<()> {
         if let Ok(equity) = self.fetch_account_equity().await {
-            info!(equity = %equity, "grvt private snapshot account equity fetched");
             sender.send(PrivateEvent::AccountEquity { equity }).await?;
         } else {
             warn!("grvt account equity fetch failed; equity will remain 0");
@@ -1076,7 +1036,6 @@ impl GrvtClient {
                 "id": id,
             }))?;
             ws_stream.send(WsMessage::Text(subscribe.into())).await?;
-            info!(stream, "grvt private websocket subscribed");
         }
         Ok(())
     }

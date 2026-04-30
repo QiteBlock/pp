@@ -4,7 +4,7 @@ use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::{sync::Mutex, time::Instant};
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::{config::TelegramConfig, ports::notifier::NotifierPort};
 
@@ -104,7 +104,6 @@ impl TelegramNotifier {
             let Some(command) = parse_command(&text) else {
                 continue;
             };
-            info!(chat_id = message.chat.id, text = %text, "received telegram command");
             commands.push((update.update_id, command));
         }
 

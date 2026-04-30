@@ -43,15 +43,29 @@ pub fn generate_quotes(
     let gauss_sigma = parsed.model.sigma.max(Decimal::new(1, 6));
     let dead_zone = parsed.model.position_dead_zone.abs();
     let spread_multiplier = parsed.model.position_spread_multiplier;
-    // For post-only quotes, the relevant execution-cost floor is maker-only.
-    // Using maker+taker here makes zero-maker venues artificially uncompetitive.
+    // Market making is a round trip. For post-only flow we still pay maker fees
+    // twice across the full lifecycle (entry fill and exit fill), so the full
+    // spread floor must clear 2 * maker_fee to break even.
+    // For non-post-only flow we keep the maker+taker floor assumption.
     let fee_floor_rate = if pair.post_only {
-        parsed.venue.maker_fee_rate
+        parsed.venue.maker_fee_rate * Decimal::TWO
     } else {
         parsed.venue.maker_fee_rate + parsed.venue.taker_fee_rate
     };
     let fee_floor_bps = fee_floor_rate * Decimal::from(10_000u64);
     let flow_spike_widen_mult = factors.flow_spike_widen_multiplier.max(Decimal::ONE);
+    let mut max_quote_notional = positive_min_cap(None, Some(v0 * factors.price_index));
+    if let Some(parsed_pair) = parsed
+        .pairs
+        .iter()
+        .find(|parsed_pair| parsed_pair.symbol == pair.symbol)
+    {
+        max_quote_notional = positive_min_cap(
+            max_quote_notional,
+            Some(parsed_pair.max_position_base * factors.price_index / Decimal::from(5u64)),
+        );
+    }
+    let spread_size_cap = spread_size_cap_multiplier(best_bid, best_ask);
 
     // A-S parameters
     let gamma = parsed.model.as_gamma.max(Decimal::new(1, 6));
@@ -63,15 +77,15 @@ pub fn generate_quotes(
     // Time horizon in hours.
     let time_horizon = parsed.model.as_time_horizon.max(Decimal::new(1, 6));
 
-    // Annualise σ: raw_volatility is per-cycle log-return std dev (EWMA).
-    // At 1s reconcile interval there are 3600 cycles/hour; σ_hour = σ_cycle * sqrt(3600) = σ_cycle * 60.
-    // Using sqrt(3600) = 60 in integer arithmetic.
+    // Annualise σ from the actual reconcile cadence so slower loops don't
+    // overstate hourly volatility.
     // B2: cap vol before it enters A-S to prevent BBO noise from inflating spread.
     let vol_per_cycle = factors
         .raw_volatility
         .max(parsed.factors.volatility_floor)
         .min(parsed.model.as_vol_cap);
-    let cycles_per_hour = Decimal::from(3600u64); // 1s cycles; adjust if reconcile_interval changes
+    let cycles_per_hour =
+        Decimal::from(3_600_000u64) / Decimal::from(parsed.runtime.reconcile_interval_ms.max(1));
     let vol_per_hour = vol_per_cycle * cycles_per_hour.sqrt().unwrap_or(Decimal::from(60u64));
 
     // A-S: γ·σ_hour²·T
@@ -87,7 +101,8 @@ pub fn generate_quotes(
     };
     let as_half_spread_frac_raw = gamma_sigma2_t / Decimal::TWO + ln_term / gamma;
 
-    // Clamp to [fee_floor/2, max_spread/2] in bps, then convert back to fraction for pricing.
+    // Clamp to [round-trip fee floor / 2, max_spread / 2] in bps, then convert
+    // back to fraction for pricing.
     let min_half_spread_bps =
         (fee_floor_bps / Decimal::TWO).max(effective_born_inf_bps / Decimal::TWO);
     let as_half_spread_bps = (as_half_spread_frac_raw * Decimal::from(10_000u64))
@@ -292,6 +307,16 @@ pub fn generate_quotes(
             bid_size *= toxic_reduction;
             ask_size *= safe_boost;
         }
+        bid_size *= spread_size_cap;
+        ask_size *= spread_size_cap;
+        if let Some(cap_notional) = max_quote_notional {
+            if bid_price > Decimal::ZERO {
+                bid_size = bid_size.min(cap_notional / bid_price);
+            }
+            if ask_price > Decimal::ZERO {
+                ask_size = ask_size.min(cap_notional / ask_price);
+            }
+        }
 
         if matches!(pair.side_filter, SideFilter::Both | SideFilter::BidOnly) {
             quotes.push(QuoteIntent {
@@ -352,4 +377,29 @@ pub fn factor_spread_addon(parsed: &ParsedConfig, volatility: Decimal) -> Decima
 fn gaussian(x: Decimal, mu: Decimal, sigma: Decimal) -> Decimal {
     let exponent = -((x - mu) * (x - mu)) / (Decimal::from(2u64) * sigma * sigma);
     exponent.exp()
+}
+
+fn positive_min_cap(current: Option<Decimal>, candidate: Option<Decimal>) -> Option<Decimal> {
+    match candidate.filter(|value| *value > Decimal::ZERO) {
+        Some(candidate) => Some(current.map_or(candidate, |value| value.min(candidate))),
+        None => current,
+    }
+}
+
+fn spread_size_cap_multiplier(best_bid: Option<Decimal>, best_ask: Option<Decimal>) -> Decimal {
+    let (Some(bid), Some(ask)) = (best_bid, best_ask) else {
+        return Decimal::ONE;
+    };
+    if bid <= Decimal::ZERO || ask <= Decimal::ZERO || ask <= bid {
+        return Decimal::ONE;
+    }
+    let mid = (bid + ask) / Decimal::from(2u64);
+    if mid <= Decimal::ZERO {
+        return Decimal::ONE;
+    }
+    let spread_bps = (ask - bid) / mid * Decimal::from(10_000u64);
+    if spread_bps <= Decimal::ZERO {
+        return Decimal::ONE;
+    }
+    (Decimal::from(40u64) / spread_bps).min(Decimal::ONE)
 }

@@ -1,12 +1,10 @@
-use anyhow::{bail, Result};
-use chrono::{DateTime, Duration, Utc};
-use rust_decimal::Decimal;
-use tracing::info;
-
 use crate::{
     config::{AppConfig, ParsedConfig},
     core::state::BotState,
 };
+use anyhow::{bail, Result};
+use chrono::{DateTime, Duration, Utc};
+use rust_decimal::Decimal;
 
 pub struct CircuitBreaker {
     open: bool,
@@ -44,11 +42,6 @@ impl CircuitBreaker {
         self.open = true;
         self.reason = Some(reason.clone());
         self.last_tripped_at = Some(now);
-        info!(
-            reason = %reason,
-            cooldown_ms = self.current_cooldown.num_milliseconds(),
-            "circuit breaker tripped"
-        );
     }
 
     pub fn reset(&mut self) {
@@ -73,11 +66,6 @@ impl CircuitBreaker {
             let reduced = self.current_cooldown - self.base_cooldown;
             self.current_cooldown = (self.base_cooldown + reduced / 2).max(self.base_cooldown);
         }
-        info!(
-            elapsed_ms = elapsed.num_milliseconds(),
-            cooldown_ms = self.current_cooldown.num_milliseconds(),
-            "circuit breaker reset"
-        );
     }
 
     pub fn force_reset(&mut self) {
@@ -85,10 +73,6 @@ impl CircuitBreaker {
         self.reason = None;
         self.current_cooldown = self.base_cooldown;
         self.last_tripped_at = None;
-        info!(
-            cooldown_ms = self.current_cooldown.num_milliseconds(),
-            "circuit breaker force reset"
-        );
     }
 
     pub fn ensure_closed(&self) -> Result<()> {

@@ -26,7 +26,7 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{client::IntoClientRequest, Message as WsMessage},
 };
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::{
     adapters::{
@@ -237,40 +237,22 @@ impl ExtendedClient {
                     let sender = sender.clone();
                     let subscribed = subscribed.clone();
                     async move {
-                        let ws_path = path.clone();
                         let mut request = path.into_client_request()?;
                         request.headers_mut().insert(
                             USER_AGENT,
                             HeaderValue::from_str("market-making-bot/0.1.0")?,
                         );
                         let (mut ws_stream, _) = connect_async(request).await?;
-                        info!(
-                            stream = stream_name,
-                            path = %ws_path,
-                            symbols = ?subscribed,
-                            "extended public websocket connected"
-                        );
                         let mut logged_first_text = false;
                         let mut logged_first_event = false;
                         loop {
                             match ws_stream.next().await {
                                 Some(Ok(WsMessage::Text(text))) => {
                                     if !logged_first_text {
-                                        info!(
-                                            stream = stream_name,
-                                            frame_len = text.len(),
-                                            frame = %text,
-                                            "extended public websocket first text frame"
-                                        );
                                         logged_first_text = true;
                                     }
                                     let events = parser(&text, &subscribed)?;
                                     if !events.is_empty() && !logged_first_event {
-                                        info!(
-                                            stream = stream_name,
-                                            event_count = events.len(),
-                                            "extended public websocket first parsed events"
-                                        );
                                         logged_first_event = true;
                                     }
                                     for event in events {
@@ -326,7 +308,6 @@ impl ExtendedClient {
             .insert(USER_AGENT, HeaderValue::from_str(&self.config.user_agent)?);
 
         let (mut ws_stream, _) = connect_async(request).await?;
-        info!("extended private websocket connected");
         let mut logged_first_text = false;
         let mut logged_first_event = false;
 
@@ -334,19 +315,10 @@ impl ExtendedClient {
             match ws_stream.next().await {
                 Some(Ok(WsMessage::Text(text))) => {
                     if !logged_first_text {
-                        info!(
-                            frame_len = text.len(),
-                            frame = %text,
-                            "extended private websocket first text frame"
-                        );
                         logged_first_text = true;
                     }
                     let events = parse_extended_private_events(&text)?;
                     if !events.is_empty() && !logged_first_event {
-                        info!(
-                            event_count = events.len(),
-                            "extended private websocket first parsed events"
-                        );
                         logged_first_event = true;
                     }
                     for event in events {
@@ -371,19 +343,10 @@ impl ExtendedClient {
 
     async fn send_private_snapshot(&self, sender: &mpsc::Sender<PrivateEvent>) -> Result<()> {
         let equity = self.fetch_balance_equity().await?;
-        info!(equity = %equity, "extended private snapshot balance fetched");
         sender.send(PrivateEvent::AccountEquity { equity }).await?;
         let open_orders = self.fetch_open_orders().await?;
-        info!(
-            count = open_orders.len(),
-            "extended private snapshot open orders fetched"
-        );
         sender.send(PrivateEvent::OpenOrders(open_orders)).await?;
         let positions = self.fetch_positions().await?;
-        info!(
-            count = positions.len(),
-            "extended private snapshot positions fetched"
-        );
         for position in positions {
             sender.send(PrivateEvent::Position(position)).await?;
         }

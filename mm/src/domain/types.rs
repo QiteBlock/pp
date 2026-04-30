@@ -325,6 +325,29 @@ pub struct StrategySnapshot {
 }
 
 #[derive(Clone, Debug)]
+pub struct QuoteFilterEvent {
+    pub ts: DateTime<Utc>,
+    pub symbol: String,
+    pub is_simulated: bool,
+    pub reason: String,
+    pub side: Side,
+    pub level_index: i64,
+    pub is_unwind: bool,
+    pub unwind_only: bool,
+    pub stale_maker_unwind: bool,
+    pub emergency_unwind: bool,
+    pub current_position: Decimal,
+    pub raw_quantity: Decimal,
+    pub effective_quantity: Option<Decimal>,
+    pub remaining_capacity: Option<Decimal>,
+    pub price: Option<Decimal>,
+    pub notional: Option<Decimal>,
+    pub quote_min_trade_amount: Option<Decimal>,
+    pub best_bid: Option<Decimal>,
+    pub best_ask: Option<Decimal>,
+}
+
+#[derive(Clone, Debug)]
 pub struct RecentTrade {
     pub quantity: Decimal,
     pub timestamp: DateTime<Utc>,

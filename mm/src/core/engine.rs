@@ -11,7 +11,7 @@ use tokio::{
     task::JoinHandle,
     time::{interval, Duration, Instant},
 };
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::{
     adapters::{
@@ -31,7 +31,7 @@ use crate::{
     },
     domain::{
         Fill, InstrumentMeta, MarketEvent, MarketRegime, OrderRequest, OrderType, PrivateEvent,
-        Side, StrategySnapshot, TimeInForce,
+        QuoteFilterEvent, Side, StrategySnapshot, TimeInForce,
     },
 };
 
@@ -83,6 +83,13 @@ where
         Ok(())
     }
 
+    fn persist_quote_filter_event(&self, event: QuoteFilterEvent) -> Result<()> {
+        if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
+            fill_store.insert_quote_filter_event(&event)?;
+        }
+        Ok(())
+    }
+
     pub fn new(
         config: AppConfig,
         exchange: Arc<E>,
@@ -104,9 +111,7 @@ where
     }
 
     pub async fn run(&self) -> Result<()> {
-        info!("engine run starting");
         let instruments = self.exchange.load_instruments().await?;
-        info!(count = instruments.len(), "engine instruments loaded");
         let instrument_by_symbol: HashMap<String, InstrumentMeta> = instruments
             .into_iter()
             .map(|instrument| (instrument.symbol.clone(), instrument))
@@ -119,19 +124,12 @@ where
             .filter(|pair| pair.enabled)
             .map(|pair| pair.symbol.clone())
             .collect();
-        info!(symbols = ?market_symbols, "engine enabled market symbols");
 
         let initial_orders = self.exchange.fetch_open_orders().await?;
-        info!(
-            count = initial_orders.len(),
-            "engine initial open orders fetched"
-        );
         let (market_tx, mut market_rx) = mpsc::channel(1024);
         let (private_tx, mut private_rx) = mpsc::channel(512);
-        info!("engine spawning all streams");
         let mut streams_task =
             self.spawn_all_streams(market_symbols.clone(), market_tx, private_tx);
-        info!("engine streams task spawned");
         let mut state = BotState::new(
             self.parsed.venue.maker_fee_rate,
             self.parsed.runtime.max_orderbook_depth,
@@ -140,28 +138,15 @@ where
         if self.config.runtime.dry_run && self.config.runtime.restore_dry_run_state {
             if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
                 let restored_positions = fill_store.load_latest_positions(true)?;
-                let restored_count = restored_positions.len();
                 for position in restored_positions {
                     state.apply_private_event(PrivateEvent::Position(position));
                 }
-                if restored_count > 0 {
-                    info!(restored_count, "restored dry-run positions from fill store");
-                }
             }
-        } else if self.config.runtime.dry_run {
-            info!("dry-run state restore disabled; starting from a clean baseline");
-        }
-
-        if self.config.runtime.dry_run {
-            info!("dry-run mode active; order submission and cancel requests are disabled");
         }
 
         let mut factors = FactorEngine::default();
         let mut fill_tracker = FillTracker::default();
         let mut health = HealthTracker::default();
-        if self.parsed.risk.max_correlated_position_usd <= Decimal::ZERO {
-            info!("correlated position limit disabled; max_correlated_position_usd <= 0");
-        }
         let mut circuit_breaker = CircuitBreaker::new(
             self.parsed.risk.circuit_breaker_cooldown_ms,
             self.parsed.risk.circuit_breaker_cooldown_ms * 8,
@@ -182,7 +167,6 @@ where
             t
         };
         let mut last_generation_at: Option<Instant> = None;
-        let mut ticker_tick_count: u64 = 0;
         // Track the last-quoted price index per symbol to detect 3bps moves.
         let mut last_quoted_price: HashMap<String, Decimal> = HashMap::new();
         let mut last_breaker_message: Option<String> = None;
@@ -209,7 +193,6 @@ where
                         health.record_ws_discrepancy();
                         // Issue 9: pause quoting 3 s after reconnect to let state settle.
                         reconnect_pause_until = Some(Instant::now() + Duration::from_millis(3000));
-                        info!("grvt private stream reconnected; quoting paused for 3 s");
                     }
                     if let Some(fs) = self.apply_private_event_and_record(
                         &mut state,
@@ -224,12 +207,6 @@ where
                         }
                         // Issue 6: post-fill cooldown on toxic side.
                         if fs.toxicity_score > Decimal::from(2u64) {
-                            info!(
-                                symbol = %fs.fill_symbol,
-                                side = ?fs.fill_side,
-                                toxicity = %fs.toxicity_score,
-                                "toxic fill; cooling down side for 3 s"
-                            );
                             side_cooldown.insert((fs.fill_symbol.clone(), fs.fill_side), Instant::now());
                         }
                         // Post-fill widen: widen opposite side for N seconds.
@@ -243,16 +220,6 @@ where
                     }
                 }
                 _ = ticker.tick() => {
-                    ticker_tick_count += 1;
-                    if ticker_tick_count % 50 == 0 {
-                        info!(
-                            tick_count = ticker_tick_count,
-                            market_symbols = state.market.symbols.len(),
-                            open_orders = state.open_orders.len(),
-                            dry_run_orders = state.dry_run_orders.len(),
-                            "ticker arm firing"
-                        );
-                    }
                     // Issue 9: hold off quoting during reconnect settle window.
                     if reconnect_pause_until.map(|t| Instant::now() < t).unwrap_or(false) {
                         continue;
@@ -269,7 +236,6 @@ where
                         if matches!(event, PrivateEvent::StreamReconnected) {
                             health.record_ws_discrepancy();
                             reconnect_pause_until = Some(Instant::now() + Duration::from_millis(3000));
-                            info!("private stream reconnected during cycle drain; quoting paused for 3 s");
                         }
                         if let Some(fs) = self.apply_private_event_and_record(
                             &mut state,
@@ -283,12 +249,6 @@ where
                                 last_generation_at = None;
                             }
                             if fs.toxicity_score > Decimal::from(2u64) {
-                                info!(
-                                    symbol = %fs.fill_symbol,
-                                    side = ?fs.fill_side,
-                                    toxicity = %fs.toxicity_score,
-                                    "toxic fill during cycle drain; cooling down side for 3 s"
-                                );
                                 side_cooldown.insert((fs.fill_symbol.clone(), fs.fill_side), Instant::now());
                             }
                             // Post-fill widen on opposite side.
@@ -308,11 +268,6 @@ where
                     ) && state.open_orders.len() <= self.config.risk.max_open_orders
                     {
                         circuit_breaker.force_reset();
-                        info!(
-                            open_orders = state.open_orders.len(),
-                            max_open_orders = self.config.risk.max_open_orders,
-                            "reset open-order circuit breaker after count normalized"
-                        );
                         last_breaker_message = None;
                     }
 
@@ -328,7 +283,6 @@ where
                             warn!("market data stale; attempting REST snapshot fallback");
                             let snapshot = self.exchange.fetch_market_snapshot(&market_symbols).await;
                             if !snapshot.is_empty() {
-                                info!(events = snapshot.len(), "REST snapshot refreshed stale market data");
                                 for event in snapshot {
                                     state.apply_market_event(event);
                                 }
@@ -378,14 +332,7 @@ where
                         continue;
                     }
                     last_breaker_message = None;
-                    info!(
-                        market_symbols = state.market.symbols.len(),
-                        open_orders = state.open_orders.len(),
-                        dry_run_orders = state.dry_run_orders.len(),
-                        "security checks passed; circuit breaker closed"
-                    );
                     let paused = self.control.is_paused();
-                    info!(paused, "pause check before desired-order build");
                     if paused {
                         continue;
                     }
@@ -408,14 +355,6 @@ where
                             }
                         })
                         .collect();
-
-                    info!(
-                        degraded,
-                        emergency_unwind_symbols = emergency_unwind_symbols.len(),
-                        side_cooldowns = side_cooldown.len(),
-                        post_fill_widen_entries = post_fill_widen.len(),
-                        "reached build_desired_orders call"
-                    );
                     let desired = self.build_desired_orders(
                         &mut factors,
                         &state,
@@ -526,7 +465,6 @@ where
                     if !self.config.runtime.dry_run
                         && should_cancel_on_adverse_bbo_move(current_orders, &state)
                     {
-                        info!("current BBO moved by more than 2 bps; cancelling stale resting orders");
                         self.exchange.cancel_all_orders().await?;
                         state.open_orders.clear();
                         last_generation_at = None;
@@ -560,8 +498,6 @@ where
                                 filter_orders_against_current_bbo(&self.parsed, &state, &recon.to_place);
                             if !filtered_to_place.is_empty() {
                                 self.exchange.place_orders(filtered_to_place).await?;
-                            } else {
-                                info!("all candidate orders were filtered out by pre-placement BBO checks");
                             }
                             // Reset the cooldown timestamp again now that placement is done,
                             // so generation_min_interval_ms is measured from placement
@@ -660,7 +596,6 @@ where
                     {
                         circuit_breaker.force_reset();
                         last_breaker_message = None;
-                        info!("reset market-data circuit breaker after fresh market data");
                     }
                     if let Some((symbol, reference_price, timestamp)) = market_reference(&state, &event) {
                         fill_tracker.observe_price(&symbol, reference_price, timestamp);
@@ -848,27 +783,6 @@ where
             Decimal::ZERO
         };
 
-        info!(
-            symbol = %fill.symbol,
-            side = ?fill.side,
-            level_index,
-            price = %fill.price,
-            quantity = %fill.quantity,
-            spread_earned_bps = %spread_earned_bps,
-            toxicity_score = %toxicity_score,
-            next_level_multiplier = %next_level_multiplier,
-            is_simulated,
-            position_quantity = %position_quantity,
-            realized_pnl = %realized_pnl,
-            unrealized_pnl = %unrealized_pnl,
-            account_equity = %state.account_equity,
-            startup_account_equity = ?state.startup_account_equity,
-            session_account_pnl = ?session_account_pnl,
-            total_fees = %state.pnl.total_fees,
-            total_pnl = %effective_total_pnl,
-            "fill recorded"
-        );
-
         let fill_kind = if is_simulated { "simulated" } else { "live" };
         self.notifier
             .send(format!(
@@ -913,7 +827,6 @@ where
         private_sender: mpsc::Sender<PrivateEvent>,
     ) -> JoinHandle<Result<()>> {
         let exchange = self.exchange.clone();
-        info!(symbols = ?symbols, "spawning exchange streams");
         // Build Binance symbol map from pair configs that have binance_symbol set.
         let binance_symbol_map: HashMap<String, String> = self
             .config
@@ -970,7 +883,9 @@ where
         let n_trade_threshold = self.config.factors.n_trade_quote_threshold;
         let hard_toxic_stop_secs = 300u64;
         let min_level_multiplier = Decimal::new(5, 1);
-        let non_unwind_size_reduction = Decimal::new(25, 2);
+        let unwind_only_trigger_ratio = Decimal::new(15, 2);
+        let hard_vpin_skip_threshold = Decimal::new(85, 2);
+        let passive_stale_close_spread_bps = Decimal::from(30u64);
         let position_hold_timeout =
             ChronoDuration::seconds(self.parsed.risk.stale_position_timeout_secs as i64);
         let stale_close_slippage_cap_frac =
@@ -1030,11 +945,15 @@ where
                     continue;
                 }
 
-                let chunk_target = if stale_close_chunk_base > Decimal::ZERO {
-                    total_abs_quantity.min(stale_close_chunk_base)
-                } else {
-                    total_abs_quantity
-                };
+                let incremental_chunk_cap = total_abs_quantity * Decimal::new(5, 1);
+                let instrument_chunk_cap = instrument.min_order_size * Decimal::TWO;
+                let mut chunk_target = total_abs_quantity.min(incremental_chunk_cap);
+                if stale_close_chunk_base > Decimal::ZERO {
+                    chunk_target = chunk_target.min(stale_close_chunk_base);
+                }
+                if instrument_chunk_cap > Decimal::ZERO {
+                    chunk_target = chunk_target.min(instrument_chunk_cap);
+                }
                 let min_notional_quantity =
                     (min_trade_amount / reference_price).max(Decimal::new(1, 9));
                 let desired_close_quantity = chunk_target
@@ -1066,10 +985,8 @@ where
                 } else {
                     Side::Bid
                 };
-                let close_reference_price = state
-                    .market
-                    .symbols
-                    .get(&pair.symbol)
+                let market = state.market.symbols.get(&pair.symbol);
+                let close_reference_price = market
                     .and_then(|market| {
                         market
                             .mid_price()
@@ -1079,15 +996,38 @@ where
                             .or(market.best_ask)
                     })
                     .unwrap_or(reference_price);
-                let capped_limit_price = round_to_tick_for_side(
-                    close_reference_price
-                        * match side {
-                            Side::Ask => Decimal::ONE - stale_close_slippage_cap_frac,
-                            Side::Bid => Decimal::ONE + stale_close_slippage_cap_frac,
-                        },
-                    instrument.tick_size,
-                    side,
-                );
+                let bbo_spread_bps = market.and_then(|market| market.bbo_spread_bps());
+                let use_passive_stale_close = bbo_spread_bps
+                    .map(|spread_bps| spread_bps > passive_stale_close_spread_bps)
+                    .unwrap_or(false)
+                    && market.and_then(|market| market.mid_price()).is_some();
+                let (limit_price, time_in_force, strategy_decision) = if use_passive_stale_close {
+                    (
+                        round_to_tick_for_side(
+                            market
+                                .and_then(|market| market.mid_price())
+                                .unwrap_or(close_reference_price),
+                            instrument.tick_size,
+                            side,
+                        ),
+                        TimeInForce::GoodTillTime,
+                        "stale_passive_close",
+                    )
+                } else {
+                    (
+                        round_to_tick_for_side(
+                            close_reference_price
+                                * match side {
+                                    Side::Ask => Decimal::ONE - stale_close_slippage_cap_frac,
+                                    Side::Bid => Decimal::ONE + stale_close_slippage_cap_frac,
+                                },
+                            instrument.tick_size,
+                            side,
+                        ),
+                        TimeInForce::ImmediateOrCancel,
+                        "stale_ioc_close",
+                    )
+                };
                 warn!(
                     symbol = %pair.symbol,
                     position = %position.quantity,
@@ -1095,10 +1035,14 @@ where
                     side = ?side,
                     quantity = %quantity,
                     reference_price = %reference_price,
-                    limit_price = %capped_limit_price,
+                    limit_price = %limit_price,
+                    bbo_spread_bps = ?bbo_spread_bps,
+                    passive_stale_close = use_passive_stale_close,
                     slippage_cap_bps = %self.parsed.risk.stale_position_close_slippage_cap_bps,
                     chunk_base = %stale_close_chunk_base,
-                    "stale position exceeded hold timeout; forcing IOC limit flatten and skipping normal quote generation"
+                    incremental_chunk_cap = %incremental_chunk_cap,
+                    instrument_chunk_cap = %instrument_chunk_cap,
+                    "stale position exceeded hold timeout; forcing stale close order and skipping normal quote generation"
                 );
                 let order = OrderRequest {
                     symbol: pair.symbol.clone(),
@@ -1106,8 +1050,8 @@ where
                     level_index: 0,
                     side,
                     order_type: OrderType::Limit,
-                    time_in_force: TimeInForce::ImmediateOrCancel,
-                    price: Some(capped_limit_price),
+                    time_in_force,
+                    price: Some(limit_price),
                     quantity,
                     post_only: false,
                 };
@@ -1115,7 +1059,7 @@ where
                     state,
                     &pair.symbol,
                     self.config.runtime.dry_run,
-                    "stale_ioc_close",
+                    strategy_decision,
                     None,
                     position.quantity,
                     reference_price,
@@ -1138,7 +1082,7 @@ where
         if !stale_flatten_orders.is_empty() {
             warn!(
                 stale_order_count = stale_flatten_orders.len(),
-                "returning stale-position IOC market flatten orders only for this cycle"
+                "returning stale-position close orders only for this cycle"
             );
             return Ok(stale_flatten_orders);
         }
@@ -1147,7 +1091,6 @@ where
             let Some(mut factor_snapshot) =
                 factors.compute(&self.config, &self.parsed, pair, state, fill_tracker)
             else {
-                info!(symbol = %pair.symbol, "factor snapshot unavailable; skipping symbol");
                 let current_position = state
                     .positions
                     .get(&pair.symbol)
@@ -1216,21 +1159,6 @@ where
                 fill_tracker.level_volume_multiplier(&pair.symbol, Side::Bid, 0);
             let ask_lvl0_multiplier =
                 fill_tracker.level_volume_multiplier(&pair.symbol, Side::Ask, 0);
-            info!(
-                symbol = %pair.symbol,
-                position = %current_position,
-                has_position,
-                raw_volatility = %factor_snapshot.raw_volatility,
-                spread_addon = %factor_snapshot.volatility,
-                inventory_lean_bps = %factor_snapshot.inventory_lean_bps,
-                regime = ?factor_snapshot.regime,
-                regime_intensity = %factor_snapshot.regime_intensity,
-                recent_trade_count = factor_snapshot.recent_trade_count,
-                flow_direction = %factor_snapshot.flow_direction,
-                bid_lvl0_multiplier = %bid_lvl0_multiplier,
-                ask_lvl0_multiplier = %ask_lvl0_multiplier,
-                "building desired orders for symbol"
-            );
             if stale_maker_unwind {
                 warn!(
                     symbol = %pair.symbol,
@@ -1512,36 +1440,88 @@ where
                 .iter()
                 .find(|parsed_pair| parsed_pair.symbol == pair.symbol)
                 .with_context(|| format!("missing parsed pair config for {}", pair.symbol))?;
+            let tiny_position = current_position.abs() < instrument.min_order_size;
+            if tiny_position && unwind_only {
+                unwind_only = false;
+            }
+            if !tiny_position
+                && parsed_pair.max_position_base > Decimal::ZERO
+                && current_position.abs()
+                    > parsed_pair.max_position_base * unwind_only_trigger_ratio
+            {
+                warn!(
+                    symbol = %pair.symbol,
+                    position = %current_position,
+                    max_position_base = %parsed_pair.max_position_base,
+                    trigger_ratio = %unwind_only_trigger_ratio,
+                    "inventory exceeded unwind-only trigger; suppressing accumulation side"
+                );
+                unwind_only = true;
+            }
+            if factor_snapshot.vpin > hard_vpin_skip_threshold {
+                if has_position && !tiny_position {
+                    warn!(
+                        symbol = %pair.symbol,
+                        position = %current_position,
+                        vpin = %factor_snapshot.vpin,
+                        threshold = %hard_vpin_skip_threshold,
+                        "VPIN exceeded hard threshold while holding inventory; switching to unwind-only quoting"
+                    );
+                    unwind_only = true;
+                } else {
+                    warn!(
+                        symbol = %pair.symbol,
+                        vpin = %factor_snapshot.vpin,
+                        threshold = %hard_vpin_skip_threshold,
+                        "VPIN exceeded hard threshold; skipping fresh quoting"
+                    );
+                    self.persist_strategy_snapshot(build_strategy_snapshot(
+                        state,
+                        &pair.symbol,
+                        self.config.runtime.dry_run,
+                        "skip",
+                        Some("vpin_hard_stop"),
+                        current_position,
+                        position_price,
+                        has_position,
+                        false,
+                        stale_maker_unwind,
+                        false,
+                        degraded,
+                        market,
+                        Some(&factor_snapshot),
+                        Some(bid_lvl0_multiplier),
+                        Some(ask_lvl0_multiplier),
+                        0,
+                        &[],
+                    ))?;
+                    continue;
+                }
+            }
             // Compute pos_ratio for size asymmetry (S2) before generating quotes.
-            let pos_ratio = if parsed_pair.max_position_base.is_zero() {
+            let pos_ratio = if tiny_position || parsed_pair.max_position_base.is_zero() {
                 Decimal::ZERO
             } else {
                 (current_position / parsed_pair.max_position_base)
                     .clamp(-Decimal::ONE, Decimal::ONE)
             };
+            let mut quote_factor_snapshot = factor_snapshot.clone();
+            if tiny_position {
+                quote_factor_snapshot.inventory_skew = Decimal::ZERO;
+                quote_factor_snapshot.inventory_lean_bps = Decimal::ZERO;
+            }
 
             let quotes = generate_quotes(
                 &self.config.model,
                 &self.parsed,
                 pair,
-                &factor_snapshot,
+                &quote_factor_snapshot,
                 fill_tracker,
                 best_bid,
                 best_ask,
                 pos_ratio,
             );
             let generated_quote_count = quotes.len();
-            info!(
-                symbol = %pair.symbol,
-                generated_quote_count,
-                unwind_only,
-                emergency_unwind = emergency_unwind_symbols.contains(&pair.symbol),
-                best_bid = ?best_bid,
-                best_ask = ?best_ask,
-                reference_price = %reference_price,
-                pos_ratio = %pos_ratio,
-                "generated raw quotes for desired-order build"
-            );
 
             // Online kappa: record whether a level-0 fill happened this cycle.
             // A level-0 fill means the tracker saw a fill at level_index=0 for this symbol.
@@ -1592,25 +1572,62 @@ where
                 // Issue 6: post-fill side cooldown — skip this side for 3 s after a toxic fill.
 
                 // Fix 2: determine if this specific quote is on the unwind side.
-                let is_unwind = match quote.side {
-                    Side::Ask => current_position > Decimal::ZERO,
-                    Side::Bid => current_position < Decimal::ZERO,
+                let is_unwind = if tiny_position {
+                    false
+                } else {
+                    match quote.side {
+                        Side::Ask => current_position > Decimal::ZERO,
+                        Side::Bid => current_position < Decimal::ZERO,
+                    }
                 };
                 let mut quantity = quote.quantity;
                 if unwind_only && !is_unwind {
-                    quantity *= non_unwind_size_reduction;
+                    self.persist_quote_filter_event(build_quote_filter_event(
+                        &pair.symbol,
+                        self.config.runtime.dry_run,
+                        "unwind_only_wrong_side_suppressed",
+                        quote.side,
+                        quote.level_index,
+                        is_unwind,
+                        unwind_only,
+                        stale_maker_unwind,
+                        emergency_unwind,
+                        current_position,
+                        quantity,
+                        Some(Decimal::ZERO),
+                        None,
+                        None,
+                        None,
+                        None,
+                        best_bid,
+                        best_ask,
+                    ))?;
+                    continue;
                 }
                 if !is_unwind {
                     if let Some(&cooled_at) = side_cooldown.get(&(pair.symbol.clone(), quote.side))
                     {
                         if cooled_at.elapsed() < Duration::from_secs(3) {
-                            info!(
-                                symbol = %pair.symbol,
-                                side = ?quote.side,
-                                level_index = quote.level_index,
-                                cooldown_elapsed_ms = cooled_at.elapsed().as_millis(),
-                                "filtered quote in desired-order loop: side cooldown active"
-                            );
+                            self.persist_quote_filter_event(build_quote_filter_event(
+                                &pair.symbol,
+                                self.config.runtime.dry_run,
+                                "side_cooldown_active",
+                                quote.side,
+                                quote.level_index,
+                                is_unwind,
+                                unwind_only,
+                                stale_maker_unwind,
+                                emergency_unwind,
+                                current_position,
+                                quantity,
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                                best_bid,
+                                best_ask,
+                            ))?;
                             continue;
                         }
                     }
@@ -1654,14 +1671,26 @@ where
                     self.parsed.model.min_step_volume,
                 );
                 if effective_quantity <= Decimal::ZERO {
-                    info!(
-                        symbol = %pair.symbol,
-                        side = ?quote.side,
-                        level_index = quote.level_index,
-                        raw_quantity = %quantity,
-                        min_step_volume = %self.parsed.model.min_step_volume,
-                        "filtered quote in desired-order loop: effective quantity quantized to zero"
-                    );
+                    self.persist_quote_filter_event(build_quote_filter_event(
+                        &pair.symbol,
+                        self.config.runtime.dry_run,
+                        "effective_quantity_zero",
+                        quote.side,
+                        quote.level_index,
+                        is_unwind,
+                        unwind_only,
+                        stale_maker_unwind,
+                        emergency_unwind,
+                        current_position,
+                        quantity,
+                        Some(effective_quantity),
+                        None,
+                        Some(price),
+                        None,
+                        Some(quote_min_trade_amount),
+                        best_bid,
+                        best_ask,
+                    ))?;
                     continue;
                 }
                 if effective_quantity * price < quote_min_trade_amount {
@@ -1675,21 +1704,50 @@ where
                             self.parsed.model.min_step_volume,
                         );
                         if floored <= Decimal::ZERO {
+                            self.persist_quote_filter_event(build_quote_filter_event(
+                                &pair.symbol,
+                                self.config.runtime.dry_run,
+                                "unwind_floor_quantized_to_zero",
+                                quote.side,
+                                quote.level_index,
+                                is_unwind,
+                                unwind_only,
+                                stale_maker_unwind,
+                                emergency_unwind,
+                                current_position,
+                                quantity,
+                                Some(floored),
+                                None,
+                                Some(price),
+                                None,
+                                Some(quote_min_trade_amount),
+                                best_bid,
+                                best_ask,
+                            ))?;
                             continue;
                         }
                         quantity = floored;
                     } else {
-                        info!(
-                            symbol = %pair.symbol,
-                            side = ?quote.side,
-                            level_index = quote.level_index,
-                            effective_quantity = %effective_quantity,
-                            price = %price,
-                            notional = %(effective_quantity * price),
-                            min_trade_amount = %quote_min_trade_amount,
+                        self.persist_quote_filter_event(build_quote_filter_event(
+                            &pair.symbol,
+                            self.config.runtime.dry_run,
+                            "below_min_notional",
+                            quote.side,
+                            quote.level_index,
                             is_unwind,
-                            "filtered quote in desired-order loop: below minimum notional"
-                        );
+                            unwind_only,
+                            stale_maker_unwind,
+                            emergency_unwind,
+                            current_position,
+                            quantity,
+                            Some(effective_quantity),
+                            None,
+                            Some(price),
+                            Some(effective_quantity * price),
+                            Some(quote_min_trade_amount),
+                            best_bid,
+                            best_ask,
+                        ))?;
                         continue;
                     }
                 }
@@ -1700,13 +1758,26 @@ where
                         Side::Ask => &mut remaining_ask_capacity,
                     };
                     if *remaining_capacity <= Decimal::ZERO {
-                        info!(
-                            symbol = %pair.symbol,
-                            side = ?quote.side,
-                            level_index = quote.level_index,
-                            remaining_capacity = %*remaining_capacity,
-                            "filtered quote in desired-order loop: no remaining side capacity"
-                        );
+                        self.persist_quote_filter_event(build_quote_filter_event(
+                            &pair.symbol,
+                            self.config.runtime.dry_run,
+                            "no_remaining_side_capacity",
+                            quote.side,
+                            quote.level_index,
+                            is_unwind,
+                            unwind_only,
+                            stale_maker_unwind,
+                            emergency_unwind,
+                            current_position,
+                            quantity,
+                            Some(effective_quantity),
+                            Some(*remaining_capacity),
+                            Some(price),
+                            Some(effective_quantity * price),
+                            Some(quote_min_trade_amount),
+                            best_bid,
+                            best_ask,
+                        ))?;
                         continue;
                     }
                     if quantity > *remaining_capacity {
@@ -1730,9 +1801,49 @@ where
                             if floored_qty > Decimal::ZERO && floored_qty <= *remaining_capacity {
                                 quantity = floored_qty;
                             } else {
+                                self.persist_quote_filter_event(build_quote_filter_event(
+                                    &pair.symbol,
+                                    self.config.runtime.dry_run,
+                                    "unwind_capacity_floor_failed",
+                                    quote.side,
+                                    quote.level_index,
+                                    is_unwind,
+                                    unwind_only,
+                                    stale_maker_unwind,
+                                    emergency_unwind,
+                                    current_position,
+                                    quantity,
+                                    Some(effective_quantity),
+                                    Some(*remaining_capacity),
+                                    Some(price),
+                                    Some(effective_quantity * price),
+                                    Some(quote_min_trade_amount),
+                                    best_bid,
+                                    best_ask,
+                                ))?;
                                 continue;
                             }
                         } else {
+                            self.persist_quote_filter_event(build_quote_filter_event(
+                                &pair.symbol,
+                                self.config.runtime.dry_run,
+                                "post_capacity_below_min_notional",
+                                quote.side,
+                                quote.level_index,
+                                is_unwind,
+                                unwind_only,
+                                stale_maker_unwind,
+                                emergency_unwind,
+                                current_position,
+                                quantity,
+                                Some(effective_quantity),
+                                Some(*remaining_capacity),
+                                Some(price),
+                                Some(effective_quantity * price),
+                                Some(quote_min_trade_amount),
+                                best_bid,
+                                best_ask,
+                            ))?;
                             continue;
                         }
                     }
@@ -1753,7 +1864,7 @@ where
                 symbol_orders.push(request);
             }
 
-            if symbol_orders.is_empty() && has_position {
+            if symbol_orders.is_empty() && has_position && !tiny_position {
                 // No orders were generated but we hold a position – place a
                 // minimal forced exit order to prevent being stuck indefinitely.
                 // This bypasses flow-spike, vol-cut, and cooldown filters.
@@ -1820,48 +1931,6 @@ where
                 }
             }
             clip_symbol_orders_to_bbo(&mut symbol_orders, best_bid, best_ask, instrument.tick_size);
-            let bid_count = symbol_orders
-                .iter()
-                .filter(|order| order.side == Side::Bid)
-                .count();
-            let ask_count = symbol_orders
-                .iter()
-                .filter(|order| order.side == Side::Ask)
-                .count();
-            let top_bid = symbol_orders
-                .iter()
-                .filter(|order| order.side == Side::Bid)
-                .filter_map(|order| order.price)
-                .max();
-            let top_ask = symbol_orders
-                .iter()
-                .filter(|order| order.side == Side::Ask)
-                .filter_map(|order| order.price)
-                .min();
-            let total_bid_qty: Decimal = symbol_orders
-                .iter()
-                .filter(|order| order.side == Side::Bid)
-                .map(|order| order.quantity)
-                .sum();
-            let total_ask_qty: Decimal = symbol_orders
-                .iter()
-                .filter(|order| order.side == Side::Ask)
-                .map(|order| order.quantity)
-                .sum();
-            info!(
-                symbol = %pair.symbol,
-                generated_quote_count,
-                desired_order_count = symbol_orders.len(),
-                bid_count,
-                ask_count,
-                total_bid_qty = %total_bid_qty,
-                total_ask_qty = %total_ask_qty,
-                top_bid = ?top_bid,
-                top_ask = ?top_ask,
-                unwind_only,
-                emergency_unwind,
-                "built desired orders for symbol"
-            );
             let decision = if !symbol_orders.is_empty() {
                 if stale_maker_unwind {
                     "stale_maker_unwind_quoted"
@@ -1899,12 +1968,6 @@ where
             ))?;
             orders.extend(symbol_orders.iter().cloned());
         }
-
-        info!(
-            desired_order_count = orders.len(),
-            enabled_pairs = self.config.pairs.iter().filter(|pair| pair.enabled).count(),
-            "build_desired_orders completed"
-        );
         Ok(orders)
     }
 }
@@ -2015,6 +2078,50 @@ fn build_strategy_snapshot(
         top_ask,
         account_equity: state.account_equity,
         total_pnl: state.effective_total_pnl(),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_quote_filter_event(
+    symbol: &str,
+    is_simulated: bool,
+    reason: &str,
+    side: Side,
+    level_index: usize,
+    is_unwind: bool,
+    unwind_only: bool,
+    stale_maker_unwind: bool,
+    emergency_unwind: bool,
+    current_position: Decimal,
+    raw_quantity: Decimal,
+    effective_quantity: Option<Decimal>,
+    remaining_capacity: Option<Decimal>,
+    price: Option<Decimal>,
+    notional: Option<Decimal>,
+    quote_min_trade_amount: Option<Decimal>,
+    best_bid: Option<Decimal>,
+    best_ask: Option<Decimal>,
+) -> QuoteFilterEvent {
+    QuoteFilterEvent {
+        ts: Utc::now(),
+        symbol: symbol.to_string(),
+        is_simulated,
+        reason: reason.to_string(),
+        side,
+        level_index: level_index as i64,
+        is_unwind,
+        unwind_only,
+        stale_maker_unwind,
+        emergency_unwind,
+        current_position,
+        raw_quantity,
+        effective_quantity,
+        remaining_capacity,
+        price,
+        notional,
+        quote_min_trade_amount,
+        best_bid,
+        best_ask,
     }
 }
 
@@ -2215,7 +2322,7 @@ fn filter_orders_against_current_bbo(
                     return None;
                 }
             }
-            if order.level_index == 0 {
+            if order.level_index == 0 && order.post_only {
                 if let Some(reference) = same_side_bbo {
                     if reference > Decimal::ZERO {
                         let max_gap_bps = parsed.model.born_inf_bps + Decimal::from(2u64);
@@ -2383,25 +2490,7 @@ fn build_reconciliation_plan(
 }
 
 fn log_dry_run_inventory(state: &BotState) {
-    for position in state
-        .positions
-        .values()
-        .filter(|position| !position.quantity.is_zero())
-    {
-        info!(
-            symbol = %position.symbol,
-            quantity = %position.quantity,
-            entry_price = %position.entry_price,
-            realized_pnl = %position.realized_pnl,
-            unrealized_pnl = %position.unrealized_pnl,
-            account_equity = %state.account_equity,
-            startup_account_equity = ?state.startup_account_equity,
-            session_account_pnl = ?state.session_account_pnl(),
-            total_fees = %state.pnl.total_fees,
-            total_pnl = %state.effective_total_pnl(),
-            "dry-run inventory"
-        );
-    }
+    let _ = state;
 }
 
 fn log_minute_stats(config: &AppConfig, state: &BotState, stats: &MinuteStats) {
@@ -2457,28 +2546,15 @@ fn log_minute_stats(config: &AppConfig, state: &BotState, stats: &MinuteStats) {
     } else {
         Decimal::ZERO
     };
-    let session_account_pnl = state.session_account_pnl();
-
-    info!(
-        trade_count = stats.trade_count,
-        fills_count = stats.fills_count,
-        simulated_fills_count = stats.simulated_fills_count,
-        live_fills_count = live_fills,
-        missed_crosses_count = stats.missed_crosses_count,
-        near_misses_count = stats.near_misses_count,
-        average_position = %average_position,
-        realized_pnl = %realized_pnl,
-        unrealized_pnl = %unrealized_pnl,
-        account_equity = %state.account_equity,
-        startup_account_equity = ?state.startup_account_equity,
-        session_account_pnl = ?session_account_pnl,
-        total_fees = %state.pnl.total_fees,
-        total_pnl = %state.effective_total_pnl(),
-        avg_spread_earned_bps = %avg_spread_earned_bps,
-        toxic_fill_ratio = %toxic_fill_ratio,
-        toxic_fill_count = stats.toxic_fill_count,
-        profitability_signal = %profitability_signal,
-        "minute stats"
+    let _ = (
+        average_position,
+        realized_pnl,
+        unrealized_pnl,
+        live_fills,
+        avg_spread_earned_bps,
+        toxic_fill_ratio,
+        profitability_signal,
+        state,
     );
 }
 

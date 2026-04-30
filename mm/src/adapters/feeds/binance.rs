@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::{
     connect_async_tls_with_config, tungstenite::Message as WsMessage, Connector,
 };
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::domain::MarketEvent;
 
@@ -67,8 +67,6 @@ pub async fn stream_binance_spot_prices(
     };
 
     loop {
-        info!(%ws_url, "connecting to Binance futures markPrice@1s stream (native-tls)");
-
         let connector = Connector::NativeTls(tls_connector.clone());
         match connect_async_tls_with_config(ws_url.as_str(), None, false, Some(connector)).await {
             Ok((ws_stream, _)) => {

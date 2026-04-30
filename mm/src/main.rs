@@ -13,7 +13,7 @@ use market_making::{
     },
 };
 use tokio::time::{sleep, Duration};
-use tracing::{error, info};
+use tracing::error;
 use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
@@ -60,9 +60,7 @@ async fn main() -> Result<()> {
         control,
     ));
 
-    if config.runtime.dry_run {
-        info!("dry-run enabled; skipping startup cancel-all");
-    } else {
+    if !config.runtime.dry_run {
         flatten_account_state(
             exchange.as_ref(),
             &notifier,
@@ -80,9 +78,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    if config.runtime.dry_run {
-        info!("dry-run enabled; skipping shutdown cancel-all");
-    } else {
+    if !config.runtime.dry_run {
         if let Err(err) = flatten_account_state(
             exchange.as_ref(),
             &notifier,

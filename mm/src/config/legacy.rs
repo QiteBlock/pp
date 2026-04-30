@@ -40,6 +40,9 @@ impl AppConfig {
         if parsed.venue.taker_fee_rate < Decimal::ZERO {
             bail!("venue.max_fee_rate must be non-negative");
         }
+        if parsed.runtime.reconcile_interval_ms == 0 {
+            bail!("runtime.reconcile_interval_ms must be > 0");
+        }
         if parsed.runtime.websocket_send_timeout_ms == 0 {
             bail!("runtime.websocket_send_timeout_ms must be > 0");
         }
@@ -95,6 +98,7 @@ impl AppConfig {
                 taker_fee_rate: parse_decimal("venue.max_fee_rate", &self.venue.max_fee_rate)?,
             },
             runtime: ParsedRuntimeConfig {
+                reconcile_interval_ms: self.runtime.reconcile_interval_ms,
                 websocket_send_timeout_ms: self.runtime.websocket_send_timeout_ms,
                 max_orderbook_depth: self.runtime.max_orderbook_depth,
                 restore_dry_run_state: self.runtime.restore_dry_run_state,
@@ -396,6 +400,7 @@ pub struct ParsedVenueConfig {
 
 #[derive(Clone, Debug)]
 pub struct ParsedRuntimeConfig {
+    pub reconcile_interval_ms: u64,
     pub websocket_send_timeout_ms: u64,
     pub max_orderbook_depth: usize,
     pub restore_dry_run_state: bool,

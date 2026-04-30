@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use async_trait::async_trait;
 use rust_decimal::Decimal;
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::{
     adapters::exchange::{AnyExchangeClient, OrderExecutor, PrivateDataSource},
@@ -41,16 +41,11 @@ pub async fn flatten_account_state(
     phase: &str,
     min_close_notional: Decimal,
 ) -> Result<()> {
-    info!(phase, "canceling all exchange orders");
     exchange.cancel_all_orders().await?;
 
     if exchange.supports_limit_cleanup() {
         close_positions_with_limit_orders(exchange, notifier, phase, min_close_notional).await
     } else {
-        info!(
-            phase,
-            "limit-based cleanup not implemented for this venue; leaving positions unchanged"
-        );
         Ok(())
     }
 }
@@ -74,16 +69,8 @@ async fn close_positions_with_limit_orders(
             .active_cleanup_positions(&positions, min_close_notional)
             .await?;
         if open_positions.is_empty() {
-            info!(phase, attempts = attempt - 1, "no open positions to close");
             return Ok(());
         }
-
-        info!(
-            phase,
-            attempt,
-            count = open_positions.len(),
-            "placing passive maker close order and waiting for fill"
-        );
 
         exchange
             .submit_limit_close_orders(&open_positions, min_close_notional)
@@ -97,19 +84,10 @@ async fn close_positions_with_limit_orders(
                 .active_cleanup_positions(&positions, min_close_notional)
                 .await?;
             if remaining.is_empty() {
-                info!(phase, attempt, poll, "position closed by maker fill");
                 return Ok(());
             }
-            info!(
-                phase,
-                attempt,
-                poll,
-                remaining = remaining.len(),
-                "waiting for maker fill"
-            );
         }
 
-        info!(phase, attempt, "reprice: cancelling stale close order");
         exchange.cancel_all_orders().await?;
         sleep(Duration::from_millis(300)).await;
     }
@@ -119,7 +97,6 @@ async fn close_positions_with_limit_orders(
         .active_cleanup_positions(&positions, min_close_notional)
         .await?;
     if residual_positions.is_empty() {
-        info!(phase, "limit-close cleanup completed after retries");
         return Ok(());
     }
 
@@ -146,7 +123,6 @@ async fn close_positions_with_limit_orders(
         .active_cleanup_positions(&positions, min_close_notional)
         .await?;
     if still_open.is_empty() {
-        info!(phase, "market-close cleanup succeeded");
         return Ok(());
     }
 

@@ -7,7 +7,7 @@ use rust_decimal::Decimal;
 use crate::{
     config::StorageConfig,
     core::state::BotState,
-    domain::{Fill, Position, StrategySnapshot},
+    domain::{Fill, Position, QuoteFilterEvent, StrategySnapshot},
 };
 
 pub struct FillStore {
@@ -116,6 +116,28 @@ impl FillStore {
                 top_ask TEXT,
                 account_equity TEXT NOT NULL,
                 total_pnl TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS quote_filter_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                is_simulated INTEGER NOT NULL,
+                reason TEXT NOT NULL,
+                side TEXT NOT NULL,
+                level_index INTEGER NOT NULL,
+                is_unwind INTEGER NOT NULL,
+                unwind_only INTEGER NOT NULL,
+                stale_maker_unwind INTEGER NOT NULL,
+                emergency_unwind INTEGER NOT NULL,
+                current_position TEXT NOT NULL,
+                raw_quantity TEXT NOT NULL,
+                effective_quantity TEXT,
+                remaining_capacity TEXT,
+                price TEXT,
+                notional TEXT,
+                quote_min_trade_amount TEXT,
+                best_bid TEXT,
+                best_ask TEXT
             );",
         )?;
 
@@ -364,6 +386,48 @@ impl FillStore {
                 snapshot.top_ask.map(|v| v.to_string()),
                 snapshot.account_equity.to_string(),
                 snapshot.total_pnl.to_string(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_quote_filter_event(&self, event: &QuoteFilterEvent) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fill store mutex poisoned"))?;
+        connection.execute(
+            "INSERT INTO quote_filter_events (
+                ts, symbol, is_simulated, reason, side, level_index,
+                is_unwind, unwind_only, stale_maker_unwind, emergency_unwind,
+                current_position, raw_quantity, effective_quantity, remaining_capacity,
+                price, notional, quote_min_trade_amount, best_bid, best_ask
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6,
+                ?7, ?8, ?9, ?10,
+                ?11, ?12, ?13, ?14,
+                ?15, ?16, ?17, ?18, ?19
+            )",
+            params![
+                event.ts.to_rfc3339(),
+                event.symbol,
+                if event.is_simulated { 1 } else { 0 },
+                event.reason,
+                format!("{:?}", event.side),
+                event.level_index,
+                if event.is_unwind { 1 } else { 0 },
+                if event.unwind_only { 1 } else { 0 },
+                if event.stale_maker_unwind { 1 } else { 0 },
+                if event.emergency_unwind { 1 } else { 0 },
+                event.current_position.to_string(),
+                event.raw_quantity.to_string(),
+                event.effective_quantity.map(|v| v.to_string()),
+                event.remaining_capacity.map(|v| v.to_string()),
+                event.price.map(|v| v.to_string()),
+                event.notional.map(|v| v.to_string()),
+                event.quote_min_trade_amount.map(|v| v.to_string()),
+                event.best_bid.map(|v| v.to_string()),
+                event.best_ask.map(|v| v.to_string()),
             ],
         )?;
         Ok(())
