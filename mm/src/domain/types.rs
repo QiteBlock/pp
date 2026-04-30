@@ -52,6 +52,14 @@ pub enum OrderType {
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TimeInForce {
+    #[default]
+    GoodTillTime,
+    ImmediateOrCancel,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MarketRegime {
     #[default]
     Quiet,
@@ -76,6 +84,7 @@ pub struct OrderRequest {
     pub level_index: usize,
     pub side: Side,
     pub order_type: OrderType,
+    pub time_in_force: TimeInForce,
     pub price: Option<Decimal>,
     pub quantity: Decimal,
     pub post_only: bool,

@@ -35,7 +35,7 @@ use crate::{
     config::{HibachiAuthMode, NetworkConfig, VenueConfig},
     domain::{
         Fill, InstrumentMeta, MarketEvent, OpenOrder, OrderRequest, OrderType, Position,
-        PrivateEvent, Side,
+        PrivateEvent, Side, TimeInForce,
     },
 };
 
@@ -752,6 +752,10 @@ impl OrderExecutor for HibachiClient {
                     None
                 },
                 order_type: request.order_type,
+                time_in_force: match request.time_in_force {
+                    TimeInForce::GoodTillTime => None,
+                    TimeInForce::ImmediateOrCancel => Some("IOC".to_string()),
+                },
                 price: request.price,
                 quantity: request.quantity,
                 side: request.side,
@@ -1181,6 +1185,8 @@ struct CreateOrderPayload {
     #[serde(skip_serializing_if = "Option::is_none")]
     order_flags: Option<String>,
     order_type: OrderType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    time_in_force: Option<String>,
     price: Option<Decimal>,
     quantity: Decimal,
     side: Side,

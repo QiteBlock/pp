@@ -39,7 +39,7 @@ use crate::{
     config::{NetworkConfig, VenueConfig},
     domain::{
         InstrumentMeta, MarketEvent, OpenOrder, OrderRequest, OrderType, Position, PrivateEvent,
-        Side,
+        Side, TimeInForce,
     },
 };
 
@@ -348,6 +348,7 @@ impl GrvtClient {
                 level_index: 0,
                 side,
                 order_type: OrderType::Limit,
+                time_in_force: TimeInForce::GoodTillTime,
                 price: Some(price),
                 quantity: position.quantity.abs(),
                 post_only: true,
@@ -433,6 +434,7 @@ impl GrvtClient {
                 level_index: 0,
                 side,
                 order_type: OrderType::Market,
+                time_in_force: TimeInForce::ImmediateOrCancel,
                 price: None,
                 quantity: position.quantity.abs(),
                 post_only: false,
@@ -656,10 +658,9 @@ impl GrvtClient {
         let mut order = json!({
             "sub_account_id": self.config.grvt_sub_account_id,
             "is_market": request.order_type == OrderType::Market,
-            "time_in_force": if request.order_type == OrderType::Market {
-                "IMMEDIATE_OR_CANCEL"
-            } else {
-                "GOOD_TILL_TIME"
+            "time_in_force": match request.time_in_force {
+                TimeInForce::GoodTillTime => "GOOD_TILL_TIME",
+                TimeInForce::ImmediateOrCancel => "IMMEDIATE_OR_CANCEL",
             },
             "post_only": request.post_only,
             "reduce_only": false,
@@ -1647,10 +1648,9 @@ fn sign_grvt_order(
         Token::FixedBytes(order_typehash.to_vec()),
         Token::Uint(U256::from(sub_account_id.parse::<u64>()?)),
         Token::Bool(request.order_type == OrderType::Market),
-        Token::Uint(U256::from(if request.order_type == OrderType::Market {
-            3u64
-        } else {
-            1u64
+        Token::Uint(U256::from(match request.time_in_force {
+            TimeInForce::GoodTillTime => 1u64,
+            TimeInForce::ImmediateOrCancel => 3u64,
         })),
         Token::Bool(request.post_only),
         Token::Bool(false),

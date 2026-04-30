@@ -56,6 +56,12 @@ impl AppConfig {
         {
             bail!("model.price_sensitivity_scaling_factor must be within [0, 1]");
         }
+        if parsed.risk.stale_position_close_slippage_cap_bps < Decimal::ZERO {
+            bail!("risk.stale_position_close_slippage_cap_bps must be non-negative");
+        }
+        if parsed.risk.stale_position_close_chunk_base < Decimal::ZERO {
+            bail!("risk.stale_position_close_chunk_base must be non-negative");
+        }
         if parsed.factors.regime_intensity_alpha <= Decimal::ZERO
             || parsed.factors.regime_intensity_alpha > Decimal::ONE
         {
@@ -233,6 +239,15 @@ impl AppConfig {
                     &self.risk.emergency_unwind_threshold,
                 )?,
                 emergency_unwind_cycles: self.risk.emergency_unwind_cycles,
+                stale_position_timeout_secs: self.risk.stale_position_timeout_secs,
+                stale_position_close_slippage_cap_bps: parse_decimal(
+                    "risk.stale_position_close_slippage_cap_bps",
+                    &self.risk.stale_position_close_slippage_cap_bps,
+                )?,
+                stale_position_close_chunk_base: parse_decimal(
+                    "risk.stale_position_close_chunk_base",
+                    &self.risk.stale_position_close_chunk_base,
+                )?,
             },
             factors: ParsedFactorConfig {
                 volatility_ewma_alpha: parse_decimal(
@@ -447,6 +462,9 @@ pub struct ParsedRiskConfig {
     pub circuit_breaker_cooldown_ms: u64,
     pub emergency_unwind_threshold: Decimal,
     pub emergency_unwind_cycles: usize,
+    pub stale_position_timeout_secs: u64,
+    pub stale_position_close_slippage_cap_bps: Decimal,
+    pub stale_position_close_chunk_base: Decimal,
 }
 
 #[derive(Clone, Debug)]
@@ -589,6 +607,14 @@ fn default_emergency_unwind_threshold() -> String {
 
 fn default_emergency_unwind_cycles() -> usize {
     5
+}
+
+fn default_stale_position_timeout_secs() -> u64 {
+    10 * 60
+}
+
+fn default_stale_position_close_slippage_cap_bps() -> String {
+    "50".to_string()
 }
 
 fn default_empty_quote_alert_cycles() -> usize {
@@ -813,6 +839,15 @@ pub struct RiskConfig {
     /// Consecutive empty-unwind cycles before emergency mode activates.
     #[serde(default = "default_emergency_unwind_cycles")]
     pub emergency_unwind_cycles: usize,
+    /// Age in seconds after which stale positions switch to IOC limit-close logic.
+    #[serde(default = "default_stale_position_timeout_secs")]
+    pub stale_position_timeout_secs: u64,
+    /// Slippage cap in bps applied to IOC stale closes versus mid/reference price.
+    #[serde(default = "default_stale_position_close_slippage_cap_bps")]
+    pub stale_position_close_slippage_cap_bps: String,
+    /// Max base-size per stale close attempt. 0 = full position.
+    #[serde(default = "default_zero_string")]
+    pub stale_position_close_chunk_base: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

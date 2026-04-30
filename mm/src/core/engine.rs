@@ -31,7 +31,7 @@ use crate::{
     },
     domain::{
         Fill, InstrumentMeta, MarketEvent, MarketRegime, OrderRequest, OrderType, PrivateEvent,
-        Side,
+        Side, TimeInForce,
     },
 };
 
@@ -964,7 +964,11 @@ where
         let hard_toxic_stop_secs = 300u64;
         let min_level_multiplier = Decimal::new(5, 1);
         let non_unwind_size_reduction = Decimal::new(25, 2);
-        let position_hold_timeout = ChronoDuration::minutes(10);
+        let position_hold_timeout =
+            ChronoDuration::seconds(self.parsed.risk.stale_position_timeout_secs as i64);
+        let stale_close_slippage_cap_frac =
+            self.parsed.risk.stale_position_close_slippage_cap_bps / Decimal::from(10_000u64);
+        let stale_close_chunk_base = self.parsed.risk.stale_position_close_chunk_base;
         let enabled_pairs: Vec<_> = self
             .config
             .pairs
@@ -973,80 +977,134 @@ where
             .collect();
         let now_utc = Utc::now();
         let mut stale_flatten_orders = Vec::new();
+        let mut stale_maker_unwind_symbols = HashSet::new();
 
-        for pair in &enabled_pairs {
-            let Some(position) = state.positions.get(&pair.symbol) else {
-                continue;
-            };
-            let Some(opened_at) = position.opened_at else {
-                continue;
-            };
-            let position_age = now_utc - opened_at;
-            if position_age <= position_hold_timeout {
-                continue;
-            }
+        if self.parsed.risk.stale_position_timeout_secs > 0 {
+            for pair in &enabled_pairs {
+                let Some(position) = state.positions.get(&pair.symbol) else {
+                    continue;
+                };
+                let Some(opened_at) = position.opened_at else {
+                    continue;
+                };
+                let position_age = now_utc - opened_at;
+                if position_age <= position_hold_timeout {
+                    continue;
+                }
 
-            let reference_price =
-                position_price_for_symbol(state, &pair.symbol, position.entry_price);
-            if position_is_effectively_flat(position.quantity, reference_price, min_trade_amount) {
-                continue;
-            }
+                let reference_price =
+                    position_price_for_symbol(state, &pair.symbol, position.entry_price);
+                if position.quantity == Decimal::ZERO {
+                    continue;
+                }
 
-            let Some(instrument) = instrument_by_symbol.get(&pair.symbol) else {
-                warn!(
-                    symbol = %pair.symbol,
-                    position = %position.quantity,
-                    position_age_secs = position_age.num_seconds(),
-                    "stale position exceeded hold timeout but instrument metadata is missing; skipping forced flatten"
+                let Some(instrument) = instrument_by_symbol.get(&pair.symbol) else {
+                    warn!(
+                        symbol = %pair.symbol,
+                        position = %position.quantity,
+                        position_age_secs = position_age.num_seconds(),
+                        "stale position exceeded hold timeout but instrument metadata is missing; skipping forced flatten"
+                    );
+                    continue;
+                };
+                let total_abs_quantity = position.quantity.abs();
+                let total_notional = total_abs_quantity * reference_price;
+                if reference_price <= Decimal::ZERO || total_notional < min_trade_amount {
+                    warn!(
+                        symbol = %pair.symbol,
+                        position = %position.quantity,
+                        position_age_secs = position_age.num_seconds(),
+                        reference_price = %reference_price,
+                        total_notional = %total_notional,
+                        min_trade_amount = %min_trade_amount,
+                        "stale position exceeded hold timeout but is below IOC close threshold; falling back to unwind-only maker quoting"
+                    );
+                    stale_maker_unwind_symbols.insert(pair.symbol.clone());
+                    continue;
+                }
+
+                let chunk_target = if stale_close_chunk_base > Decimal::ZERO {
+                    total_abs_quantity.min(stale_close_chunk_base)
+                } else {
+                    total_abs_quantity
+                };
+                let min_notional_quantity =
+                    (min_trade_amount / reference_price).max(Decimal::new(1, 9));
+                let desired_close_quantity = chunk_target
+                    .max(min_notional_quantity)
+                    .min(total_abs_quantity);
+                let quantity = quantize_order_quantity_for_checks(
+                    desired_close_quantity,
+                    instrument,
+                    self.parsed.model.min_step_volume,
                 );
-                continue;
-            };
-            let quantity = quantize_order_quantity_for_checks(
-                position.quantity.abs(),
-                instrument,
-                self.parsed.model.min_step_volume,
-            );
-            let notional = quantity * reference_price;
-            if quantity <= Decimal::ZERO
-                || (reference_price > Decimal::ZERO && notional < min_trade_amount)
-            {
+                let chunk_notional = quantity * reference_price;
+                if quantity <= Decimal::ZERO || chunk_notional < min_trade_amount {
+                    warn!(
+                        symbol = %pair.symbol,
+                        position = %position.quantity,
+                        position_age_secs = position_age.num_seconds(),
+                        quantity = %quantity,
+                        reference_price = %reference_price,
+                        notional = %chunk_notional,
+                        min_trade_amount = %min_trade_amount,
+                        "stale position exceeded hold timeout but IOC close chunk is below minimum tradable threshold; falling back to unwind-only maker quoting"
+                    );
+                    stale_maker_unwind_symbols.insert(pair.symbol.clone());
+                    continue;
+                }
+
+                let side = if position.quantity > Decimal::ZERO {
+                    Side::Ask
+                } else {
+                    Side::Bid
+                };
+                let close_reference_price = state
+                    .market
+                    .symbols
+                    .get(&pair.symbol)
+                    .and_then(|market| {
+                        market
+                            .mid_price()
+                            .or(market.mark_price)
+                            .or(market.spot_price)
+                            .or(market.best_bid)
+                            .or(market.best_ask)
+                    })
+                    .unwrap_or(reference_price);
+                let capped_limit_price = round_to_tick_for_side(
+                    close_reference_price
+                        * match side {
+                            Side::Ask => Decimal::ONE - stale_close_slippage_cap_frac,
+                            Side::Bid => Decimal::ONE + stale_close_slippage_cap_frac,
+                        },
+                    instrument.tick_size,
+                    side,
+                );
                 warn!(
                     symbol = %pair.symbol,
                     position = %position.quantity,
                     position_age_secs = position_age.num_seconds(),
+                    side = ?side,
                     quantity = %quantity,
                     reference_price = %reference_price,
-                    notional = %notional,
-                    min_trade_amount = %min_trade_amount,
-                    "stale position exceeded hold timeout but close size is below minimum tradable threshold"
+                    limit_price = %capped_limit_price,
+                    slippage_cap_bps = %self.parsed.risk.stale_position_close_slippage_cap_bps,
+                    chunk_base = %stale_close_chunk_base,
+                    "stale position exceeded hold timeout; forcing IOC limit flatten and skipping normal quote generation"
                 );
-                continue;
+                stale_flatten_orders.push(OrderRequest {
+                    symbol: pair.symbol.clone(),
+                    contract_id: instrument.contract_id,
+                    level_index: 0,
+                    side,
+                    order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::ImmediateOrCancel,
+                    price: Some(capped_limit_price),
+                    quantity,
+                    post_only: false,
+                });
             }
-
-            let side = if position.quantity > Decimal::ZERO {
-                Side::Ask
-            } else {
-                Side::Bid
-            };
-            warn!(
-                symbol = %pair.symbol,
-                position = %position.quantity,
-                position_age_secs = position_age.num_seconds(),
-                side = ?side,
-                quantity = %quantity,
-                reference_price = %reference_price,
-                "stale position exceeded hold timeout; forcing IOC market flatten and skipping normal quote generation"
-            );
-            stale_flatten_orders.push(OrderRequest {
-                symbol: pair.symbol.clone(),
-                contract_id: instrument.contract_id,
-                level_index: 0,
-                side,
-                order_type: OrderType::Market,
-                price: None,
-                quantity,
-                post_only: false,
-            });
         }
 
         if !stale_flatten_orders.is_empty() {
@@ -1088,10 +1146,12 @@ where
                 .get(&pair.symbol)
                 .map(|position| position.quantity)
                 .unwrap_or(Decimal::ZERO);
+            let stale_maker_unwind = stale_maker_unwind_symbols.contains(&pair.symbol);
             let position_price =
                 position_price_for_symbol(state, &pair.symbol, factor_snapshot.price_index);
             let has_position =
                 !position_is_effectively_flat(current_position, position_price, min_trade_amount);
+            let treat_as_position = has_position || stale_maker_unwind;
             let mut unwind_only = false;
             let bid_lvl0_multiplier =
                 fill_tracker.level_volume_multiplier(&pair.symbol, Side::Bid, 0);
@@ -1112,6 +1172,15 @@ where
                 ask_lvl0_multiplier = %ask_lvl0_multiplier,
                 "building desired orders for symbol"
             );
+            if stale_maker_unwind {
+                warn!(
+                    symbol = %pair.symbol,
+                    position = %current_position,
+                    position_price = %position_price,
+                    "stale residual position below IOC close threshold; forcing unwind-only maker flow"
+                );
+                unwind_only = true;
+            }
             let toxic_regime_blocks_new_positions = factor_snapshot.regime
                 == MarketRegime::TrendingToxic
                 && factor_snapshot.regime_intensity
@@ -1127,7 +1196,7 @@ where
                 && ask_lvl0_multiplier <= min_level_multiplier;
 
             if factor_snapshot.recent_trade_count < n_trade_threshold {
-                if has_position {
+                if treat_as_position {
                     warn!(
                         symbol = %pair.symbol,
                         position = %current_position,
@@ -1141,7 +1210,7 @@ where
                 }
             }
             if toxic_regime_blocks_new_positions {
-                if has_position {
+                if treat_as_position {
                     warn!(
                         symbol = %pair.symbol,
                         position = %current_position,
@@ -1163,7 +1232,7 @@ where
                 }
             }
             if sustained_fully_toxic {
-                if has_position {
+                if treat_as_position {
                     warn!(
                         symbol = %pair.symbol,
                         position = %current_position,
@@ -1187,7 +1256,7 @@ where
                 }
             }
             if factor_snapshot.raw_volatility > vol_cut {
-                if has_position {
+                if treat_as_position {
                     warn!(
                         symbol = %pair.symbol,
                         position = %current_position,
@@ -1349,7 +1418,7 @@ where
             // absolute instrument minimum so the position can always be unwound.
             let emergency_unwind = emergency_unwind_symbols.contains(&pair.symbol);
             // Effective min-trade-amount: use 0 in emergency so any sized order passes.
-            let effective_min_trade_amount = if emergency_unwind {
+            let effective_min_trade_amount = if emergency_unwind || stale_maker_unwind {
                 Decimal::ZERO
             } else {
                 min_trade_amount
@@ -1517,6 +1586,7 @@ where
                     level_index: quote.level_index,
                     side: quote.side,
                     order_type: OrderType::Limit,
+                    time_in_force: TimeInForce::GoodTillTime,
                     price: Some(price),
                     quantity,
                     post_only: quote.post_only,
@@ -1576,6 +1646,7 @@ where
                         level_index: 0,
                         side: exit_side,
                         order_type: OrderType::Limit,
+                        time_in_force: TimeInForce::GoodTillTime,
                         price: Some(price),
                         quantity: effective_quantity,
                         post_only: false,
@@ -1820,6 +1891,9 @@ fn filter_orders_against_current_bbo(
             let Some(price) = order.price else {
                 return Some(order.clone());
             };
+            if order.time_in_force == TimeInForce::ImmediateOrCancel {
+                return Some(order.clone());
+            }
             let market = state.market.symbols.get(&order.symbol)?;
             let same_side_bbo = match order.side {
                 Side::Bid => market.best_bid,

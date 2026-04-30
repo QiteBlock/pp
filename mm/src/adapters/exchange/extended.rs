@@ -36,6 +36,7 @@ use crate::{
     config::{NetworkConfig, VenueConfig},
     domain::{
         Fill, InstrumentMeta, MarketEvent, OpenOrder, OrderRequest, Position, PrivateEvent, Side,
+        TimeInForce,
     },
 };
 
@@ -513,9 +514,9 @@ impl ExtendedClient {
             "price": format_decimal(price),
             "reduceOnly": false,
             "postOnly": request.post_only,
-            "timeInForce": match request.order_type {
-                crate::domain::OrderType::Limit => "GTT",
-                crate::domain::OrderType::Market => "IOC",
+            "timeInForce": match request.time_in_force {
+                TimeInForce::GoodTillTime => "GTT",
+                TimeInForce::ImmediateOrCancel => "IOC",
             },
             "expiryEpochMillis": expiry_epoch_millis,
             "fee": format_decimal(fee_rate),
