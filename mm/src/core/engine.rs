@@ -31,7 +31,7 @@ use crate::{
     },
     domain::{
         Fill, InstrumentMeta, MarketEvent, MarketRegime, OrderRequest, OrderType, PrivateEvent,
-        Side, TimeInForce,
+        Side, StrategySnapshot, TimeInForce,
     },
 };
 
@@ -76,6 +76,13 @@ impl<E> MarketMakingEngine<E>
 where
     E: ExchangeClient + CleanupExchange + 'static,
 {
+    fn persist_strategy_snapshot(&self, snapshot: StrategySnapshot) -> Result<()> {
+        if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
+            fill_store.insert_strategy_snapshot(&snapshot)?;
+        }
+        Ok(())
+    }
+
     pub fn new(
         config: AppConfig,
         exchange: Arc<E>,
@@ -1093,7 +1100,7 @@ where
                     chunk_base = %stale_close_chunk_base,
                     "stale position exceeded hold timeout; forcing IOC limit flatten and skipping normal quote generation"
                 );
-                stale_flatten_orders.push(OrderRequest {
+                let order = OrderRequest {
                     symbol: pair.symbol.clone(),
                     contract_id: instrument.contract_id,
                     level_index: 0,
@@ -1103,7 +1110,28 @@ where
                     price: Some(capped_limit_price),
                     quantity,
                     post_only: false,
-                });
+                };
+                self.persist_strategy_snapshot(build_strategy_snapshot(
+                    state,
+                    &pair.symbol,
+                    self.config.runtime.dry_run,
+                    "stale_ioc_close",
+                    None,
+                    position.quantity,
+                    reference_price,
+                    true,
+                    true,
+                    false,
+                    false,
+                    degraded,
+                    state.market.symbols.get(&pair.symbol),
+                    None,
+                    None,
+                    None,
+                    0,
+                    std::slice::from_ref(&order),
+                ))?;
+                stale_flatten_orders.push(order);
             }
         }
 
@@ -1120,6 +1148,37 @@ where
                 factors.compute(&self.config, &self.parsed, pair, state, fill_tracker)
             else {
                 info!(symbol = %pair.symbol, "factor snapshot unavailable; skipping symbol");
+                let current_position = state
+                    .positions
+                    .get(&pair.symbol)
+                    .map(|position| position.quantity)
+                    .unwrap_or(Decimal::ZERO);
+                let position_price = position_price_for_symbol(state, &pair.symbol, Decimal::ZERO);
+                let has_position = !position_is_effectively_flat(
+                    current_position,
+                    position_price,
+                    min_trade_amount,
+                );
+                self.persist_strategy_snapshot(build_strategy_snapshot(
+                    state,
+                    &pair.symbol,
+                    self.config.runtime.dry_run,
+                    "skip",
+                    Some("factor_unavailable"),
+                    current_position,
+                    position_price,
+                    has_position,
+                    false,
+                    stale_maker_unwind_symbols.contains(&pair.symbol),
+                    false,
+                    degraded,
+                    state.market.symbols.get(&pair.symbol),
+                    None,
+                    None,
+                    None,
+                    0,
+                    &[],
+                ))?;
                 continue;
             };
             // Populate post-fill widen multipliers.
@@ -1206,6 +1265,26 @@ where
                     );
                     unwind_only = true;
                 } else {
+                    self.persist_strategy_snapshot(build_strategy_snapshot(
+                        state,
+                        &pair.symbol,
+                        self.config.runtime.dry_run,
+                        "skip",
+                        Some("recent_trade_threshold"),
+                        current_position,
+                        position_price,
+                        has_position,
+                        false,
+                        stale_maker_unwind,
+                        false,
+                        degraded,
+                        state.market.symbols.get(&pair.symbol),
+                        Some(&factor_snapshot),
+                        Some(bid_lvl0_multiplier),
+                        Some(ask_lvl0_multiplier),
+                        0,
+                        &[],
+                    ))?;
                     continue;
                 }
             }
@@ -1228,6 +1307,26 @@ where
                         threshold_secs = self.parsed.factors.toxic_regime_block_new_positions_secs,
                         "persistent trending-toxic regime; blocking new positions"
                     );
+                    self.persist_strategy_snapshot(build_strategy_snapshot(
+                        state,
+                        &pair.symbol,
+                        self.config.runtime.dry_run,
+                        "skip",
+                        Some("persistent_trending_toxic"),
+                        current_position,
+                        position_price,
+                        has_position,
+                        false,
+                        stale_maker_unwind,
+                        false,
+                        degraded,
+                        state.market.symbols.get(&pair.symbol),
+                        Some(&factor_snapshot),
+                        Some(bid_lvl0_multiplier),
+                        Some(ask_lvl0_multiplier),
+                        0,
+                        &[],
+                    ))?;
                     continue;
                 }
             }
@@ -1252,6 +1351,26 @@ where
                         ask_lvl0_multiplier = %ask_lvl0_multiplier,
                         "all recent fills remain toxic with size pinned at the floor; suppressing quotes entirely"
                     );
+                    self.persist_strategy_snapshot(build_strategy_snapshot(
+                        state,
+                        &pair.symbol,
+                        self.config.runtime.dry_run,
+                        "skip",
+                        Some("sustained_fully_toxic"),
+                        current_position,
+                        position_price,
+                        has_position,
+                        false,
+                        stale_maker_unwind,
+                        false,
+                        degraded,
+                        state.market.symbols.get(&pair.symbol),
+                        Some(&factor_snapshot),
+                        Some(bid_lvl0_multiplier),
+                        Some(ask_lvl0_multiplier),
+                        0,
+                        &[],
+                    ))?;
                     continue;
                 }
             }
@@ -1272,6 +1391,26 @@ where
                         threshold = %vol_cut,
                         "volatility cut threshold exceeded; suppressing quotes"
                     );
+                    self.persist_strategy_snapshot(build_strategy_snapshot(
+                        state,
+                        &pair.symbol,
+                        self.config.runtime.dry_run,
+                        "skip",
+                        Some("volatility_cut"),
+                        current_position,
+                        position_price,
+                        has_position,
+                        false,
+                        stale_maker_unwind,
+                        false,
+                        degraded,
+                        state.market.symbols.get(&pair.symbol),
+                        Some(&factor_snapshot),
+                        Some(bid_lvl0_multiplier),
+                        Some(ask_lvl0_multiplier),
+                        0,
+                        &[],
+                    ))?;
                     continue;
                 }
             }
@@ -1344,6 +1483,26 @@ where
             let mid = market.and_then(|market| market.mid_price());
             let Some(instrument) = instrument_by_symbol.get(&pair.symbol) else {
                 warn!(symbol = %pair.symbol, "missing instrument metadata; skipping symbol");
+                self.persist_strategy_snapshot(build_strategy_snapshot(
+                    state,
+                    &pair.symbol,
+                    self.config.runtime.dry_run,
+                    "skip",
+                    Some("missing_instrument_metadata"),
+                    current_position,
+                    position_price,
+                    has_position,
+                    unwind_only,
+                    stale_maker_unwind,
+                    false,
+                    degraded,
+                    market,
+                    Some(&factor_snapshot),
+                    Some(bid_lvl0_multiplier),
+                    Some(ask_lvl0_multiplier),
+                    0,
+                    &[],
+                ))?;
                 continue;
             };
             let reference_price = mid.or(best_bid).or(best_ask).unwrap_or(Decimal::ZERO);
@@ -1703,6 +1862,41 @@ where
                 emergency_unwind,
                 "built desired orders for symbol"
             );
+            let decision = if !symbol_orders.is_empty() {
+                if stale_maker_unwind {
+                    "stale_maker_unwind_quoted"
+                } else if unwind_only {
+                    "unwind_only_quoted"
+                } else {
+                    "quoted"
+                }
+            } else if stale_maker_unwind {
+                "stale_maker_unwind_suppressed"
+            } else if unwind_only {
+                "unwind_only_suppressed"
+            } else {
+                "suppressed"
+            };
+            self.persist_strategy_snapshot(build_strategy_snapshot(
+                state,
+                &pair.symbol,
+                self.config.runtime.dry_run,
+                decision,
+                None,
+                current_position,
+                position_price,
+                has_position,
+                unwind_only,
+                stale_maker_unwind,
+                emergency_unwind,
+                degraded,
+                market,
+                Some(&factor_snapshot),
+                Some(bid_lvl0_multiplier),
+                Some(ask_lvl0_multiplier),
+                generated_quote_count,
+                &symbol_orders,
+            ))?;
             orders.extend(symbol_orders.iter().cloned());
         }
 
@@ -1712,6 +1906,115 @@ where
             "build_desired_orders completed"
         );
         Ok(orders)
+    }
+}
+
+fn build_strategy_snapshot(
+    state: &BotState,
+    symbol: &str,
+    is_simulated: bool,
+    decision: &str,
+    skip_reason: Option<&str>,
+    current_position: Decimal,
+    position_price: Decimal,
+    has_position: bool,
+    unwind_only: bool,
+    stale_maker_unwind: bool,
+    emergency_unwind: bool,
+    degraded: bool,
+    market: Option<&crate::core::state::SymbolMarketState>,
+    factor_snapshot: Option<&crate::domain::FactorSnapshot>,
+    bid_lvl0_multiplier: Option<Decimal>,
+    ask_lvl0_multiplier: Option<Decimal>,
+    generated_quote_count: usize,
+    orders: &[OrderRequest],
+) -> StrategySnapshot {
+    let bid_count = orders
+        .iter()
+        .filter(|order| order.side == Side::Bid)
+        .count() as i64;
+    let ask_count = orders
+        .iter()
+        .filter(|order| order.side == Side::Ask)
+        .count() as i64;
+    let total_bid_qty: Decimal = orders
+        .iter()
+        .filter(|order| order.side == Side::Bid)
+        .map(|order| order.quantity)
+        .sum();
+    let total_ask_qty: Decimal = orders
+        .iter()
+        .filter(|order| order.side == Side::Ask)
+        .map(|order| order.quantity)
+        .sum();
+    let top_bid = orders
+        .iter()
+        .filter(|order| order.side == Side::Bid)
+        .filter_map(|order| order.price)
+        .max();
+    let top_ask = orders
+        .iter()
+        .filter(|order| order.side == Side::Ask)
+        .filter_map(|order| order.price)
+        .min();
+    let position_notional = current_position.abs() * position_price;
+
+    StrategySnapshot {
+        ts: Utc::now(),
+        symbol: symbol.to_string(),
+        is_simulated,
+        decision: decision.to_string(),
+        skip_reason: skip_reason.map(str::to_string),
+        current_position,
+        position_price,
+        position_notional,
+        has_position,
+        unwind_only,
+        stale_maker_unwind,
+        emergency_unwind,
+        degraded,
+        best_bid: market.and_then(|m| m.best_bid),
+        best_ask: market.and_then(|m| m.best_ask),
+        mid_price: market.and_then(|m| m.mid_price()),
+        mark_price: market.and_then(|m| m.mark_price),
+        spot_price: market.and_then(|m| m.spot_price),
+        bbo_spread_bps: market.and_then(|m| m.bbo_spread_bps()),
+        bbo_bid_size: market.and_then(|m| m.bbo_bid_size),
+        bbo_ask_size: market.and_then(|m| m.bbo_ask_size),
+        price_index: factor_snapshot.map(|f| f.price_index),
+        raw_volatility: factor_snapshot.map(|f| f.raw_volatility),
+        volatility: factor_snapshot.map(|f| f.volatility),
+        inventory_lean_bps: factor_snapshot.map(|f| f.inventory_lean_bps),
+        volume_imbalance: factor_snapshot.map(|f| f.volume_imbalance),
+        flow_direction: factor_snapshot.map(|f| f.flow_direction),
+        inventory_skew: factor_snapshot.map(|f| f.inventory_skew),
+        recent_trade_count: factor_snapshot.map(|f| f.recent_trade_count as i64),
+        regime: factor_snapshot.map(|f| format!("{:?}", f.regime)),
+        regime_intensity: factor_snapshot.map(|f| f.regime_intensity),
+        ob_imbalance: factor_snapshot.map(|f| f.ob_imbalance),
+        consecutive_flow_spike: factor_snapshot.map(|f| i64::from(f.consecutive_flow_spike)),
+        microprice: factor_snapshot.map(|f| f.microprice),
+        fill_rate_skew: factor_snapshot.map(|f| f.fill_rate_skew),
+        vpin: factor_snapshot.map(|f| f.vpin),
+        funding_lean: factor_snapshot.map(|f| f.funding_lean),
+        kappa_estimate: factor_snapshot.and_then(|f| f.kappa_estimate),
+        post_fill_widen_bid: factor_snapshot.map(|f| f.post_fill_widen_bid),
+        post_fill_widen_ask: factor_snapshot.map(|f| f.post_fill_widen_ask),
+        flow_spike_widen_multiplier: factor_snapshot.map(|f| f.flow_spike_widen_multiplier),
+        toxic_regime_persistence_secs: factor_snapshot
+            .map(|f| f.toxic_regime_persistence_secs as i64),
+        bid_lvl0_multiplier,
+        ask_lvl0_multiplier,
+        generated_quote_count: generated_quote_count as i64,
+        desired_order_count: orders.len() as i64,
+        bid_count,
+        ask_count,
+        total_bid_qty,
+        total_ask_qty,
+        top_bid,
+        top_ask,
+        account_equity: state.account_equity,
+        total_pnl: state.effective_total_pnl(),
     }
 }
 
