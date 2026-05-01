@@ -1,13 +1,18 @@
 use std::{collections::HashMap, fs, path::Path, str::FromStr, sync::Mutex};
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use rust_decimal::Decimal;
 
 use crate::{
     config::StorageConfig,
     core::state::BotState,
-    domain::{Fill, Position, QuoteFilterEvent, StrategySnapshot},
+    domain::{
+        BookSnapshot, CancelEvent, Fill, FillStorageTelemetry, FundingPaymentEvent, LatencySample,
+        MidPriceSample, OrderRejectionEvent, Position, QuoteFilterEvent, QuotePlacementEvent,
+        StrategySnapshot,
+    },
 };
 
 pub struct FillStore {
@@ -138,15 +143,115 @@ impl FillStore {
                 quote_min_trade_amount TEXT,
                 best_bid TEXT,
                 best_ask TEXT
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS quote_placements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                level_index INTEGER NOT NULL,
+                price TEXT,
+                quantity TEXT NOT NULL,
+                order_id TEXT,
+                client_order_key TEXT NOT NULL UNIQUE,
+                placed_or_replaced TEXT NOT NULL,
+                decision_ts TEXT NOT NULL,
+                sent_ts TEXT NOT NULL,
+                ack_ts TEXT,
+                mid_price TEXT,
+                is_simulated INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS book_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                mid_price TEXT,
+                best_bid TEXT,
+                best_ask TEXT,
+                bids_json TEXT NOT NULL,
+                asks_json TEXT NOT NULL,
+                trigger TEXT NOT NULL,
+                is_simulated INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cancel_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                level_index INTEGER,
+                order_id TEXT,
+                reason TEXT NOT NULL,
+                time_alive_ms INTEGER,
+                is_simulated INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS mid_price_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                mid_price TEXT NOT NULL,
+                best_bid TEXT,
+                best_ask TEXT,
+                mark_price TEXT,
+                spot_price TEXT,
+                source TEXT NOT NULL,
+                is_simulated INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS order_rejections (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                level_index INTEGER,
+                price TEXT,
+                quantity TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                is_simulated INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS latency_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                action TEXT NOT NULL,
+                side TEXT,
+                level_index INTEGER,
+                decision_ts TEXT NOT NULL,
+                sent_ts TEXT NOT NULL,
+                ack_ts TEXT,
+                client_order_key TEXT,
+                order_id TEXT,
+                is_simulated INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS funding_payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT,
+                payment_type TEXT NOT NULL,
+                amount TEXT NOT NULL,
+                note TEXT,
+                is_simulated INTEGER NOT NULL
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_funding_payments_unique
+            ON funding_payments (ts, symbol, payment_type, amount, note, is_simulated);",
         )?;
+        ensure_column(&connection, "fills", "quote_placed_ts", "TEXT")?;
+        ensure_column(&connection, "fills", "time_to_fill_ms", "INTEGER")?;
+        ensure_column(&connection, "fills", "pre_fill_mid_drift_bps", "TEXT")?;
+        ensure_column(&connection, "fills", "fee_paid", "TEXT")?;
+        ensure_column(&connection, "fills", "funding_paid", "TEXT")?;
 
         Ok(Some(Self {
             connection: Mutex::new(connection),
         }))
     }
 
-    pub fn insert_fill(&self, fill: &Fill, state: &BotState, is_simulated: bool) -> Result<()> {
+    pub fn insert_fill(
+        &self,
+        fill: &Fill,
+        state: &BotState,
+        is_simulated: bool,
+        telemetry: Option<&FillStorageTelemetry>,
+    ) -> Result<()> {
         let position = state.positions.get(&fill.symbol);
         let position_quantity_after = position
             .map(|position| position.quantity.to_string())
@@ -160,6 +265,19 @@ impl FillStore {
         let unrealized_pnl_after = position
             .map(|position| position.unrealized_pnl.to_string())
             .unwrap_or_else(|| "0".to_string());
+        let fee_paid = telemetry
+            .and_then(|details| details.fee_paid)
+            .map(|v| v.to_string());
+        let funding_paid = telemetry
+            .and_then(|details| details.funding_paid)
+            .map(|v| v.to_string());
+        let pre_fill_mid_drift_bps = telemetry
+            .and_then(|details| details.pre_fill_mid_drift_bps)
+            .map(|v| v.to_string());
+        let quote_placed_ts = telemetry
+            .and_then(|details| details.quote_placed_ts)
+            .map(|ts| ts.to_rfc3339());
+        let time_to_fill_ms = telemetry.and_then(|details| details.time_to_fill_ms);
 
         let connection = self
             .connection
@@ -169,8 +287,9 @@ impl FillStore {
             "INSERT INTO fills (
                 ts, symbol, side, price, quantity, is_simulated,
                 position_quantity_after, entry_price_after,
-                realized_pnl_after, unrealized_pnl_after, total_pnl_after
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                realized_pnl_after, unrealized_pnl_after, total_pnl_after,
+                quote_placed_ts, time_to_fill_ms, pre_fill_mid_drift_bps, fee_paid, funding_paid
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 fill.timestamp.to_rfc3339(),
                 fill.symbol,
@@ -183,6 +302,11 @@ impl FillStore {
                 realized_pnl_after,
                 unrealized_pnl_after,
                 state.effective_total_pnl().to_string(),
+                quote_placed_ts,
+                time_to_fill_ms,
+                pre_fill_mid_drift_bps,
+                fee_paid,
+                funding_paid,
             ],
         )?;
         self.insert_global_pnl_snapshot_locked(
@@ -432,6 +556,216 @@ impl FillStore {
         )?;
         Ok(())
     }
+
+    pub fn insert_quote_placement(&self, event: &QuotePlacementEvent) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fill store mutex poisoned"))?;
+        connection.execute(
+            "INSERT OR REPLACE INTO quote_placements (
+                ts, symbol, side, level_index, price, quantity, order_id, client_order_key,
+                placed_or_replaced, decision_ts, sent_ts, ack_ts, mid_price, is_simulated
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                event.ts.to_rfc3339(),
+                event.symbol,
+                format!("{:?}", event.side),
+                event.level_index,
+                event.price.map(|v| v.to_string()),
+                event.quantity.to_string(),
+                event.order_id,
+                event.client_order_key,
+                event.placed_or_replaced,
+                event.decision_ts.to_rfc3339(),
+                event.sent_ts.to_rfc3339(),
+                event.ack_ts.map(|ts| ts.to_rfc3339()),
+                event.mid_price.map(|v| v.to_string()),
+                if event.is_simulated { 1 } else { 0 },
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn ack_quote_placement(
+        &self,
+        client_order_key: &str,
+        order_id: Option<&str>,
+        ack_ts: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fill store mutex poisoned"))?;
+        connection.execute(
+            "UPDATE quote_placements
+             SET order_id = COALESCE(?1, order_id), ack_ts = ?2
+             WHERE client_order_key = ?3",
+            params![order_id, ack_ts.to_rfc3339(), client_order_key],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_book_snapshot(&self, snapshot: &BookSnapshot) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fill store mutex poisoned"))?;
+        connection.execute(
+            "INSERT INTO book_snapshots (
+                ts, symbol, mid_price, best_bid, best_ask, bids_json, asks_json, trigger, is_simulated
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                snapshot.ts.to_rfc3339(),
+                snapshot.symbol,
+                snapshot.mid_price.map(|v| v.to_string()),
+                snapshot.best_bid.map(|v| v.to_string()),
+                snapshot.best_ask.map(|v| v.to_string()),
+                snapshot.bids_json,
+                snapshot.asks_json,
+                snapshot.trigger,
+                if snapshot.is_simulated { 1 } else { 0 },
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_cancel_event(&self, event: &CancelEvent) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fill store mutex poisoned"))?;
+        connection.execute(
+            "INSERT INTO cancel_events (
+                ts, symbol, side, level_index, order_id, reason, time_alive_ms, is_simulated
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                event.ts.to_rfc3339(),
+                event.symbol,
+                format!("{:?}", event.side),
+                event.level_index,
+                event.order_id,
+                event.reason,
+                event.time_alive_ms,
+                if event.is_simulated { 1 } else { 0 },
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_mid_price_sample(&self, sample: &MidPriceSample) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fill store mutex poisoned"))?;
+        connection.execute(
+            "INSERT INTO mid_price_samples (
+                ts, symbol, mid_price, best_bid, best_ask, mark_price, spot_price, source, is_simulated
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                sample.ts.to_rfc3339(),
+                sample.symbol,
+                sample.mid_price.to_string(),
+                sample.best_bid.map(|v| v.to_string()),
+                sample.best_ask.map(|v| v.to_string()),
+                sample.mark_price.map(|v| v.to_string()),
+                sample.spot_price.map(|v| v.to_string()),
+                sample.source,
+                if sample.is_simulated { 1 } else { 0 },
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_order_rejection(&self, event: &OrderRejectionEvent) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fill store mutex poisoned"))?;
+        connection.execute(
+            "INSERT INTO order_rejections (
+                ts, symbol, side, level_index, price, quantity, reason, stage, is_simulated
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                event.ts.to_rfc3339(),
+                event.symbol,
+                format!("{:?}", event.side),
+                event.level_index,
+                event.price.map(|v| v.to_string()),
+                event.quantity.to_string(),
+                event.reason,
+                event.stage,
+                if event.is_simulated { 1 } else { 0 },
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_latency_sample(&self, sample: &LatencySample) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fill store mutex poisoned"))?;
+        connection.execute(
+            "INSERT INTO latency_samples (
+                ts, symbol, action, side, level_index, decision_ts, sent_ts, ack_ts,
+                client_order_key, order_id, is_simulated
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                sample.ts.to_rfc3339(),
+                sample.symbol,
+                sample.action,
+                sample.side.map(|side| format!("{:?}", side)),
+                sample.level_index,
+                sample.decision_ts.to_rfc3339(),
+                sample.sent_ts.to_rfc3339(),
+                sample.ack_ts.map(|ts| ts.to_rfc3339()),
+                sample.client_order_key,
+                sample.order_id,
+                if sample.is_simulated { 1 } else { 0 },
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_funding_payment(&self, event: &FundingPaymentEvent) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fill store mutex poisoned"))?;
+        connection.execute(
+            "INSERT OR IGNORE INTO funding_payments (
+                ts, symbol, payment_type, amount, note, is_simulated
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                event.ts.to_rfc3339(),
+                event.symbol,
+                event.payment_type,
+                event.amount.to_string(),
+                event.note,
+                if event.is_simulated { 1 } else { 0 },
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn latest_funding_payment_ts(&self, is_simulated: bool) -> Result<Option<DateTime<Utc>>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fill store mutex poisoned"))?;
+        let mut statement =
+            connection.prepare("SELECT MAX(ts) FROM funding_payments WHERE is_simulated = ?1")?;
+        let latest: Option<String> =
+            statement.query_row([if is_simulated { 1 } else { 0 }], |row| row.get(0))?;
+        latest
+            .map(|ts| {
+                DateTime::parse_from_rfc3339(&ts)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .context("failed to parse stored funding payment timestamp")
+            })
+            .transpose()
+    }
 }
 
 fn aggregate_pnl(state: &BotState) -> (Decimal, Decimal) {
@@ -446,4 +780,25 @@ fn aggregate_pnl(state: &BotState) -> (Decimal, Decimal) {
         .map(|position| position.unrealized_pnl)
         .sum();
     (realized, unrealized)
+}
+
+fn ensure_column(
+    connection: &Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut statement = connection.prepare(&pragma)?;
+    let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let exists = columns
+        .filter_map(|result| result.ok())
+        .any(|name| name == column);
+    if !exists {
+        connection.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
+        )?;
+    }
+    Ok(())
 }

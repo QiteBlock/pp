@@ -1,8 +1,12 @@
 use anyhow::Result;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
 use crate::config::ExchangeKind;
-use crate::domain::{InstrumentMeta, MarketEvent, OpenOrder, OrderRequest, Position, PrivateEvent};
+use crate::domain::{
+    FundingPaymentEvent, InstrumentMeta, MarketEvent, OpenOrder, OrderRequest, Position,
+    PrivateEvent,
+};
 
 use self::{extended::ExtendedClient, grvt::GrvtClient, hibachi::HibachiClient};
 
@@ -71,6 +75,15 @@ pub trait ExchangeClient:
     /// Returns an empty vec for venues that do not support this (default).
     async fn fetch_market_snapshot(&self, _symbols: &[String]) -> Vec<MarketEvent> {
         Vec::new()
+    }
+
+    /// Optional REST sync: fetch account-level funding payment history since the given time.
+    async fn fetch_funding_payments(
+        &self,
+        _symbols: &[String],
+        _start_time: DateTime<Utc>,
+    ) -> Result<Vec<FundingPaymentEvent>> {
+        Ok(Vec::new())
     }
 }
 
@@ -226,6 +239,18 @@ impl ExchangeClient for AnyExchangeClient {
             Self::Hibachi(_) => Vec::new(),
             Self::Grvt(client) => client.fetch_market_snapshot(symbols).await,
             Self::Extended(client) => client.fetch_market_snapshot(symbols).await,
+        }
+    }
+
+    async fn fetch_funding_payments(
+        &self,
+        symbols: &[String],
+        start_time: DateTime<Utc>,
+    ) -> Result<Vec<FundingPaymentEvent>> {
+        match self {
+            Self::Hibachi(_) => Ok(Vec::new()),
+            Self::Grvt(client) => client.fetch_funding_payments(symbols, start_time).await,
+            Self::Extended(client) => client.fetch_funding_payments(symbols, start_time).await,
         }
     }
 }

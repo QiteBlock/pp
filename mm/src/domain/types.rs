@@ -109,6 +109,8 @@ pub struct Fill {
     pub side: Side,
     pub price: Decimal,
     pub quantity: Decimal,
+    pub fee_paid: Option<Decimal>,
+    pub funding_paid: Option<Decimal>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -345,6 +347,109 @@ pub struct QuoteFilterEvent {
     pub quote_min_trade_amount: Option<Decimal>,
     pub best_bid: Option<Decimal>,
     pub best_ask: Option<Decimal>,
+}
+
+#[derive(Clone, Debug)]
+pub struct FillStorageTelemetry {
+    pub quote_placed_ts: Option<DateTime<Utc>>,
+    pub time_to_fill_ms: Option<i64>,
+    pub pre_fill_mid_drift_bps: Option<Decimal>,
+    pub fee_paid: Option<Decimal>,
+    pub funding_paid: Option<Decimal>,
+}
+
+#[derive(Clone, Debug)]
+pub struct QuotePlacementEvent {
+    pub ts: DateTime<Utc>,
+    pub symbol: String,
+    pub side: Side,
+    pub level_index: i64,
+    pub price: Option<Decimal>,
+    pub quantity: Decimal,
+    pub order_id: Option<String>,
+    pub client_order_key: String,
+    pub placed_or_replaced: String,
+    pub decision_ts: DateTime<Utc>,
+    pub sent_ts: DateTime<Utc>,
+    pub ack_ts: Option<DateTime<Utc>>,
+    pub mid_price: Option<Decimal>,
+    pub is_simulated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct BookSnapshot {
+    pub ts: DateTime<Utc>,
+    pub symbol: String,
+    pub mid_price: Option<Decimal>,
+    pub best_bid: Option<Decimal>,
+    pub best_ask: Option<Decimal>,
+    pub bids_json: String,
+    pub asks_json: String,
+    pub trigger: String,
+    pub is_simulated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct CancelEvent {
+    pub ts: DateTime<Utc>,
+    pub symbol: String,
+    pub side: Side,
+    pub level_index: Option<i64>,
+    pub order_id: Option<String>,
+    pub reason: String,
+    pub time_alive_ms: Option<i64>,
+    pub is_simulated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct MidPriceSample {
+    pub ts: DateTime<Utc>,
+    pub symbol: String,
+    pub mid_price: Decimal,
+    pub best_bid: Option<Decimal>,
+    pub best_ask: Option<Decimal>,
+    pub mark_price: Option<Decimal>,
+    pub spot_price: Option<Decimal>,
+    pub source: String,
+    pub is_simulated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct OrderRejectionEvent {
+    pub ts: DateTime<Utc>,
+    pub symbol: String,
+    pub side: Side,
+    pub level_index: Option<i64>,
+    pub price: Option<Decimal>,
+    pub quantity: Decimal,
+    pub reason: String,
+    pub stage: String,
+    pub is_simulated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct LatencySample {
+    pub ts: DateTime<Utc>,
+    pub symbol: String,
+    pub action: String,
+    pub side: Option<Side>,
+    pub level_index: Option<i64>,
+    pub decision_ts: DateTime<Utc>,
+    pub sent_ts: DateTime<Utc>,
+    pub ack_ts: Option<DateTime<Utc>>,
+    pub client_order_key: Option<String>,
+    pub order_id: Option<String>,
+    pub is_simulated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct FundingPaymentEvent {
+    pub ts: DateTime<Utc>,
+    pub symbol: Option<String>,
+    pub payment_type: String,
+    pub amount: Decimal,
+    pub note: Option<String>,
+    pub is_simulated: bool,
 }
 
 #[derive(Clone, Debug)]

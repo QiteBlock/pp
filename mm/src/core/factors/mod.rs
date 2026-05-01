@@ -308,12 +308,12 @@ impl FactorEngine {
             trade_velocity / symbol_state.trade_velocity_ewma
         };
 
-        let cross_flow = cross_symbol_flow(
+        let cross_flow = clamp_cross_flow(cross_symbol_flow(
             &pair.symbol,
             state,
             volume_window_start,
             parsed.factors.cross_symbol_vol_weight,
-        );
+        ));
         let bbo_spread_ewma_bps = symbol_state
             .bbo_spread_ewma
             .unwrap_or_else(|| market.bbo_spread_bps().unwrap_or(Decimal::ZERO));
@@ -646,6 +646,10 @@ fn smooth_flow_direction(value: Decimal) -> Decimal {
     } else {
         value / (Decimal::ONE + value.abs())
     }
+}
+
+fn clamp_cross_flow(value: Decimal) -> Decimal {
+    value.clamp(-Decimal::ONE, Decimal::ONE)
 }
 
 /// S8: GRVT/Asia-aware time-of-day spread multiplier.

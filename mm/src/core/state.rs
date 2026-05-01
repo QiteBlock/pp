@@ -206,6 +206,8 @@ impl BotState {
                 side: matched.side,
                 price: matched.price.unwrap_or(price),
                 quantity: fill_quantity,
+                fee_paid: None,
+                funding_paid: None,
                 timestamp,
             });
         }
@@ -423,6 +425,7 @@ impl MarketState {
                         symbol_state.recent_trades.clear();
                         symbol_state.last_updated = None;
                         symbol_state.last_updated_at = None;
+                        symbol_state.last_bbo_update_at = None;
                     }
                 }
             }
@@ -471,6 +474,7 @@ impl MarketState {
                 }
                 symbol_state.last_updated = Some(timestamp);
                 symbol_state.last_updated_at = Some(Instant::now());
+                symbol_state.last_bbo_update_at = Some(Instant::now());
                 self.last_updated = Some(timestamp);
                 self.last_updated_at = Some(Instant::now());
             }
@@ -517,8 +521,17 @@ impl MarketState {
                 symbol_state.asks = asks;
                 prune_book_depth(&mut symbol_state.bids, self.max_orderbook_depth, true);
                 prune_book_depth(&mut symbol_state.asks, self.max_orderbook_depth, false);
+                if let Some((best_bid, bid_qty)) = symbol_state.bids.iter().next_back() {
+                    symbol_state.best_bid = Some(*best_bid);
+                    symbol_state.bbo_bid_size = Some(*bid_qty);
+                }
+                if let Some((best_ask, ask_qty)) = symbol_state.asks.iter().next() {
+                    symbol_state.best_ask = Some(*best_ask);
+                    symbol_state.bbo_ask_size = Some(*ask_qty);
+                }
                 symbol_state.last_updated = Some(timestamp);
                 symbol_state.last_updated_at = Some(Instant::now());
+                symbol_state.last_bbo_update_at = Some(Instant::now());
                 self.last_updated = Some(timestamp);
                 self.last_updated_at = Some(Instant::now());
             }
@@ -545,8 +558,17 @@ impl MarketState {
                 }
                 prune_book_depth(&mut symbol_state.bids, self.max_orderbook_depth, true);
                 prune_book_depth(&mut symbol_state.asks, self.max_orderbook_depth, false);
+                if let Some((best_bid, bid_qty)) = symbol_state.bids.iter().next_back() {
+                    symbol_state.best_bid = Some(*best_bid);
+                    symbol_state.bbo_bid_size = Some(*bid_qty);
+                }
+                if let Some((best_ask, ask_qty)) = symbol_state.asks.iter().next() {
+                    symbol_state.best_ask = Some(*best_ask);
+                    symbol_state.bbo_ask_size = Some(*ask_qty);
+                }
                 symbol_state.last_updated = Some(timestamp);
                 symbol_state.last_updated_at = Some(Instant::now());
+                symbol_state.last_bbo_update_at = Some(Instant::now());
                 self.last_updated = Some(timestamp);
                 self.last_updated_at = Some(Instant::now());
             }
@@ -574,6 +596,7 @@ pub struct SymbolMarketState {
     pub recent_trades: VecDeque<RecentTrade>,
     pub last_updated: Option<DateTime<Utc>>,
     pub last_updated_at: Option<Instant>,
+    pub last_bbo_update_at: Option<Instant>,
 }
 
 impl SymbolMarketState {

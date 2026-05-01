@@ -884,6 +884,15 @@ fn parse_fill(value: &Value) -> Option<Fill> {
             .or_else(|| value.get("matchedQuantity"))
             .or_else(|| value.get("executedQuantity"))
             .and_then(as_decimal)?,
+        fee_paid: value
+            .get("fee")
+            .or_else(|| value.get("fees"))
+            .or_else(|| value.get("commission"))
+            .and_then(as_decimal),
+        funding_paid: value
+            .get("funding")
+            .or_else(|| value.get("fundingPaid"))
+            .and_then(as_decimal),
         timestamp: parse_timestamp(
             value
                 .get("timestamp")

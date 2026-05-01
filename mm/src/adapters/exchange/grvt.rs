@@ -4,7 +4,7 @@ use std::{
     str::FromStr,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -38,8 +38,8 @@ use crate::{
     },
     config::{NetworkConfig, VenueConfig},
     domain::{
-        InstrumentMeta, MarketEvent, OpenOrder, OrderRequest, OrderType, Position, PrivateEvent,
-        Side, TimeInForce,
+        FundingPaymentEvent, InstrumentMeta, MarketEvent, OpenOrder, OrderRequest, OrderType,
+        Position, PrivateEvent, Side, TimeInForce,
     },
 };
 
@@ -256,6 +256,96 @@ impl GrvtClient {
             bail!("grvt {path} failed with HTTP {status}: {body_text}");
         }
         serde_json::from_str(&body_text).map_err(Into::into)
+    }
+
+    async fn fetch_funding_payments_since(
+        &self,
+        symbols: &[String],
+        start_time: DateTime<Utc>,
+    ) -> Result<Vec<FundingPaymentEvent>> {
+        let mut events = Vec::new();
+        let start_time_nanos = start_time
+            .timestamp_nanos_opt()
+            .context("grvt funding payment start_time nanos overflow")?;
+
+        for symbol in symbols {
+            let mut cursor: Option<String> = None;
+            loop {
+                let mut payload = json!({
+                    "sub_account_id": self.config.grvt_sub_account_id,
+                    "instrument": grvt_symbol_from_internal(symbol),
+                    "start_time": start_time_nanos.to_string(),
+                    "limit": 500,
+                });
+                if let Some(cursor_value) = cursor.as_deref() {
+                    payload["cursor"] = Value::String(cursor_value.to_string());
+                }
+
+                let response = self
+                    .post_trading("/full/v1/funding_payment_history", &payload)
+                    .await?;
+                let result = response.get("result").or_else(|| response.get("r"));
+                let Some(items) = result.and_then(Value::as_array) else {
+                    break;
+                };
+                for item in items {
+                    let Some(ts) =
+                        parse_grvt_timestamp(item.get("event_time").or_else(|| item.get("et")))
+                    else {
+                        continue;
+                    };
+                    let Some(amount) = item
+                        .get("amount")
+                        .or_else(|| item.get("a"))
+                        .and_then(as_decimal)
+                    else {
+                        continue;
+                    };
+                    let instrument = item
+                        .get("instrument")
+                        .or_else(|| item.get("i"))
+                        .and_then(Value::as_str)
+                        .map(grvt_symbol_to_internal);
+                    let currency = item
+                        .get("currency")
+                        .or_else(|| item.get("c"))
+                        .and_then(Value::as_str);
+                    let tx_id = item
+                        .get("tx_id")
+                        .or_else(|| item.get("ti"))
+                        .and_then(Value::as_str);
+                    events.push(FundingPaymentEvent {
+                        ts,
+                        symbol: instrument,
+                        payment_type: "funding_payment".to_string(),
+                        amount,
+                        note: Some(
+                            json!({
+                                "venue": "grvt",
+                                "sub_account_id": self.config.grvt_sub_account_id,
+                                "currency": currency,
+                                "tx_id": tx_id,
+                            })
+                            .to_string(),
+                        ),
+                        is_simulated: false,
+                    });
+                }
+
+                let next_cursor = response
+                    .get("next")
+                    .or_else(|| response.get("n"))
+                    .and_then(Value::as_str)
+                    .filter(|cursor_value| !cursor_value.is_empty())
+                    .map(ToOwned::to_owned);
+                if next_cursor.is_none() {
+                    break;
+                }
+                cursor = next_cursor;
+            }
+        }
+
+        Ok(events)
     }
 
     pub async fn fetch_best_bid_ask_snapshot(&self, symbol: &str) -> Result<(Decimal, Decimal)> {
@@ -505,9 +595,18 @@ impl GrvtClient {
                             "id": grvt_request_id(stream_name),
                         }))?;
                         ws_stream.send(WsMessage::Text(subscribe.into())).await?;
+                        let track_market_liveness =
+                            matches!(stream_name, "v1.mini.d" | "v1.book.d");
+                        let mut last_data_at = Instant::now();
 
                         let mut keepalive = {
                             let mut t = tokio::time::interval(Duration::from_secs(10));
+                            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                            t.tick().await;
+                            t
+                        };
+                        let mut liveness_check = {
+                            let mut t = tokio::time::interval(Duration::from_secs(5));
                             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                             t.tick().await;
                             t
@@ -516,6 +615,14 @@ impl GrvtClient {
                             tokio::select! {
                                 _ = keepalive.tick() => {
                                     ws_stream.send(WsMessage::Ping(vec![].into())).await?;
+                                }
+                                _ = liveness_check.tick(), if track_market_liveness => {
+                                    if last_data_at.elapsed() >= Duration::from_secs(30) {
+                                        bail!(
+                                            "grvt market websocket {} stalled without BBO updates for 30s",
+                                            stream_name
+                                        );
+                                    }
                                 }
                                 message = ws_stream.next() => {
                                     let Some(msg) = message else { break };
@@ -534,6 +641,7 @@ impl GrvtClient {
                                             let events = parse_market_events(stream_name, &text)?;
                                             if !events.is_empty() {
                                                 parsed_frame_count.fetch_add(1, Ordering::Relaxed);
+                                                last_data_at = Instant::now();
                                             }
                                             for event in events {
                                                 sender.send(event).await?;
@@ -781,6 +889,14 @@ impl ExchangeClient for GrvtClient {
             }
         }
         events
+    }
+
+    async fn fetch_funding_payments(
+        &self,
+        symbols: &[String],
+        start_time: DateTime<Utc>,
+    ) -> Result<Vec<FundingPaymentEvent>> {
+        self.fetch_funding_payments_since(symbols, start_time).await
     }
 }
 
@@ -1497,6 +1613,14 @@ fn parse_grvt_fill(value: &Value) -> Option<crate::domain::Fill> {
         .and_then(Value::as_bool)?;
     let timestamp = parse_grvt_timestamp(value.get("event_time").or_else(|| value.get("et")))
         .unwrap_or_else(Utc::now);
+    let fee_paid = value
+        .get("fee")
+        .or_else(|| value.get("f"))
+        .and_then(as_decimal);
+    let builder_fee = value
+        .get("builder_fee")
+        .or_else(|| value.get("bf1"))
+        .and_then(as_decimal);
     Some(crate::domain::Fill {
         order_id: value
             .get("order_id")
@@ -1512,6 +1636,13 @@ fn parse_grvt_fill(value: &Value) -> Option<crate::domain::Fill> {
         side: if is_buyer { Side::Bid } else { Side::Ask },
         price,
         quantity,
+        fee_paid: match (fee_paid, builder_fee) {
+            (Some(fee), Some(builder)) => Some(fee + builder),
+            (Some(fee), None) => Some(fee),
+            (None, Some(builder)) => Some(builder),
+            (None, None) => None,
+        },
+        funding_paid: None,
         timestamp,
     })
 }

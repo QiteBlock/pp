@@ -4,8 +4,9 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use rust_decimal::Decimal;
+use serde_json::json;
 use tokio::{
     sync::mpsc,
     task::JoinHandle,
@@ -30,8 +31,10 @@ use crate::{
         state::BotState,
     },
     domain::{
-        Fill, InstrumentMeta, MarketEvent, MarketRegime, OrderRequest, OrderType, PrivateEvent,
-        QuoteFilterEvent, Side, StrategySnapshot, TimeInForce,
+        BookSnapshot, CancelEvent, Fill, FillStorageTelemetry, FundingPaymentEvent, InstrumentMeta,
+        LatencySample, MarketEvent, MarketRegime, MidPriceSample, OrderRejectionEvent,
+        OrderRequest, OrderType, PrivateEvent, QuoteFilterEvent, QuotePlacementEvent, Side,
+        StrategySnapshot, TimeInForce,
     },
 };
 
@@ -72,6 +75,19 @@ struct GroupDiff {
     missing_orders: usize,
 }
 
+#[derive(Clone)]
+struct LiveQuoteMetadata {
+    client_order_key: String,
+    placed_at: DateTime<Utc>,
+    decision_ts: DateTime<Utc>,
+    sent_ts: DateTime<Utc>,
+    ack_ts: Option<DateTime<Utc>>,
+    order_id: Option<String>,
+    quote_price: Option<Decimal>,
+    quote_mid: Option<Decimal>,
+    quantity: Decimal,
+}
+
 impl<E> MarketMakingEngine<E>
 where
     E: ExchangeClient + CleanupExchange + 'static,
@@ -88,6 +104,166 @@ where
             fill_store.insert_quote_filter_event(&event)?;
         }
         Ok(())
+    }
+
+    fn persist_quote_placement(&self, event: QuotePlacementEvent) -> Result<()> {
+        if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
+            fill_store.insert_quote_placement(&event)?;
+        }
+        Ok(())
+    }
+
+    fn ack_quote_placement(
+        &self,
+        client_order_key: &str,
+        order_id: Option<&str>,
+        ack_ts: DateTime<Utc>,
+    ) -> Result<()> {
+        if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
+            fill_store.ack_quote_placement(client_order_key, order_id, ack_ts)?;
+        }
+        Ok(())
+    }
+
+    fn persist_book_snapshot(&self, snapshot: BookSnapshot) -> Result<()> {
+        if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
+            fill_store.insert_book_snapshot(&snapshot)?;
+        }
+        Ok(())
+    }
+
+    fn persist_cancel_event(&self, event: CancelEvent) -> Result<()> {
+        if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
+            fill_store.insert_cancel_event(&event)?;
+        }
+        Ok(())
+    }
+
+    fn persist_mid_price_sample(&self, sample: MidPriceSample) -> Result<()> {
+        if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
+            fill_store.insert_mid_price_sample(&sample)?;
+        }
+        Ok(())
+    }
+
+    fn persist_order_rejection(&self, event: OrderRejectionEvent) -> Result<()> {
+        if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
+            fill_store.insert_order_rejection(&event)?;
+        }
+        Ok(())
+    }
+
+    fn persist_latency_sample(&self, sample: LatencySample) -> Result<()> {
+        if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
+            fill_store.insert_latency_sample(&sample)?;
+        }
+        Ok(())
+    }
+
+    fn persist_funding_payment(&self, event: FundingPaymentEvent) -> Result<()> {
+        if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
+            fill_store.insert_funding_payment(&event)?;
+        }
+        Ok(())
+    }
+
+    fn initial_funding_sync_start(&self) -> Result<DateTime<Utc>> {
+        let latest = self
+            .fill_store
+            .as_ref()
+            .as_ref()
+            .map(|fill_store| fill_store.latest_funding_payment_ts(self.config.runtime.dry_run))
+            .transpose()?
+            .flatten();
+        Ok(latest
+            .map(|ts| ts - ChronoDuration::minutes(1))
+            .unwrap_or_else(|| Utc::now() - ChronoDuration::hours(24)))
+    }
+
+    async fn sync_funding_payments(
+        &self,
+        symbols: &[String],
+        next_start_time: &mut DateTime<Utc>,
+    ) -> Result<()> {
+        let payments = self
+            .exchange
+            .fetch_funding_payments(symbols, *next_start_time)
+            .await?;
+        let mut latest_seen = None;
+        for payment in payments {
+            latest_seen =
+                Some(latest_seen.map_or(payment.ts, |ts: DateTime<Utc>| ts.max(payment.ts)));
+            self.persist_funding_payment(payment)?;
+        }
+        *next_start_time = latest_seen
+            .map(|ts| ts + ChronoDuration::milliseconds(1))
+            .unwrap_or_else(|| Utc::now() - ChronoDuration::minutes(1));
+        Ok(())
+    }
+
+    fn maybe_persist_mid_price_sample(
+        &self,
+        state: &BotState,
+        symbol: &str,
+        event: &MarketEvent,
+        last_mid_sample_at: &mut HashMap<String, Instant>,
+    ) -> Result<()> {
+        let Some(market) = state.market.symbols.get(symbol) else {
+            return Ok(());
+        };
+        let Some(mid_price) = market.mid_price() else {
+            return Ok(());
+        };
+        let should_sample = last_mid_sample_at
+            .get(symbol)
+            .map(|instant| instant.elapsed() >= Duration::from_millis(500))
+            .unwrap_or(true);
+        if !should_sample {
+            return Ok(());
+        }
+        last_mid_sample_at.insert(symbol.to_string(), Instant::now());
+        self.persist_mid_price_sample(MidPriceSample {
+            ts: Utc::now(),
+            symbol: symbol.to_string(),
+            mid_price,
+            best_bid: market.best_bid,
+            best_ask: market.best_ask,
+            mark_price: market.mark_price,
+            spot_price: market.spot_price,
+            source: market_event_source(event).to_string(),
+            is_simulated: self.config.runtime.dry_run,
+        })
+    }
+
+    fn maybe_persist_book_snapshot(
+        &self,
+        state: &BotState,
+        symbol: &str,
+        event: &MarketEvent,
+        last_book_snapshot_at: &mut HashMap<String, Instant>,
+    ) -> Result<()> {
+        let Some(market) = state.market.symbols.get(symbol) else {
+            return Ok(());
+        };
+        let should_sample = last_book_snapshot_at
+            .get(symbol)
+            .map(|instant| instant.elapsed() >= Duration::from_secs(5))
+            .unwrap_or(true);
+        if !should_sample || (market.bids.is_empty() && market.asks.is_empty()) {
+            return Ok(());
+        }
+        last_book_snapshot_at.insert(symbol.to_string(), Instant::now());
+        self.persist_book_snapshot(BookSnapshot {
+            ts: Utc::now(),
+            symbol: symbol.to_string(),
+            mid_price: market.mid_price(),
+            best_bid: market.best_bid,
+            best_ask: market.best_ask,
+            bids_json: top_of_book_json(&market.bids, true, 5),
+            asks_json: top_of_book_json(&market.asks, false, 5),
+            trigger: market_event_source(event).to_string(),
+            is_simulated: self.config.runtime.dry_run,
+        })
     }
 
     pub fn new(
@@ -128,6 +304,8 @@ where
         let initial_orders = self.exchange.fetch_open_orders().await?;
         let (market_tx, mut market_rx) = mpsc::channel(1024);
         let (private_tx, mut private_rx) = mpsc::channel(512);
+        let market_tx_restart = market_tx.clone();
+        let private_tx_restart = private_tx.clone();
         let mut streams_task =
             self.spawn_all_streams(market_symbols.clone(), market_tx, private_tx);
         let mut state = BotState::new(
@@ -166,6 +344,11 @@ where
             t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             t
         };
+        let mut funding_sync_ticker = {
+            let mut t = interval(Duration::from_secs(300));
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            t
+        };
         let mut last_generation_at: Option<Instant> = None;
         // Track the last-quoted price index per symbol to detect 3bps moves.
         let mut last_quoted_price: HashMap<String, Decimal> = HashMap::new();
@@ -183,6 +366,12 @@ where
         let mut post_fill_widen: HashMap<(String, Side), Instant> = HashMap::new();
         // Issue 9: pause quoting 3s after a WS reconnect to let state settle.
         let mut reconnect_pause_until: Option<Instant> = None;
+        let force_market_reconnect_after = Duration::from_secs(30);
+        let mut live_quote_metadata: HashMap<(String, Side, usize), LiveQuoteMetadata> =
+            HashMap::new();
+        let mut last_mid_sample_at: HashMap<String, Instant> = HashMap::new();
+        let mut last_book_snapshot_at: HashMap<String, Instant> = HashMap::new();
+        let mut next_funding_sync_start = self.initial_funding_sync_start()?;
 
         loop {
             tokio::select! {
@@ -201,6 +390,7 @@ where
                         &mut fill_tracker,
                         &mut minute_stats,
                         &mut cumulative_traded_volume,
+                        &mut live_quote_metadata,
                     ).await? {
                         if !fs.is_simulated {
                             last_generation_at = None;
@@ -244,6 +434,7 @@ where
                             &mut fill_tracker,
                             &mut minute_stats,
                             &mut cumulative_traded_volume,
+                            &mut live_quote_metadata,
                         ).await? {
                             if !fs.is_simulated {
                                 last_generation_at = None;
@@ -289,6 +480,44 @@ where
                             }
                         }
                     }
+                    {
+                        let stale_mid_symbols: Vec<String> = market_symbols
+                            .iter()
+                            .filter(|symbol| {
+                                state.market
+                                    .symbols
+                                    .get(*symbol)
+                                    .map(|market| {
+                                        market.mid_price().is_none()
+                                            && market
+                                                .last_bbo_update_at
+                                                .map(|instant| {
+                                                    instant.elapsed() >= force_market_reconnect_after
+                                                })
+                                                .unwrap_or(false)
+                                    })
+                                    .unwrap_or(false)
+                            })
+                            .cloned()
+                            .collect();
+                        if !stale_mid_symbols.is_empty() {
+                            warn!(
+                                symbols = ?stale_mid_symbols,
+                                stale_secs = force_market_reconnect_after.as_secs(),
+                                "mid price unavailable after prolonged BBO inactivity; forcing market websocket reconnect"
+                            );
+                            streams_task.abort();
+                            let _ = (&mut streams_task).await;
+                            streams_task = self.spawn_all_streams(
+                                market_symbols.clone(),
+                                market_tx_restart.clone(),
+                                private_tx_restart.clone(),
+                            );
+                            reconnect_pause_until =
+                                Some(Instant::now() + Duration::from_millis(3000));
+                            continue;
+                        }
+                    }
 
                     if let Err(err) = run_security_checks(&self.config, &self.parsed, &state) {
                         circuit_breaker.trip(err.to_string());
@@ -306,7 +535,18 @@ where
                         if !self.config.runtime.dry_run && should_handle_trip {
                             // Always cancel all open orders when the breaker trips so that
                             // stale resting orders cannot keep filling while the bot is locked out.
+                            let cancel_ts = Utc::now();
+                            for order in state.open_orders.values() {
+                                self.persist_cancel_event(build_cancel_event(
+                                    order,
+                                    "circuit_breaker",
+                                    cancel_ts,
+                                    self.config.runtime.dry_run,
+                                    &live_quote_metadata,
+                                ))?;
+                            }
                             self.exchange.cancel_all_orders().await?;
+                            live_quote_metadata.clear();
                             if should_flatten_on_breaker(&breaker_message) {
                                 flatten_account_state(
                                     self.exchange.as_ref(),
@@ -495,11 +735,24 @@ where
                     } else {
                         &state.open_orders
                     };
+                    let current_orders_snapshot: Vec<crate::domain::OpenOrder> =
+                        current_orders.values().cloned().collect();
                     if !self.config.runtime.dry_run
                         && should_cancel_on_adverse_bbo_move(current_orders, &state)
                     {
+                        let cancel_ts = Utc::now();
+                        for order in &current_orders_snapshot {
+                            self.persist_cancel_event(build_cancel_event(
+                                order,
+                                "adverse_bbo_move",
+                                cancel_ts,
+                                self.config.runtime.dry_run,
+                                &live_quote_metadata,
+                            ))?;
+                        }
                         self.exchange.cancel_all_orders().await?;
                         state.open_orders.clear();
+                        live_quote_metadata.clear();
                         last_generation_at = None;
                         continue;
                     }
@@ -516,21 +769,74 @@ where
                             log_dry_run_orders(&recon.to_place);
                             last_generation_at = Some(Instant::now());
                         } else {
+                            let decision_ts = Utc::now();
                             // Set last_generation_at before the await so any ticker ticks
                             // that fire during cancel/place are blocked by the cooldown guard.
                             last_generation_at = Some(Instant::now());
                             // Cancel all existing orders atomically, then place new ones.
                             // A single cancel_all is cheaper and guarantees no stale orders
                             // survive (individual cancel+place races can leave orphans).
+                            for order in &current_orders_snapshot {
+                                self.persist_cancel_event(build_cancel_event(
+                                    order,
+                                    "reconcile_replace",
+                                    decision_ts,
+                                    self.config.runtime.dry_run,
+                                    &live_quote_metadata,
+                                ))?;
+                            }
                             self.exchange.cancel_all_orders().await?;
                             // Clear local open-order state immediately so the next
                             // reconcile cycle doesn't see stale OPEN orders and
                             // generate wrong sizes while waiting for WS CANCELLED events.
                             state.open_orders.clear();
+                            live_quote_metadata.clear();
                             let filtered_to_place =
                                 filter_orders_against_current_bbo(&self.parsed, &state, &recon.to_place);
                             if !filtered_to_place.is_empty() {
-                                self.exchange.place_orders(filtered_to_place).await?;
+                                let sent_ts = Utc::now();
+                                for order in &filtered_to_place {
+                                    let placement = build_quote_placement_event(
+                                        &state,
+                                        order,
+                                        &current_orders_snapshot,
+                                        decision_ts,
+                                        sent_ts,
+                                        self.config.runtime.dry_run,
+                                    );
+                                    live_quote_metadata.insert(
+                                        (order.symbol.clone(), order.side, order.level_index),
+                                        LiveQuoteMetadata {
+                                            client_order_key: placement.client_order_key.clone(),
+                                            placed_at: placement.ts,
+                                            decision_ts: placement.decision_ts,
+                                            sent_ts: placement.sent_ts,
+                                            ack_ts: None,
+                                            order_id: None,
+                                            quote_price: placement.price,
+                                            quote_mid: placement.mid_price,
+                                            quantity: placement.quantity,
+                                        },
+                                    );
+                                    self.persist_quote_placement(placement)?;
+                                }
+                                if let Err(err) = self.exchange.place_orders(filtered_to_place.clone()).await {
+                                    let reason = err.to_string();
+                                    for order in &filtered_to_place {
+                                        self.persist_order_rejection(OrderRejectionEvent {
+                                            ts: Utc::now(),
+                                            symbol: order.symbol.clone(),
+                                            side: order.side,
+                                            level_index: Some(order.level_index as i64),
+                                            price: order.price,
+                                            quantity: order.quantity,
+                                            reason: reason.clone(),
+                                            stage: "exchange_place".to_string(),
+                                            is_simulated: self.config.runtime.dry_run,
+                                        })?;
+                                    }
+                                    return Err(err);
+                                }
                             }
                             // Reset the cooldown timestamp again now that placement is done,
                             // so generation_min_interval_ms is measured from placement
@@ -561,6 +867,16 @@ where
                             .and_then(|s| s.mark_price.or_else(|| s.mid_price()))
                         {
                             fill_tracker.observe_price(&pair.symbol, price, now);
+                            self.maybe_persist_mid_price_sample(
+                                &state,
+                                &pair.symbol,
+                                &MarketEvent::MarkPrice {
+                                    symbol: pair.symbol.clone(),
+                                    price,
+                                    timestamp: now,
+                                },
+                                &mut last_mid_sample_at,
+                            )?;
                         }
                     }
                     fill_tracker.decay(now);
@@ -577,6 +893,17 @@ where
                     }
                     log_minute_stats(&self.config, &state, &minute_stats);
                     minute_stats = MinuteStats::default();
+                }
+                _ = funding_sync_ticker.tick() => {
+                    if self.fill_store.as_ref().as_ref().is_none() || self.config.runtime.dry_run {
+                        continue;
+                    }
+                    if let Err(err) = self
+                        .sync_funding_payments(&market_symbols, &mut next_funding_sync_start)
+                        .await
+                    {
+                        warn!(?err, start = %next_funding_sync_start, "funding payment sync failed");
+                    }
                 }
                 result = &mut streams_task => {
                     result.context("stream task join failed")??;
@@ -619,6 +946,20 @@ where
                         health.record_ws_discrepancy();
                     }
                     state.apply_market_event(event.clone());
+                    if let Some(symbol) = market_event_symbol(&event) {
+                        self.maybe_persist_mid_price_sample(
+                            &state,
+                            symbol,
+                            &event,
+                            &mut last_mid_sample_at,
+                        )?;
+                        self.maybe_persist_book_snapshot(
+                            &state,
+                            symbol,
+                            &event,
+                            &mut last_book_snapshot_at,
+                        )?;
+                    }
                     if state.market.last_updated.is_some()
                         && matches!(
                             last_breaker_message.as_deref(),
@@ -668,6 +1009,7 @@ where
                                         true,
                                         &mut fill_tracker,
                                         &mut cumulative_traded_volume,
+                                        &mut live_quote_metadata,
                                     ).await?;
                                     // Post-fill widen for simulated fills.
                                     let widen_secs = self.parsed.model.post_fill_widen_secs;
@@ -723,6 +1065,7 @@ where
         fill_tracker: &mut FillTracker,
         minute_stats: &mut MinuteStats,
         cumulative_traded_volume: &mut Decimal,
+        live_quote_metadata: &mut HashMap<(String, Side, usize), LiveQuoteMetadata>,
     ) -> Result<Option<FillStats>> {
         match event {
             PrivateEvent::Fill(fill) => {
@@ -733,10 +1076,30 @@ where
                         force_simulated,
                         fill_tracker,
                         cumulative_traded_volume,
+                        live_quote_metadata,
                     )
                     .await?;
                 minute_stats.accumulate_fill(fs.clone());
                 Ok(Some(fs))
+            }
+            PrivateEvent::OpenOrders(orders) => {
+                let ack_ts = Utc::now();
+                for order in &orders {
+                    self.record_quote_ack(order, ack_ts, force_simulated, live_quote_metadata)?;
+                }
+                state.apply_private_event(PrivateEvent::OpenOrders(orders));
+                Ok(None)
+            }
+            PrivateEvent::UpsertOpenOrder(order) => {
+                let ack_ts = Utc::now();
+                self.record_quote_ack(&order, ack_ts, force_simulated, live_quote_metadata)?;
+                state.apply_private_event(PrivateEvent::UpsertOpenOrder(order));
+                Ok(None)
+            }
+            PrivateEvent::RemoveOpenOrder { order_id, nonce } => {
+                self.clear_live_quote_metadata(order_id.as_deref(), nonce, live_quote_metadata);
+                state.apply_private_event(PrivateEvent::RemoveOpenOrder { order_id, nonce });
+                Ok(None)
             }
             other => {
                 state.apply_private_event(other);
@@ -752,8 +1115,12 @@ where
         is_simulated: bool,
         fill_tracker: &mut FillTracker,
         cumulative_traded_volume: &mut Decimal,
+        live_quote_metadata: &mut HashMap<(String, Side, usize), LiveQuoteMetadata>,
     ) -> Result<FillStats> {
         let (level_index, spread_earned_bps) = infer_fill_analytics(state, &fill);
+        let total_fees_before = state.pnl.total_fees;
+        let mut fill_telemetry =
+            build_fill_storage_telemetry(state, &fill, level_index, live_quote_metadata);
         fill_tracker.record_fill(
             fill.symbol.clone(),
             fill.side,
@@ -767,6 +1134,24 @@ where
             fill_tracker.level_volume_multiplier(&fill.symbol, fill.side, level_index);
 
         state.apply_private_event(PrivateEvent::Fill(fill.clone()));
+        if let Some(details) = fill_telemetry.as_mut() {
+            if details.fee_paid.is_none() {
+                details.fee_paid = Some(state.pnl.total_fees - total_fees_before);
+            }
+        }
+        if let Some(market) = state.market.symbols.get(&fill.symbol) {
+            self.persist_book_snapshot(BookSnapshot {
+                ts: fill.timestamp,
+                symbol: fill.symbol.clone(),
+                mid_price: market.mid_price(),
+                best_bid: market.best_bid,
+                best_ask: market.best_ask,
+                bids_json: top_of_book_json(&market.bids, true, 5),
+                asks_json: top_of_book_json(&market.asks, false, 5),
+                trigger: "fill".to_string(),
+                is_simulated,
+            })?;
+        }
         if state
             .positions
             .get(&fill.symbol)
@@ -793,7 +1178,7 @@ where
             }
         }
         if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
-            fill_store.insert_fill(&fill, state, is_simulated)?;
+            fill_store.insert_fill(&fill, state, is_simulated, fill_telemetry.as_ref())?;
         }
 
         let position = state.positions.get(&fill.symbol);
@@ -851,6 +1236,58 @@ where
             fill_symbol: fill.symbol.clone(),
             fill_side: fill.side,
         })
+    }
+
+    fn record_quote_ack(
+        &self,
+        order: &crate::domain::OpenOrder,
+        ack_ts: DateTime<Utc>,
+        is_simulated: bool,
+        live_quote_metadata: &mut HashMap<(String, Side, usize), LiveQuoteMetadata>,
+    ) -> Result<()> {
+        let Some(level_index) = order.level_index else {
+            return Ok(());
+        };
+        let key = (order.symbol.clone(), order.side, level_index);
+        if let Some(meta) = live_quote_metadata.get_mut(&key) {
+            if meta.ack_ts.is_none() {
+                meta.ack_ts = Some(ack_ts);
+                meta.order_id = order.order_id.clone();
+                self.ack_quote_placement(
+                    &meta.client_order_key,
+                    order.order_id.as_deref(),
+                    ack_ts,
+                )?;
+                self.persist_latency_sample(LatencySample {
+                    ts: ack_ts,
+                    symbol: order.symbol.clone(),
+                    action: "place_order".to_string(),
+                    side: Some(order.side),
+                    level_index: Some(level_index as i64),
+                    decision_ts: meta.decision_ts,
+                    sent_ts: meta.sent_ts,
+                    ack_ts: Some(ack_ts),
+                    client_order_key: Some(meta.client_order_key.clone()),
+                    order_id: order.order_id.clone(),
+                    is_simulated,
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    fn clear_live_quote_metadata(
+        &self,
+        order_id: Option<&str>,
+        _nonce: Option<u64>,
+        live_quote_metadata: &mut HashMap<(String, Side, usize), LiveQuoteMetadata>,
+    ) {
+        live_quote_metadata.retain(|_, meta| {
+            !order_id
+                .zip(meta.order_id.as_deref())
+                .map(|(left, right)| left == right)
+                .unwrap_or(false)
+        });
     }
 
     fn spawn_all_streams(
@@ -917,7 +1354,7 @@ where
         let hard_toxic_stop_secs = 300u64;
         let min_level_multiplier = Decimal::new(5, 1);
         let unwind_only_trigger_ratio = Decimal::new(15, 2);
-        let hard_vpin_skip_threshold = Decimal::new(85, 2);
+        let hard_vpin_skip_threshold = Decimal::new(95, 2);
         let passive_stale_close_spread_bps = Decimal::from(30u64);
         let position_hold_timeout =
             ChronoDuration::seconds(self.parsed.risk.stale_position_timeout_secs as i64);
@@ -1509,7 +1946,10 @@ where
                 );
                 unwind_only = true;
             }
-            if factor_snapshot.vpin > hard_vpin_skip_threshold {
+            let toxic_vpin_gate = factor_snapshot.vpin > hard_vpin_skip_threshold
+                && !dust_position
+                && factor_snapshot.regime == MarketRegime::TrendingToxic;
+            if toxic_vpin_gate {
                 if actionable_position {
                     warn!(
                         symbol = %pair.symbol,
@@ -1524,7 +1964,8 @@ where
                         symbol = %pair.symbol,
                         vpin = %factor_snapshot.vpin,
                         threshold = %hard_vpin_skip_threshold,
-                        "VPIN exceeded hard threshold; skipping fresh quoting"
+                        regime = ?factor_snapshot.regime,
+                        "VPIN exceeded hard threshold in toxic regime; skipping fresh quoting"
                     );
                     self.persist_strategy_snapshot(build_strategy_snapshot(
                         state,
@@ -2219,6 +2660,74 @@ fn build_quote_filter_event(
         quote_min_trade_amount,
         best_bid,
         best_ask,
+    }
+}
+
+fn build_quote_placement_event(
+    state: &BotState,
+    order: &OrderRequest,
+    current_orders: &[crate::domain::OpenOrder],
+    decision_ts: DateTime<Utc>,
+    sent_ts: DateTime<Utc>,
+    is_simulated: bool,
+) -> QuotePlacementEvent {
+    let existing_same_level = current_orders.iter().any(|current| {
+        current.symbol == order.symbol
+            && current.side == order.side
+            && current.level_index == Some(order.level_index)
+    });
+    let market = state.market.symbols.get(&order.symbol);
+    let ts = Utc::now();
+    QuotePlacementEvent {
+        ts,
+        symbol: order.symbol.clone(),
+        side: order.side,
+        level_index: order.level_index as i64,
+        price: order.price,
+        quantity: order.quantity,
+        order_id: None,
+        client_order_key: format!(
+            "{}:{:?}:{}:{}",
+            order.symbol,
+            order.side,
+            order.level_index,
+            sent_ts.timestamp_millis()
+        ),
+        placed_or_replaced: if existing_same_level {
+            "replaced".to_string()
+        } else {
+            "placed".to_string()
+        },
+        decision_ts,
+        sent_ts,
+        ack_ts: None,
+        mid_price: market.and_then(|market| market.mid_price()),
+        is_simulated,
+    }
+}
+
+fn build_cancel_event(
+    order: &crate::domain::OpenOrder,
+    reason: &str,
+    ts: DateTime<Utc>,
+    is_simulated: bool,
+    live_quote_metadata: &HashMap<(String, Side, usize), LiveQuoteMetadata>,
+) -> CancelEvent {
+    let level_index = order.level_index.map(|level| level as i64);
+    let time_alive_ms = order.level_index.and_then(|level| {
+        live_quote_metadata
+            .get(&(order.symbol.clone(), order.side, level))
+            .map(|meta| (ts - meta.placed_at).num_milliseconds())
+    });
+    CancelEvent {
+        ts,
+        symbol: order.symbol.clone(),
+        side: order.side,
+        level_index,
+        order_id: order.order_id.clone(),
+        reason: reason.to_string(),
+        time_alive_ms,
+        is_simulated,
     }
 }
 
@@ -2974,6 +3483,84 @@ fn infer_fill_analytics(state: &BotState, fill: &Fill) -> (usize, Decimal) {
     };
 
     (level_index, spread_earned_bps)
+}
+
+fn build_fill_storage_telemetry(
+    state: &BotState,
+    fill: &Fill,
+    level_index: usize,
+    live_quote_metadata: &HashMap<(String, Side, usize), LiveQuoteMetadata>,
+) -> Option<FillStorageTelemetry> {
+    let key = (fill.symbol.clone(), fill.side, level_index);
+    let meta = live_quote_metadata.get(&key)?;
+    let mid_at_fill = state
+        .market
+        .symbols
+        .get(&fill.symbol)
+        .and_then(|market| market.mid_price());
+    let pre_fill_mid_drift_bps =
+        meta.quote_mid
+            .zip(mid_at_fill)
+            .and_then(|(placed_mid, fill_mid)| {
+                if placed_mid > Decimal::ZERO && fill_mid > Decimal::ZERO {
+                    Some((fill_mid - placed_mid) / placed_mid * Decimal::from(10_000u64))
+                } else {
+                    None
+                }
+            });
+    Some(FillStorageTelemetry {
+        quote_placed_ts: Some(meta.placed_at),
+        time_to_fill_ms: Some((fill.timestamp - meta.placed_at).num_milliseconds()),
+        pre_fill_mid_drift_bps,
+        fee_paid: fill.fee_paid,
+        funding_paid: fill.funding_paid,
+    })
+}
+
+fn market_event_symbol(event: &MarketEvent) -> Option<&str> {
+    match event {
+        MarketEvent::MarkPrice { symbol, .. }
+        | MarketEvent::SpotPrice { symbol, .. }
+        | MarketEvent::BestBidAsk { symbol, .. }
+        | MarketEvent::Trade { symbol, .. }
+        | MarketEvent::OrderBookSnapshot { symbol, .. }
+        | MarketEvent::OrderBookUpdate { symbol, .. }
+        | MarketEvent::FundingRate { symbol, .. } => Some(symbol.as_str()),
+        MarketEvent::StreamReconnected { .. } => None,
+    }
+}
+
+fn market_event_source(event: &MarketEvent) -> &'static str {
+    match event {
+        MarketEvent::MarkPrice { .. } => "mark_price",
+        MarketEvent::SpotPrice { .. } => "spot_price",
+        MarketEvent::BestBidAsk { .. } => "best_bid_ask",
+        MarketEvent::Trade { .. } => "trade",
+        MarketEvent::OrderBookSnapshot { .. } => "orderbook_snapshot",
+        MarketEvent::OrderBookUpdate { .. } => "orderbook_update",
+        MarketEvent::FundingRate { .. } => "funding_rate",
+        MarketEvent::StreamReconnected { .. } => "stream_reconnected",
+    }
+}
+
+fn top_of_book_json(
+    book: &std::collections::BTreeMap<Decimal, Decimal>,
+    descending: bool,
+    depth: usize,
+) -> String {
+    let levels: Vec<_> = if descending {
+        book.iter()
+            .rev()
+            .take(depth)
+            .map(|(price, quantity)| json!({"price": price.to_string(), "quantity": quantity.to_string()}))
+            .collect()
+    } else {
+        book.iter()
+            .take(depth)
+            .map(|(price, quantity)| json!({"price": price.to_string(), "quantity": quantity.to_string()}))
+            .collect()
+    };
+    serde_json::to_string(&levels).unwrap_or_else(|_| "[]".to_string())
 }
 
 fn market_reference(

@@ -35,8 +35,8 @@ use crate::{
     },
     config::{NetworkConfig, VenueConfig},
     domain::{
-        Fill, InstrumentMeta, MarketEvent, OpenOrder, OrderRequest, Position, PrivateEvent, Side,
-        TimeInForce,
+        Fill, FundingPaymentEvent, InstrumentMeta, MarketEvent, OpenOrder, OrderRequest, Position,
+        PrivateEvent, Side, TimeInForce,
     },
 };
 
@@ -218,6 +218,84 @@ impl ExtendedClient {
         }
         let response: ExtendedResponse<ExtendedBalanceSnapshot> = response.json().await?;
         parse_decimal_string(&response.data.equity)
+    }
+
+    async fn fetch_funding_payments_since(
+        &self,
+        symbols: &[String],
+        start_time: chrono::DateTime<Utc>,
+    ) -> Result<Vec<FundingPaymentEvent>> {
+        let endpoint = self.endpoint("/api/v1/user/funding/history");
+        let mut cursor: Option<String> = None;
+        let mut events = Vec::new();
+
+        loop {
+            let mut url =
+                reqwest::Url::parse(&endpoint).context("invalid Extended funding history url")?;
+            {
+                let mut query = url.query_pairs_mut();
+                query.append_pair("startTime", &start_time.timestamp_millis().to_string());
+                for symbol in symbols {
+                    query.append_pair("market", symbol);
+                }
+                if let Some(cursor_value) = cursor.as_deref() {
+                    query.append_pair("cursor", cursor_value);
+                }
+            }
+
+            let response: ExtendedFundingHistoryResponse = self
+                .request_policy
+                .send_with_retry(
+                    &self.rest_governor,
+                    "extended_fetch_funding_history",
+                    || {
+                        let url = url.clone();
+                        self.http.get(url).send()
+                    },
+                )
+                .await?
+                .json()
+                .await?;
+
+            for payment in response.data {
+                let Some(ts) = Utc.timestamp_millis_opt(payment.paid_time).single() else {
+                    continue;
+                };
+                let amount = parse_decimal_string(&payment.funding_fee)?;
+                events.push(FundingPaymentEvent {
+                    ts,
+                    symbol: Some(payment.market.clone()),
+                    payment_type: "funding_payment".to_string(),
+                    amount,
+                    note: Some(
+                        json!({
+                            "venue": "extended",
+                            "record_id": payment.id,
+                            "account_id": payment.account_id,
+                            "position_id": payment.position_id,
+                            "side": payment.side,
+                            "size": payment.size,
+                            "value": payment.value,
+                            "mark_price": payment.mark_price,
+                            "funding_rate": payment.funding_rate,
+                        })
+                        .to_string(),
+                    ),
+                    is_simulated: false,
+                });
+            }
+
+            let next_cursor = response
+                .pagination
+                .and_then(|pagination| pagination.cursor)
+                .filter(|cursor_value| !cursor_value.is_empty());
+            if next_cursor.is_none() {
+                break;
+            }
+            cursor = next_cursor;
+        }
+
+        Ok(events)
     }
 
     async fn run_public_ws_loop(
@@ -557,6 +635,14 @@ impl ExchangeClient for ExtendedClient {
             }
         }
         events
+    }
+
+    async fn fetch_funding_payments(
+        &self,
+        symbols: &[String],
+        start_time: chrono::DateTime<Utc>,
+    ) -> Result<Vec<FundingPaymentEvent>> {
+        self.fetch_funding_payments_since(symbols, start_time).await
     }
 }
 
@@ -1095,6 +1181,18 @@ fn parse_extended_fill_value(value: &Value) -> Option<Fill> {
         side,
         price,
         quantity,
+        fee_paid: value
+            .get("fee")
+            .or_else(|| value.get("fees"))
+            .or_else(|| value.get("payedFee"))
+            .or_else(|| value.get("commission"))
+            .or_else(|| value.get("f"))
+            .and_then(as_decimal),
+        funding_paid: value
+            .get("funding")
+            .or_else(|| value.get("fundingPaid"))
+            .or_else(|| value.get("funding_payment"))
+            .and_then(as_decimal),
         timestamp,
     })
 }
@@ -1233,6 +1331,36 @@ struct ExtendedResponse<T> {
     data: T,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtendedFundingHistoryResponse {
+    data: Vec<ExtendedFundingPayment>,
+    pagination: Option<ExtendedCursorPagination>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtendedFundingPayment {
+    id: u64,
+    account_id: u64,
+    market: String,
+    position_id: u64,
+    side: String,
+    size: String,
+    value: String,
+    mark_price: String,
+    funding_fee: String,
+    funding_rate: String,
+    paid_time: i64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExtendedCursorPagination {
+    #[serde(default, deserialize_with = "deserialize_optional_string_or_number")]
+    cursor: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct ExtendedAccountIdentity {
     vault: u64,
@@ -1305,6 +1433,23 @@ where
             .map_err(|err| serde::de::Error::custom(err.to_string())),
         other => Err(serde::de::Error::custom(format!(
             "expected string or number for u64, got {other}"
+        ))),
+    }
+}
+
+fn deserialize_optional_string_or_number<'de, D>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<Value>::deserialize(deserializer)?;
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text)),
+        Some(Value::Number(number)) => Ok(Some(number.to_string())),
+        Some(other) => Err(serde::de::Error::custom(format!(
+            "expected optional string or number, got {other}"
         ))),
     }
 }
