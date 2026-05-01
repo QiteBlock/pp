@@ -6,11 +6,12 @@ use tokio::time::{Duration, Instant};
 pub struct HealthTracker {
     ws_discrepancies: VecDeque<Instant>,
     rest_failures: VecDeque<Instant>,
-    /// Consecutive quoting cycles that produced zero orders while a position is held.
+    /// Consecutive quoting cycles that produced zero orders while an actionable
+    /// position is held.
     consecutive_empty_cycles: usize,
-    /// Per-symbol count of cycles where the position exceeded the emergency threshold
-    /// but the unwind side produced zero orders.
-    pub empty_unwind_cycles: HashMap<String, usize>,
+    /// Per-symbol count of cycles where an actionable position exceeded the
+    /// emergency threshold but the unwind side produced zero orders.
+    pub empty_real_unwind_cycles: HashMap<String, usize>,
 }
 
 impl HealthTracker {
@@ -34,10 +35,10 @@ impl HealthTracker {
     pub fn update_empty_cycles(
         &mut self,
         orders_generated: usize,
-        has_position: bool,
+        has_actionable_position: bool,
         threshold: usize,
     ) -> bool {
-        if orders_generated == 0 && has_position {
+        if orders_generated == 0 && has_actionable_position {
             self.consecutive_empty_cycles += 1;
             self.consecutive_empty_cycles == threshold
         } else {
@@ -51,17 +52,18 @@ impl HealthTracker {
         symbol: &str,
         unwind_orders: usize,
         over_threshold: bool,
+        dust_position: bool,
         emergency_cycles: usize,
     ) -> bool {
-        if unwind_orders == 0 && over_threshold {
+        if !dust_position && unwind_orders == 0 && over_threshold {
             let count = self
-                .empty_unwind_cycles
+                .empty_real_unwind_cycles
                 .entry(symbol.to_string())
                 .or_insert(0);
             *count += 1;
             *count >= emergency_cycles
         } else {
-            self.empty_unwind_cycles.remove(symbol);
+            self.empty_real_unwind_cycles.remove(symbol);
             false
         }
     }

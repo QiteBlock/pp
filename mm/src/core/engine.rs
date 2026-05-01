@@ -347,7 +347,11 @@ where
                         .iter()
                         .filter(|pair| pair.enabled)
                         .filter_map(|pair| {
-                            let cycles = health.empty_unwind_cycles.get(&pair.symbol).copied().unwrap_or(0);
+                            let cycles = health
+                                .empty_real_unwind_cycles
+                                .get(&pair.symbol)
+                                .copied()
+                                .unwrap_or(0);
                             if cycles >= self.parsed.risk.emergency_unwind_cycles {
                                 Some(pair.symbol.clone())
                             } else {
@@ -379,27 +383,43 @@ where
                     minute_stats.record_position_sample(&self.config, &state);
                     // Fix 1: alert when the bot stops quoting while holding a position.
                     {
-                        let has_position = state
+                        let has_actionable_position = state
                             .positions
                             .values()
                             .any(|position| {
-                                !position_is_effectively_flat(
-                                    position.quantity,
-                                    market_price_for_position(&state, position),
-                                    self.parsed.model.min_trade_amount,
-                                )
+                                instrument_by_symbol
+                                    .get(&position.symbol)
+                                    .map(|instrument| {
+                                        position_requires_action(
+                                            position.quantity,
+                                            market_price_for_position(&state, position),
+                                            instrument,
+                                            self.parsed.model.min_trade_amount,
+                                        )
+                                    })
+                                    .unwrap_or(position.quantity != Decimal::ZERO)
                             });
                         let alert_cycles = self.config.runtime.empty_quote_alert_cycles;
-                        if health.update_empty_cycles(desired.len(), has_position, alert_cycles) {
+                        if health.update_empty_cycles(
+                            desired.len(),
+                            has_actionable_position,
+                            alert_cycles,
+                        ) {
                             let positions_desc: String = state
                                 .positions
                                 .values()
                                 .filter(|position| {
-                                    !position_is_effectively_flat(
-                                        position.quantity,
-                                        market_price_for_position(&state, position),
-                                        self.parsed.model.min_trade_amount,
-                                    )
+                                    instrument_by_symbol
+                                        .get(&position.symbol)
+                                        .map(|instrument| {
+                                            position_requires_action(
+                                                position.quantity,
+                                                market_price_for_position(&state, position),
+                                                instrument,
+                                                self.parsed.model.min_trade_amount,
+                                            )
+                                        })
+                                        .unwrap_or(position.quantity != Decimal::ZERO)
                                 })
                                 .map(|p| format!("{} {}", p.symbol, p.quantity))
                                 .collect::<Vec<_>>()
@@ -425,10 +445,22 @@ where
                             .get(&pair.symbol)
                             .map(|p| p.quantity)
                             .unwrap_or(Decimal::ZERO);
+                        let position_price = position_price_for_symbol(&state, &pair.symbol, Decimal::ZERO);
                         let parsed_pair = self.parsed.pairs.iter().find(|p| p.symbol == pair.symbol);
                         if let Some(parsed_pair) = parsed_pair {
                             let threshold = self.parsed.risk.emergency_unwind_threshold * parsed_pair.max_position_base;
                             let over_threshold = position.abs() > threshold;
+                            let dust_position = instrument_by_symbol
+                                .get(&pair.symbol)
+                                .map(|instrument| {
+                                    position_is_dust(
+                                        position,
+                                        position_price,
+                                        instrument,
+                                        self.parsed.model.min_trade_amount,
+                                    )
+                                })
+                                .unwrap_or(false);
                             let unwind_side = if position > Decimal::ZERO { Side::Ask } else { Side::Bid };
                             let unwind_orders = desired
                                 .iter()
@@ -438,6 +470,7 @@ where
                                 &pair.symbol,
                                 unwind_orders,
                                 over_threshold,
+                                dust_position,
                                 self.parsed.risk.emergency_unwind_cycles,
                             );
                             if was_inactive {
@@ -931,6 +964,14 @@ where
                 };
                 let total_abs_quantity = position.quantity.abs();
                 let total_notional = total_abs_quantity * reference_price;
+                if position_is_dust(
+                    position.quantity,
+                    reference_price,
+                    instrument,
+                    min_trade_amount,
+                ) {
+                    continue;
+                }
                 if reference_price <= Decimal::ZERO || total_notional < min_trade_amount {
                     warn!(
                         symbol = %pair.symbol,
@@ -954,8 +995,12 @@ where
                 if instrument_chunk_cap > Decimal::ZERO {
                     chunk_target = chunk_target.min(instrument_chunk_cap);
                 }
-                let min_notional_quantity =
-                    (min_trade_amount / reference_price).max(Decimal::new(1, 9));
+                let min_notional_quantity = min_quote_quantity_for_price(
+                    instrument,
+                    reference_price,
+                    min_trade_amount,
+                    self.parsed.model.min_step_volume,
+                );
                 let desired_close_quantity = chunk_target
                     .max(min_notional_quantity)
                     .min(total_abs_quantity);
@@ -1097,11 +1142,7 @@ where
                     .map(|position| position.quantity)
                     .unwrap_or(Decimal::ZERO);
                 let position_price = position_price_for_symbol(state, &pair.symbol, Decimal::ZERO);
-                let has_position = !position_is_effectively_flat(
-                    current_position,
-                    position_price,
-                    min_trade_amount,
-                );
+                let has_position = current_position != Decimal::ZERO;
                 self.persist_strategy_snapshot(build_strategy_snapshot(
                     state,
                     &pair.symbol,
@@ -1151,9 +1192,54 @@ where
             let stale_maker_unwind = stale_maker_unwind_symbols.contains(&pair.symbol);
             let position_price =
                 position_price_for_symbol(state, &pair.symbol, factor_snapshot.price_index);
-            let has_position =
-                !position_is_effectively_flat(current_position, position_price, min_trade_amount);
-            let treat_as_position = has_position || stale_maker_unwind;
+            let market = state.market.symbols.get(&pair.symbol);
+            let best_bid = market.and_then(|market| market.best_bid);
+            let best_ask = market.and_then(|market| market.best_ask);
+            let mid = market.and_then(|market| market.mid_price());
+            let Some(instrument) = instrument_by_symbol.get(&pair.symbol) else {
+                warn!(symbol = %pair.symbol, "missing instrument metadata; skipping symbol");
+                self.persist_strategy_snapshot(build_strategy_snapshot(
+                    state,
+                    &pair.symbol,
+                    self.config.runtime.dry_run,
+                    "skip",
+                    Some("missing_instrument_metadata"),
+                    current_position,
+                    position_price,
+                    current_position != Decimal::ZERO,
+                    false,
+                    stale_maker_unwind,
+                    false,
+                    degraded,
+                    market,
+                    Some(&factor_snapshot),
+                    Some(fill_tracker.level_volume_multiplier(&pair.symbol, Side::Bid, 0)),
+                    Some(fill_tracker.level_volume_multiplier(&pair.symbol, Side::Ask, 0)),
+                    0,
+                    &[],
+                ))?;
+                continue;
+            };
+            let parsed_pair = self
+                .parsed
+                .pairs
+                .iter()
+                .find(|parsed_pair| parsed_pair.symbol == pair.symbol)
+                .with_context(|| format!("missing parsed pair config for {}", pair.symbol))?;
+            let actionable_reference_price = if position_price > Decimal::ZERO {
+                position_price
+            } else {
+                mid.or(best_bid).or(best_ask).unwrap_or(Decimal::ZERO)
+            };
+            let dust_position = position_is_dust(
+                current_position,
+                actionable_reference_price,
+                instrument,
+                min_trade_amount,
+            );
+            let has_position = current_position != Decimal::ZERO;
+            let actionable_position = has_position && !dust_position;
+            let treat_as_position = actionable_position || stale_maker_unwind;
             let mut unwind_only = false;
             let bid_lvl0_multiplier =
                 fill_tracker.level_volume_multiplier(&pair.symbol, Side::Bid, 0);
@@ -1356,7 +1442,7 @@ where
                 }
 
                 // Commit on new spike; release once the residual position is no longer tradeable.
-                if spike_active && has_position {
+                if spike_active && actionable_position {
                     if flow_spike_committed.insert(pair.symbol.clone()) {
                         warn!(
                             symbol = %pair.symbol,
@@ -1367,12 +1453,12 @@ where
                             "sustained flow spike; committing to unwind-only until flat"
                         );
                     }
-                } else if !has_position {
+                } else if !actionable_position {
                     flow_spike_committed.remove(&pair.symbol);
                 }
 
                 if flow_spike_committed.contains(&pair.symbol) {
-                    if has_position {
+                    if actionable_position {
                         warn!(
                             symbol = %pair.symbol,
                             position = %current_position,
@@ -1405,46 +1491,11 @@ where
                     proportional_vol_widening(factor_snapshot.raw_volatility, utilization);
             }
 
-            let market = state.market.symbols.get(&pair.symbol);
-            let best_bid = market.and_then(|market| market.best_bid);
-            let best_ask = market.and_then(|market| market.best_ask);
-            let mid = market.and_then(|market| market.mid_price());
-            let Some(instrument) = instrument_by_symbol.get(&pair.symbol) else {
-                warn!(symbol = %pair.symbol, "missing instrument metadata; skipping symbol");
-                self.persist_strategy_snapshot(build_strategy_snapshot(
-                    state,
-                    &pair.symbol,
-                    self.config.runtime.dry_run,
-                    "skip",
-                    Some("missing_instrument_metadata"),
-                    current_position,
-                    position_price,
-                    has_position,
-                    unwind_only,
-                    stale_maker_unwind,
-                    false,
-                    degraded,
-                    market,
-                    Some(&factor_snapshot),
-                    Some(bid_lvl0_multiplier),
-                    Some(ask_lvl0_multiplier),
-                    0,
-                    &[],
-                ))?;
-                continue;
-            };
             let reference_price = mid.or(best_bid).or(best_ask).unwrap_or(Decimal::ZERO);
-            let parsed_pair = self
-                .parsed
-                .pairs
-                .iter()
-                .find(|parsed_pair| parsed_pair.symbol == pair.symbol)
-                .with_context(|| format!("missing parsed pair config for {}", pair.symbol))?;
-            let tiny_position = current_position.abs() < instrument.min_order_size;
-            if tiny_position && unwind_only {
+            if dust_position && unwind_only {
                 unwind_only = false;
             }
-            if !tiny_position
+            if actionable_position
                 && parsed_pair.max_position_base > Decimal::ZERO
                 && current_position.abs()
                     > parsed_pair.max_position_base * unwind_only_trigger_ratio
@@ -1459,7 +1510,7 @@ where
                 unwind_only = true;
             }
             if factor_snapshot.vpin > hard_vpin_skip_threshold {
-                if has_position && !tiny_position {
+                if actionable_position {
                     warn!(
                         symbol = %pair.symbol,
                         position = %current_position,
@@ -1499,14 +1550,14 @@ where
                 }
             }
             // Compute pos_ratio for size asymmetry (S2) before generating quotes.
-            let pos_ratio = if tiny_position || parsed_pair.max_position_base.is_zero() {
+            let pos_ratio = if dust_position || parsed_pair.max_position_base.is_zero() {
                 Decimal::ZERO
             } else {
                 (current_position / parsed_pair.max_position_base)
                     .clamp(-Decimal::ONE, Decimal::ONE)
             };
             let mut quote_factor_snapshot = factor_snapshot.clone();
-            if tiny_position {
+            if dust_position {
                 quote_factor_snapshot.inventory_skew = Decimal::ZERO;
                 quote_factor_snapshot.inventory_lean_bps = Decimal::ZERO;
             }
@@ -1572,7 +1623,7 @@ where
                 // Issue 6: post-fill side cooldown — skip this side for 3 s after a toxic fill.
 
                 // Fix 2: determine if this specific quote is on the unwind side.
-                let is_unwind = if tiny_position {
+                let is_unwind = if dust_position {
                     false
                 } else {
                     match quote.side {
@@ -1662,19 +1713,65 @@ where
                     price =
                         clip_to_bbo(price, quote.side, best_bid, best_ask, instrument.tick_size);
                 }
+                let min_quote_quantity = min_quote_quantity_for_price(
+                    instrument,
+                    price,
+                    quote_min_trade_amount,
+                    self.parsed.model.min_step_volume,
+                );
+                if !is_unwind && min_quote_quantity > Decimal::ZERO && quantity < min_quote_quantity
+                {
+                    self.persist_quote_filter_event(build_quote_filter_event(
+                        &pair.symbol,
+                        self.config.runtime.dry_run,
+                        "below_min_quote_quantity",
+                        quote.side,
+                        quote.level_index,
+                        is_unwind,
+                        unwind_only,
+                        stale_maker_unwind,
+                        emergency_unwind,
+                        current_position,
+                        quantity,
+                        Some(Decimal::ZERO),
+                        None,
+                        Some(price),
+                        None,
+                        Some(quote_min_trade_amount),
+                        best_bid,
+                        best_ask,
+                    ))?;
+                    continue;
+                }
 
                 // Fix 2: for the unwind side, floor quantity to min_trade_amount/price
                 // so skew-reduced sizes never disappear below the notional floor.
-                let effective_quantity = quantize_order_quantity_for_checks(
+                let mut effective_quantity = quantize_order_quantity_for_checks(
                     quantity,
                     instrument,
                     self.parsed.model.min_step_volume,
                 );
+                if effective_quantity <= Decimal::ZERO
+                    && is_unwind
+                    && min_quote_quantity > Decimal::ZERO
+                {
+                    quantity = min_quote_quantity;
+                    effective_quantity = quantize_order_quantity_for_checks(
+                        quantity,
+                        instrument,
+                        self.parsed.model.min_step_volume,
+                    );
+                }
                 if effective_quantity <= Decimal::ZERO {
+                    let reason = if is_unwind {
+                        "unwind_floor_quantized_to_zero"
+                    } else {
+                        "effective_quantity_zero"
+                    };
                     self.persist_quote_filter_event(build_quote_filter_event(
                         &pair.symbol,
                         self.config.runtime.dry_run,
-                        "effective_quantity_zero",
+                        reason,
                         quote.side,
                         quote.level_index,
                         is_unwind,
@@ -1694,9 +1791,9 @@ where
                     continue;
                 }
                 if effective_quantity * price < quote_min_trade_amount {
-                    if is_unwind && price > Decimal::ZERO {
+                    if is_unwind && min_quote_quantity > Decimal::ZERO {
                         // Floor to the minimum notional; the position MUST be quoted.
-                        quantity = (quote_min_trade_amount / price).max(Decimal::new(1, 9));
+                        quantity = min_quote_quantity;
                         // re-quantize; if still zero the instrument step is too large — skip
                         let floored = quantize_order_quantity_for_checks(
                             quantity,
@@ -1792,9 +1889,9 @@ where
                         || effective_quantity * price < quote_min_trade_amount
                     {
                         // Fix 2: floor rather than skip for unwind side.
-                        if is_unwind && price > Decimal::ZERO {
+                        if is_unwind && min_quote_quantity > Decimal::ZERO {
                             let floored_qty = quantize_order_quantity_for_checks(
-                                (quote_min_trade_amount / price).max(Decimal::new(1, 9)),
+                                min_quote_quantity,
                                 instrument,
                                 self.parsed.model.min_step_volume,
                             );
@@ -1864,7 +1961,7 @@ where
                 symbol_orders.push(request);
             }
 
-            if symbol_orders.is_empty() && has_position && !tiny_position {
+            if symbol_orders.is_empty() && actionable_position {
                 // No orders were generated but we hold a position – place a
                 // minimal forced exit order to prevent being stuck indefinitely.
                 // This bypasses flow-spike, vol-cut, and cooldown filters.
@@ -2179,18 +2276,42 @@ fn position_price_for_symbol(state: &BotState, symbol: &str, fallback_price: Dec
         .unwrap_or(Decimal::ZERO)
 }
 
-fn position_is_effectively_flat(
+fn position_is_dust(
     quantity: Decimal,
     reference_price: Decimal,
+    instrument: &InstrumentMeta,
     min_trade_amount: Decimal,
 ) -> bool {
     if quantity == Decimal::ZERO {
-        return true;
-    }
-    if reference_price <= Decimal::ZERO {
         return false;
     }
-    quantity.abs() * reference_price < min_trade_amount
+    if quantity.abs() < instrument.min_order_size {
+        return true;
+    }
+    reference_price > Decimal::ZERO && quantity.abs() * reference_price < min_trade_amount
+}
+
+fn position_requires_action(
+    quantity: Decimal,
+    reference_price: Decimal,
+    instrument: &InstrumentMeta,
+    min_trade_amount: Decimal,
+) -> bool {
+    quantity != Decimal::ZERO
+        && !position_is_dust(quantity, reference_price, instrument, min_trade_amount)
+}
+
+fn min_quote_quantity_for_price(
+    instrument: &InstrumentMeta,
+    reference_price: Decimal,
+    min_trade_amount: Decimal,
+    min_step_volume: Decimal,
+) -> Decimal {
+    let mut quantity_floor = instrument.min_order_size.max(Decimal::new(1, 9));
+    if min_trade_amount > Decimal::ZERO && reference_price > Decimal::ZERO {
+        quantity_floor = quantity_floor.max(min_trade_amount / reference_price);
+    }
+    quantize_order_quantity_for_checks(quantity_floor, instrument, min_step_volume)
 }
 
 fn clip_to_bbo(
