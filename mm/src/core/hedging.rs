@@ -16,16 +16,19 @@ struct SimulatedHedgePosition {
     quantity: Decimal,
     entry_price: Decimal,
     realized_pnl: Decimal,
+    fees_paid: Decimal,
 }
 
 pub struct HedgeSimulator {
     positions: HashMap<String, SimulatedHedgePosition>,
+    hyperliquid_taker_fee_rate: Decimal,
 }
 
 impl HedgeSimulator {
-    pub fn new() -> Self {
+    pub fn new(hyperliquid_taker_fee_rate: Decimal) -> Self {
         Self {
             positions: HashMap::new(),
+            hyperliquid_taker_fee_rate,
         }
     }
 
@@ -62,8 +65,16 @@ impl HedgeSimulator {
         } else {
             "skipped_no_hl_quote"
         };
+        let hedge_fee_paid = hedge_price
+            .map(|price| (price * fill.quantity).abs() * self.hyperliquid_taker_fee_rate);
         if let Some(price) = hedge_price {
-            self.apply_trade(&fill.symbol, hedge_side, price, fill.quantity);
+            self.apply_trade(
+                &fill.symbol,
+                hedge_side,
+                price,
+                fill.quantity,
+                hedge_fee_paid.unwrap_or(Decimal::ZERO),
+            );
         }
         let note = hedge_quote.map(|quote| {
             serde_json::json!({
@@ -87,6 +98,7 @@ impl HedgeSimulator {
             hedge_side,
             hedge_price,
             hedge_qty: fill.quantity,
+            hedge_fee_paid,
             basis_mid_bps,
             note,
             is_simulated,
@@ -153,6 +165,7 @@ impl HedgeSimulator {
             primary_unrealized_pnl,
             hedge_unrealized_pnl,
             hedge_realized_pnl: hedge_position.realized_pnl,
+            hedge_fees_paid: hedge_position.fees_paid,
             total_pnl: primary_realized_pnl
                 + primary_unrealized_pnl
                 + hedge_position.realized_pnl
@@ -161,7 +174,14 @@ impl HedgeSimulator {
         }
     }
 
-    fn apply_trade(&mut self, symbol: &str, side: Side, price: Decimal, quantity: Decimal) {
+    fn apply_trade(
+        &mut self,
+        symbol: &str,
+        side: Side,
+        price: Decimal,
+        quantity: Decimal,
+        fee_paid: Decimal,
+    ) {
         let position = self.positions.entry(symbol.to_string()).or_default();
         let fill_quantity = quantity * side.sign();
         let previous_quantity = position.quantity;
@@ -187,6 +207,8 @@ impl HedgeSimulator {
             }
         }
 
+        position.realized_pnl -= fee_paid;
+        position.fees_paid += fee_paid;
         position.quantity = new_quantity;
     }
 }

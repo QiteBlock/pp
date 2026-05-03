@@ -12,6 +12,8 @@ pub struct AppConfig {
     pub model: ModelConfig,
     pub risk: RiskConfig,
     pub factors: FactorConfig,
+    #[serde(default)]
+    pub hedging: HedgingConfig,
     pub storage: Option<StorageConfig>,
     pub telegram: Option<TelegramConfig>,
     pub pairs: Vec<PairConfig>,
@@ -39,6 +41,9 @@ impl AppConfig {
         }
         if parsed.venue.taker_fee_rate < Decimal::ZERO {
             bail!("venue.max_fee_rate must be non-negative");
+        }
+        if parsed.hedging.hyperliquid_taker_fee_rate < Decimal::ZERO {
+            bail!("hedging.hyperliquid_taker_fee_rate must be non-negative");
         }
         if parsed.runtime.reconcile_interval_ms == 0 {
             bail!("runtime.reconcile_interval_ms must be > 0");
@@ -347,6 +352,12 @@ impl AppConfig {
                     &self.factors.vpin_widen_threshold,
                 )?,
             },
+            hedging: ParsedHedgingConfig {
+                hyperliquid_taker_fee_rate: parse_decimal(
+                    "hedging.hyperliquid_taker_fee_rate",
+                    &self.hedging.hyperliquid_taker_fee_rate,
+                )?,
+            },
             pairs: self
                 .pairs
                 .iter()
@@ -383,6 +394,7 @@ pub struct ParsedConfig {
     pub model: ParsedModelConfig,
     pub risk: ParsedRiskConfig,
     pub factors: ParsedFactorConfig,
+    pub hedging: ParsedHedgingConfig,
     pub pairs: Vec<ParsedPairConfig>,
 }
 
@@ -514,6 +526,11 @@ pub struct ParsedFactorConfig {
     pub vpin_n_buckets: usize,
     /// VPIN threshold above which quotes widen.
     pub vpin_widen_threshold: Decimal,
+}
+
+#[derive(Clone, Debug)]
+pub struct ParsedHedgingConfig {
+    pub hyperliquid_taker_fee_rate: Decimal,
 }
 
 #[derive(Clone, Debug)]
@@ -680,6 +697,10 @@ fn default_toxic_regime_block_new_positions_secs() -> u64 {
 
 fn default_toxic_regime_block_new_positions_intensity() -> String {
     "0.7".to_string()
+}
+
+fn default_hyperliquid_taker_fee_rate() -> String {
+    "0.000432".to_string()
 }
 
 fn default_microprice_weight() -> String {
@@ -919,6 +940,20 @@ pub struct FactorConfig {
     /// VPIN level above which spreads widen by `vpin_widen_multiplier`. 0 = disabled.
     #[serde(default = "default_zero_string")]
     pub vpin_widen_threshold: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct HedgingConfig {
+    #[serde(default = "default_hyperliquid_taker_fee_rate")]
+    pub hyperliquid_taker_fee_rate: String,
+}
+
+impl Default for HedgingConfig {
+    fn default() -> Self {
+        Self {
+            hyperliquid_taker_fee_rate: default_hyperliquid_taker_fee_rate(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

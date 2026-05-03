@@ -84,12 +84,28 @@ struct LiveQuoteMetadata {
     client_order_key: String,
     placed_at: DateTime<Utc>,
     decision_ts: DateTime<Utc>,
+    cancel_start_ts: Option<DateTime<Utc>>,
+    cancel_done_ts: Option<DateTime<Utc>>,
+    ready_to_place_ts: DateTime<Utc>,
+    place_dispatch_ts: DateTime<Utc>,
+    place_response_ts: DateTime<Utc>,
     sent_ts: DateTime<Utc>,
     ack_ts: Option<DateTime<Utc>>,
+    ws_ack_ts: Option<DateTime<Utc>>,
     order_id: Option<String>,
     quote_price: Option<Decimal>,
     quote_mid: Option<Decimal>,
     quantity: Decimal,
+}
+
+#[derive(Clone, Copy)]
+struct PlacementTiming {
+    decision_ts: DateTime<Utc>,
+    cancel_start_ts: Option<DateTime<Utc>>,
+    cancel_done_ts: Option<DateTime<Utc>>,
+    ready_to_place_ts: DateTime<Utc>,
+    place_dispatch_ts: DateTime<Utc>,
+    place_response_ts: DateTime<Utc>,
 }
 
 impl<E> MarketMakingEngine<E>
@@ -160,6 +176,105 @@ where
     fn persist_latency_sample(&self, sample: LatencySample) -> Result<()> {
         if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
             fill_store.insert_latency_sample(&sample)?;
+        }
+        Ok(())
+    }
+
+    fn persist_cancel_latency_samples(
+        &self,
+        current_orders: &[crate::domain::OpenOrder],
+        cancel_order_ids: &[String],
+        decision_ts: DateTime<Utc>,
+        cancel_start_ts: DateTime<Utc>,
+        cancel_done_ts: DateTime<Utc>,
+    ) -> Result<()> {
+        let cancel_ids: HashSet<&str> = cancel_order_ids.iter().map(String::as_str).collect();
+        for order in current_orders {
+            let Some(order_id) = order.order_id.as_deref() else {
+                continue;
+            };
+            if !cancel_ids.contains(order_id) {
+                continue;
+            }
+            self.persist_latency_sample(LatencySample {
+                ts: cancel_done_ts,
+                symbol: order.symbol.clone(),
+                action: "cancel_order".to_string(),
+                side: Some(order.side),
+                level_index: order.level_index.map(|level| level as i64),
+                decision_ts,
+                cancel_start_ts: Some(cancel_start_ts),
+                cancel_done_ts: Some(cancel_done_ts),
+                ready_to_place_ts: None,
+                place_dispatch_ts: None,
+                place_response_ts: None,
+                ws_ack_ts: None,
+                sent_ts: cancel_done_ts,
+                ack_ts: Some(cancel_done_ts),
+                client_order_key: None,
+                order_id: order.order_id.clone(),
+                is_simulated: self.config.runtime.dry_run,
+            })?;
+        }
+        Ok(())
+    }
+
+    fn record_successful_quote_placements(
+        &self,
+        state: &BotState,
+        orders: &[OrderRequest],
+        current_orders: &[crate::domain::OpenOrder],
+        timing: PlacementTiming,
+        live_quote_metadata: &mut HashMap<(String, Side, usize), LiveQuoteMetadata>,
+    ) -> Result<()> {
+        for order in orders {
+            let placement = build_quote_placement_event(
+                state,
+                order,
+                current_orders,
+                timing,
+                self.config.runtime.dry_run,
+            );
+            live_quote_metadata.insert(
+                (order.symbol.clone(), order.side, order.level_index),
+                LiveQuoteMetadata {
+                    client_order_key: placement.client_order_key.clone(),
+                    placed_at: placement.ts,
+                    decision_ts: placement.decision_ts,
+                    cancel_start_ts: placement.cancel_start_ts,
+                    cancel_done_ts: placement.cancel_done_ts,
+                    ready_to_place_ts: placement.ready_to_place_ts,
+                    place_dispatch_ts: placement.place_dispatch_ts,
+                    place_response_ts: placement.place_response_ts,
+                    sent_ts: placement.sent_ts,
+                    ack_ts: None,
+                    ws_ack_ts: None,
+                    order_id: None,
+                    quote_price: placement.price,
+                    quote_mid: placement.mid_price,
+                    quantity: placement.quantity,
+                },
+            );
+            self.persist_quote_placement(placement.clone())?;
+            self.persist_latency_sample(LatencySample {
+                ts: timing.place_response_ts,
+                symbol: order.symbol.clone(),
+                action: "place_order_response".to_string(),
+                side: Some(order.side),
+                level_index: Some(order.level_index as i64),
+                decision_ts: timing.decision_ts,
+                cancel_start_ts: timing.cancel_start_ts,
+                cancel_done_ts: timing.cancel_done_ts,
+                ready_to_place_ts: Some(timing.ready_to_place_ts),
+                place_dispatch_ts: Some(timing.place_dispatch_ts),
+                place_response_ts: Some(timing.place_response_ts),
+                ws_ack_ts: None,
+                sent_ts: timing.ready_to_place_ts,
+                ack_ts: Some(timing.place_response_ts),
+                client_order_key: Some(placement.client_order_key),
+                order_id: None,
+                is_simulated: self.config.runtime.dry_run,
+            })?;
         }
         Ok(())
     }
@@ -479,7 +594,8 @@ where
         let mut last_book_snapshot_at: HashMap<String, Instant> = HashMap::new();
         let mut last_basis_sample_at: HashMap<String, Instant> = HashMap::new();
         let mut next_funding_sync_start = self.initial_funding_sync_start()?;
-        let mut hedge_simulator = HedgeSimulator::new();
+        let mut hedge_simulator =
+            HedgeSimulator::new(self.parsed.hedging.hyperliquid_taker_fee_rate);
 
         loop {
             tokio::select! {
@@ -884,56 +1000,26 @@ where
                             // Set last_generation_at before the await so any ticker ticks
                             // that fire during cancel/place are blocked by the cooldown guard.
                             last_generation_at = Some(Instant::now());
-                            // Cancel all existing orders atomically, then place new ones.
-                            // A single cancel_all is cheaper and guarantees no stale orders
-                            // survive (individual cancel+place races can leave orphans).
-                            for order in &current_orders_snapshot {
-                                self.persist_cancel_event(build_cancel_event(
-                                    order,
-                                    "reconcile_replace",
-                                    decision_ts,
-                                    self.config.runtime.dry_run,
-                                    &live_quote_metadata,
-                                ))?;
-                            }
-                            self.exchange.cancel_all_orders().await?;
-                            // Clear local open-order state immediately so the next
-                            // reconcile cycle doesn't see stale OPEN orders and
-                            // generate wrong sizes while waiting for WS CANCELLED events.
-                            state.open_orders.clear();
-                            live_quote_metadata.clear();
-                            let filtered_to_place =
-                                filter_orders_against_current_bbo(&self.parsed, &state, &recon.to_place);
-                            if !filtered_to_place.is_empty() {
-                                let sent_ts = Utc::now();
-                                for order in &filtered_to_place {
-                                    let placement = build_quote_placement_event(
-                                        &state,
-                                        order,
-                                        &current_orders_snapshot,
-                                        decision_ts,
-                                        sent_ts,
-                                        self.config.runtime.dry_run,
-                                    );
-                                    live_quote_metadata.insert(
-                                        (order.symbol.clone(), order.side, order.level_index),
-                                        LiveQuoteMetadata {
-                                            client_order_key: placement.client_order_key.clone(),
-                                            placed_at: placement.ts,
-                                            decision_ts: placement.decision_ts,
-                                            sent_ts: placement.sent_ts,
-                                            ack_ts: None,
-                                            order_id: None,
-                                            quote_price: placement.price,
-                                            quote_mid: placement.mid_price,
-                                            quantity: placement.quantity,
-                                        },
-                                    );
-                                    self.persist_quote_placement(placement)?;
-                                }
-                                if let Err(err) = self.exchange.place_orders(filtered_to_place.clone()).await {
+                            let (pre_cancel_candidates, post_cancel_candidates) =
+                                split_orders_for_two_phase_place(
+                                    &current_orders_snapshot,
+                                    &recon.to_place,
+                                    self.config.risk.max_open_orders,
+                                );
+
+                            let filtered_pre_cancel = filter_orders_against_current_bbo(
+                                &self.parsed,
+                                &state,
+                                &pre_cancel_candidates,
+                            );
+                            if !filtered_pre_cancel.is_empty() {
+                                let ready_to_place_ts = Utc::now();
+                                let place_dispatch_ts = Utc::now();
+                                if let Err(err) =
+                                    self.exchange.place_orders(filtered_pre_cancel.clone()).await
+                                {
                                     let reason = err.to_string();
-                                    for order in &filtered_to_place {
+                                    for order in &filtered_pre_cancel {
                                         self.persist_order_rejection(OrderRejectionEvent {
                                             ts: Utc::now(),
                                             symbol: order.symbol.clone(),
@@ -942,12 +1028,117 @@ where
                                             price: order.price,
                                             quantity: order.quantity,
                                             reason: reason.clone(),
-                                            stage: "exchange_place".to_string(),
+                                            stage: "exchange_place_pre_cancel".to_string(),
                                             is_simulated: self.config.runtime.dry_run,
                                         })?;
                                     }
                                     return Err(err);
                                 }
+                                let place_response_ts = Utc::now();
+                                self.record_successful_quote_placements(
+                                    &state,
+                                    &filtered_pre_cancel,
+                                    &current_orders_snapshot,
+                                    PlacementTiming {
+                                        decision_ts,
+                                        cancel_start_ts: None,
+                                        cancel_done_ts: None,
+                                        ready_to_place_ts,
+                                        place_dispatch_ts,
+                                        place_response_ts,
+                                    },
+                                    &mut live_quote_metadata,
+                                )?;
+                            }
+
+                            let mut cancel_start_ts = None;
+                            let mut cancel_done_ts = None;
+                            if !recon.to_cancel_order_ids.is_empty() {
+                                let cancel_ids: HashSet<&str> =
+                                    recon.to_cancel_order_ids.iter().map(String::as_str).collect();
+                                for order in &current_orders_snapshot {
+                                    if order
+                                        .order_id
+                                        .as_deref()
+                                        .map(|id| cancel_ids.contains(id))
+                                        .unwrap_or(false)
+                                    {
+                                        self.persist_cancel_event(build_cancel_event(
+                                            order,
+                                            "reconcile_replace",
+                                            decision_ts,
+                                            self.config.runtime.dry_run,
+                                            &live_quote_metadata,
+                                        ))?;
+                                    }
+                                }
+                                let started_at = Utc::now();
+                                self.exchange
+                                    .cancel_orders(recon.to_cancel_order_ids.clone())
+                                    .await?;
+                                let done_at = Utc::now();
+                                cancel_start_ts = Some(started_at);
+                                cancel_done_ts = Some(done_at);
+                                self.persist_cancel_latency_samples(
+                                    &current_orders_snapshot,
+                                    &recon.to_cancel_order_ids,
+                                    decision_ts,
+                                    started_at,
+                                    done_at,
+                                )?;
+                                for order_id in &recon.to_cancel_order_ids {
+                                    state.open_orders.remove(order_id);
+                                }
+                                live_quote_metadata.retain(|_, meta| {
+                                    !recon
+                                        .to_cancel_order_ids
+                                        .iter()
+                                        .any(|order_id| meta.order_id.as_deref() == Some(order_id.as_str()))
+                                });
+                            }
+
+                            let filtered_post_cancel = filter_orders_against_current_bbo(
+                                &self.parsed,
+                                &state,
+                                &post_cancel_candidates,
+                            );
+                            if !filtered_post_cancel.is_empty() {
+                                let ready_to_place_ts = Utc::now();
+                                let place_dispatch_ts = Utc::now();
+                                if let Err(err) =
+                                    self.exchange.place_orders(filtered_post_cancel.clone()).await
+                                {
+                                    let reason = err.to_string();
+                                    for order in &filtered_post_cancel {
+                                        self.persist_order_rejection(OrderRejectionEvent {
+                                            ts: Utc::now(),
+                                            symbol: order.symbol.clone(),
+                                            side: order.side,
+                                            level_index: Some(order.level_index as i64),
+                                            price: order.price,
+                                            quantity: order.quantity,
+                                            reason: reason.clone(),
+                                            stage: "exchange_place_post_cancel".to_string(),
+                                            is_simulated: self.config.runtime.dry_run,
+                                        })?;
+                                    }
+                                    return Err(err);
+                                }
+                                let place_response_ts = Utc::now();
+                                self.record_successful_quote_placements(
+                                    &state,
+                                    &filtered_post_cancel,
+                                    &current_orders_snapshot,
+                                    PlacementTiming {
+                                        decision_ts,
+                                        cancel_start_ts,
+                                        cancel_done_ts,
+                                        ready_to_place_ts,
+                                        place_dispatch_ts,
+                                        place_response_ts,
+                                    },
+                                    &mut live_quote_metadata,
+                                )?;
                             }
                             // Reset the cooldown timestamp again now that placement is done,
                             // so generation_min_interval_ms is measured from placement
@@ -1389,6 +1580,7 @@ where
         if let Some(meta) = live_quote_metadata.get_mut(&key) {
             if meta.ack_ts.is_none() {
                 meta.ack_ts = Some(ack_ts);
+                meta.ws_ack_ts = Some(ack_ts);
                 meta.order_id = order.order_id.clone();
                 self.ack_quote_placement(
                     &meta.client_order_key,
@@ -1402,6 +1594,12 @@ where
                     side: Some(order.side),
                     level_index: Some(level_index as i64),
                     decision_ts: meta.decision_ts,
+                    cancel_start_ts: meta.cancel_start_ts,
+                    cancel_done_ts: meta.cancel_done_ts,
+                    ready_to_place_ts: Some(meta.ready_to_place_ts),
+                    place_dispatch_ts: Some(meta.place_dispatch_ts),
+                    place_response_ts: Some(meta.place_response_ts),
+                    ws_ack_ts: Some(ack_ts),
                     sent_ts: meta.sent_ts,
                     ack_ts: Some(ack_ts),
                     client_order_key: Some(meta.client_order_key.clone()),
@@ -2844,8 +3042,7 @@ fn build_quote_placement_event(
     state: &BotState,
     order: &OrderRequest,
     current_orders: &[crate::domain::OpenOrder],
-    decision_ts: DateTime<Utc>,
-    sent_ts: DateTime<Utc>,
+    timing: PlacementTiming,
     is_simulated: bool,
 ) -> QuotePlacementEvent {
     let existing_same_level = current_orders.iter().any(|current| {
@@ -2868,16 +3065,22 @@ fn build_quote_placement_event(
             order.symbol,
             order.side,
             order.level_index,
-            sent_ts.timestamp_millis()
+            timing.place_dispatch_ts.timestamp_millis()
         ),
         placed_or_replaced: if existing_same_level {
             "replaced".to_string()
         } else {
             "placed".to_string()
         },
-        decision_ts,
-        sent_ts,
+        decision_ts: timing.decision_ts,
+        cancel_start_ts: timing.cancel_start_ts,
+        cancel_done_ts: timing.cancel_done_ts,
+        ready_to_place_ts: timing.ready_to_place_ts,
+        place_dispatch_ts: timing.place_dispatch_ts,
+        place_response_ts: timing.place_response_ts,
+        sent_ts: timing.ready_to_place_ts,
         ack_ts: None,
+        ws_ack_ts: None,
         mid_price: market.and_then(|market| market.mid_price()),
         is_simulated,
     }
@@ -3294,6 +3497,36 @@ fn build_reconciliation_plan(
         changed_orders,
         result,
     })
+}
+
+fn split_orders_for_two_phase_place(
+    current_orders: &[crate::domain::OpenOrder],
+    to_place: &[OrderRequest],
+    max_open_orders: usize,
+) -> (Vec<OrderRequest>, Vec<OrderRequest>) {
+    let conflicting_levels: HashSet<(String, Side, usize)> = current_orders
+        .iter()
+        .filter_map(|order| {
+            order
+                .level_index
+                .map(|level| (order.symbol.clone(), order.side, level))
+        })
+        .collect();
+
+    let available_pre_cancel_slots = max_open_orders.saturating_sub(current_orders.len());
+    let mut pre_cancel = Vec::new();
+    let mut post_cancel = Vec::new();
+
+    for order in to_place {
+        let key = (order.symbol.clone(), order.side, order.level_index);
+        if conflicting_levels.contains(&key) || pre_cancel.len() >= available_pre_cancel_slots {
+            post_cancel.push(order.clone());
+        } else {
+            pre_cancel.push(order.clone());
+        }
+    }
+
+    (pre_cancel, post_cancel)
 }
 
 fn log_dry_run_inventory(state: &BotState) {

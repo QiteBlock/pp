@@ -157,8 +157,14 @@ impl FillStore {
                 client_order_key TEXT NOT NULL UNIQUE,
                 placed_or_replaced TEXT NOT NULL,
                 decision_ts TEXT NOT NULL,
+                cancel_start_ts TEXT,
+                cancel_done_ts TEXT,
+                ready_to_place_ts TEXT,
+                place_dispatch_ts TEXT,
+                place_response_ts TEXT,
                 sent_ts TEXT NOT NULL,
                 ack_ts TEXT,
+                ws_ack_ts TEXT,
                 mid_price TEXT,
                 is_simulated INTEGER NOT NULL
             );
@@ -217,6 +223,12 @@ impl FillStore {
                 side TEXT,
                 level_index INTEGER,
                 decision_ts TEXT NOT NULL,
+                cancel_start_ts TEXT,
+                cancel_done_ts TEXT,
+                ready_to_place_ts TEXT,
+                place_dispatch_ts TEXT,
+                place_response_ts TEXT,
+                ws_ack_ts TEXT,
                 sent_ts TEXT NOT NULL,
                 ack_ts TEXT,
                 client_order_key TEXT,
@@ -264,6 +276,7 @@ impl FillStore {
                 hedge_side TEXT NOT NULL,
                 hedge_price TEXT,
                 hedge_qty TEXT NOT NULL,
+                hedge_fee_paid TEXT,
                 basis_mid_bps TEXT,
                 note TEXT,
                 is_simulated INTEGER NOT NULL
@@ -284,6 +297,7 @@ impl FillStore {
                 primary_unrealized_pnl TEXT NOT NULL,
                 hedge_unrealized_pnl TEXT NOT NULL,
                 hedge_realized_pnl TEXT NOT NULL,
+                hedge_fees_paid TEXT NOT NULL,
                 total_pnl TEXT NOT NULL,
                 is_simulated INTEGER NOT NULL
             );
@@ -295,6 +309,30 @@ impl FillStore {
         ensure_column(&connection, "fills", "pre_fill_mid_drift_bps", "TEXT")?;
         ensure_column(&connection, "fills", "fee_paid", "TEXT")?;
         ensure_column(&connection, "fills", "funding_paid", "TEXT")?;
+        ensure_column(&connection, "quote_placements", "cancel_start_ts", "TEXT")?;
+        ensure_column(&connection, "quote_placements", "cancel_done_ts", "TEXT")?;
+        ensure_column(&connection, "quote_placements", "ready_to_place_ts", "TEXT")?;
+        ensure_column(&connection, "quote_placements", "place_dispatch_ts", "TEXT")?;
+        ensure_column(&connection, "quote_placements", "place_response_ts", "TEXT")?;
+        ensure_column(&connection, "quote_placements", "ws_ack_ts", "TEXT")?;
+        ensure_column(&connection, "latency_samples", "cancel_start_ts", "TEXT")?;
+        ensure_column(&connection, "latency_samples", "cancel_done_ts", "TEXT")?;
+        ensure_column(&connection, "latency_samples", "ready_to_place_ts", "TEXT")?;
+        ensure_column(&connection, "latency_samples", "place_dispatch_ts", "TEXT")?;
+        ensure_column(&connection, "latency_samples", "place_response_ts", "TEXT")?;
+        ensure_column(&connection, "latency_samples", "ws_ack_ts", "TEXT")?;
+        ensure_column(
+            &connection,
+            "hedge_simulation_events",
+            "hedge_fee_paid",
+            "TEXT",
+        )?;
+        ensure_column(
+            &connection,
+            "hedge_simulation_snapshots",
+            "hedge_fees_paid",
+            "TEXT NOT NULL DEFAULT '0'",
+        )?;
 
         Ok(Some(Self {
             connection: Mutex::new(connection),
@@ -621,8 +659,10 @@ impl FillStore {
         connection.execute(
             "INSERT OR REPLACE INTO quote_placements (
                 ts, symbol, side, level_index, price, quantity, order_id, client_order_key,
-                placed_or_replaced, decision_ts, sent_ts, ack_ts, mid_price, is_simulated
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                placed_or_replaced, decision_ts, cancel_start_ts, cancel_done_ts,
+                ready_to_place_ts, place_dispatch_ts, place_response_ts,
+                sent_ts, ack_ts, ws_ack_ts, mid_price, is_simulated
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
             params![
                 event.ts.to_rfc3339(),
                 event.symbol,
@@ -634,8 +674,14 @@ impl FillStore {
                 event.client_order_key,
                 event.placed_or_replaced,
                 event.decision_ts.to_rfc3339(),
+                event.cancel_start_ts.map(|ts| ts.to_rfc3339()),
+                event.cancel_done_ts.map(|ts| ts.to_rfc3339()),
+                event.ready_to_place_ts.to_rfc3339(),
+                event.place_dispatch_ts.to_rfc3339(),
+                event.place_response_ts.to_rfc3339(),
                 event.sent_ts.to_rfc3339(),
                 event.ack_ts.map(|ts| ts.to_rfc3339()),
+                event.ws_ack_ts.map(|ts| ts.to_rfc3339()),
                 event.mid_price.map(|v| v.to_string()),
                 if event.is_simulated { 1 } else { 0 },
             ],
@@ -655,7 +701,7 @@ impl FillStore {
             .map_err(|_| anyhow::anyhow!("fill store mutex poisoned"))?;
         connection.execute(
             "UPDATE quote_placements
-             SET order_id = COALESCE(?1, order_id), ack_ts = ?2
+             SET order_id = COALESCE(?1, order_id), ack_ts = ?2, ws_ack_ts = ?2
              WHERE client_order_key = ?3",
             params![order_id, ack_ts.to_rfc3339(), client_order_key],
         )?;
@@ -764,9 +810,10 @@ impl FillStore {
             .map_err(|_| anyhow::anyhow!("fill store mutex poisoned"))?;
         connection.execute(
             "INSERT INTO latency_samples (
-                ts, symbol, action, side, level_index, decision_ts, sent_ts, ack_ts,
-                client_order_key, order_id, is_simulated
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                ts, symbol, action, side, level_index, decision_ts, cancel_start_ts,
+                cancel_done_ts, ready_to_place_ts, place_dispatch_ts, place_response_ts,
+                ws_ack_ts, sent_ts, ack_ts, client_order_key, order_id, is_simulated
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 sample.ts.to_rfc3339(),
                 sample.symbol,
@@ -774,6 +821,12 @@ impl FillStore {
                 sample.side.map(|side| format!("{:?}", side)),
                 sample.level_index,
                 sample.decision_ts.to_rfc3339(),
+                sample.cancel_start_ts.map(|ts| ts.to_rfc3339()),
+                sample.cancel_done_ts.map(|ts| ts.to_rfc3339()),
+                sample.ready_to_place_ts.map(|ts| ts.to_rfc3339()),
+                sample.place_dispatch_ts.map(|ts| ts.to_rfc3339()),
+                sample.place_response_ts.map(|ts| ts.to_rfc3339()),
+                sample.ws_ack_ts.map(|ts| ts.to_rfc3339()),
                 sample.sent_ts.to_rfc3339(),
                 sample.ack_ts.map(|ts| ts.to_rfc3339()),
                 sample.client_order_key,
@@ -867,8 +920,9 @@ impl FillStore {
             "INSERT INTO hedge_simulation_events (
                 ts, symbol, hedge_venue, action, status,
                 primary_fill_side, primary_fill_price, primary_fill_qty,
-                hedge_side, hedge_price, hedge_qty, basis_mid_bps, note, is_simulated
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                hedge_side, hedge_price, hedge_qty, hedge_fee_paid,
+                basis_mid_bps, note, is_simulated
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 event.ts.to_rfc3339(),
                 event.symbol,
@@ -881,6 +935,7 @@ impl FillStore {
                 format!("{:?}", event.hedge_side),
                 event.hedge_price.map(|v| v.to_string()),
                 event.hedge_qty.to_string(),
+                event.hedge_fee_paid.map(|v| v.to_string()),
                 event.basis_mid_bps.map(|v| v.to_string()),
                 event.note,
                 if event.is_simulated { 1 } else { 0 },
@@ -903,8 +958,8 @@ impl FillStore {
                 primary_position, primary_entry_price, primary_mark_price,
                 hedge_position, hedge_entry_price, hedge_mid_price,
                 net_position, primary_unrealized_pnl, hedge_unrealized_pnl,
-                hedge_realized_pnl, total_pnl, is_simulated
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                hedge_realized_pnl, hedge_fees_paid, total_pnl, is_simulated
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 snapshot.ts.to_rfc3339(),
                 snapshot.symbol,
@@ -920,6 +975,7 @@ impl FillStore {
                 snapshot.primary_unrealized_pnl.to_string(),
                 snapshot.hedge_unrealized_pnl.to_string(),
                 snapshot.hedge_realized_pnl.to_string(),
+                snapshot.hedge_fees_paid.to_string(),
                 snapshot.total_pnl.to_string(),
                 if snapshot.is_simulated { 1 } else { 0 },
             ],
