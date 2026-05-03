@@ -156,13 +156,13 @@ pub fn generate_quotes(
     let ob_bid_spread_mult = (Decimal::ONE - ob * Decimal::new(5, 1))
         .max(Decimal::new(5, 1))
         .min(Decimal::new(15, 1));
-    // ob_size_multiplier ∈ [0.5, 1.5] at full imbalance.
+    // ob_size_multiplier ∈ [0.2, 1.5] at full imbalance.
     let ob_ask_size_mult = (Decimal::ONE - ob * Decimal::new(2, 0))
         .max(Decimal::new(2, 1))
-        .min(Decimal::new(3, 0));
+        .min(Decimal::new(15, 1));
     let ob_bid_size_mult = (Decimal::ONE + ob * Decimal::new(2, 0))
         .max(Decimal::new(2, 1))
-        .min(Decimal::new(3, 0));
+        .min(Decimal::new(15, 1));
 
     // S5: Continuous regime scaling.
     let intensity = factors.regime_intensity;
@@ -244,6 +244,9 @@ pub fn generate_quotes(
     let ask_size_skew = (Decimal::ONE + size_skew).max(Decimal::new(2, 1));
 
     let mut quotes = Vec::with_capacity(model.n_points * 2);
+    let side_notional_cap = max_quote_notional.map(|cap| cap * Decimal::from(2u64));
+    let mut bid_running_total_notional = Decimal::ZERO;
+    let mut ask_running_total_notional = Decimal::ZERO;
     for level in 0..model.n_points {
         let level_decimal = Decimal::from(level as u64);
 
@@ -317,8 +320,19 @@ pub fn generate_quotes(
                 ask_size = ask_size.min(cap_notional / ask_price);
             }
         }
+        if let Some(side_cap_notional) = side_notional_cap {
+            if bid_price > Decimal::ZERO {
+                let remaining = (side_cap_notional - bid_running_total_notional).max(Decimal::ZERO);
+                bid_size = bid_size.min(remaining / bid_price);
+            }
+            if ask_price > Decimal::ZERO {
+                let remaining = (side_cap_notional - ask_running_total_notional).max(Decimal::ZERO);
+                ask_size = ask_size.min(remaining / ask_price);
+            }
+        }
 
         if matches!(pair.side_filter, SideFilter::Both | SideFilter::BidOnly) {
+            bid_running_total_notional += bid_size * bid_price;
             quotes.push(QuoteIntent {
                 symbol: pair.symbol.clone(),
                 level_index: level,
@@ -329,6 +343,7 @@ pub fn generate_quotes(
             });
         }
         if matches!(pair.side_filter, SideFilter::Both | SideFilter::AskOnly) {
+            ask_running_total_notional += ask_size * ask_price;
             quotes.push(QuoteIntent {
                 symbol: pair.symbol.clone(),
                 level_index: level,

@@ -941,6 +941,11 @@ pub struct PairConfig {
     /// streamed and injected as `MarketEvent::SpotPrice` for this symbol.
     #[serde(default)]
     pub binance_symbol: Option<String>,
+    /// Optional Hyperliquid perp coin symbol (e.g. `"CRV"`). When set, the bot
+    /// subscribes to Hyperliquid BBO updates for cross-venue basis monitoring
+    /// and dry-run hedge simulation only.
+    #[serde(default)]
+    pub hyperliquid_symbol: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

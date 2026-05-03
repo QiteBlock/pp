@@ -6,7 +6,9 @@ use rust_decimal::prelude::Signed;
 use rust_decimal::Decimal;
 use tracing::warn;
 
-use crate::domain::{Fill, MarketEvent, OpenOrder, Position, PrivateEvent, RecentTrade};
+use crate::domain::{
+    ExternalVenue, Fill, MarketEvent, OpenOrder, Position, PrivateEvent, RecentTrade,
+};
 
 pub const MAX_RECENT_TRADES: usize = 10_000;
 const MAX_FILL_HISTORY: usize = 10_000;
@@ -572,6 +574,28 @@ impl MarketState {
                 self.last_updated = Some(timestamp);
                 self.last_updated_at = Some(Instant::now());
             }
+            MarketEvent::ExternalBestBidAsk {
+                symbol,
+                venue,
+                bid,
+                ask,
+                bid_size,
+                ask_size,
+                timestamp,
+            } => {
+                let symbol_state = self.symbols.entry(symbol).or_default();
+                symbol_state.external_quotes.insert(
+                    venue,
+                    ExternalQuoteState {
+                        bid,
+                        ask,
+                        bid_size,
+                        ask_size,
+                        last_updated: Some(timestamp),
+                        last_updated_at: Some(Instant::now()),
+                    },
+                );
+            }
         }
     }
 }
@@ -597,6 +621,23 @@ pub struct SymbolMarketState {
     pub last_updated: Option<DateTime<Utc>>,
     pub last_updated_at: Option<Instant>,
     pub last_bbo_update_at: Option<Instant>,
+    pub external_quotes: HashMap<ExternalVenue, ExternalQuoteState>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ExternalQuoteState {
+    pub bid: Decimal,
+    pub ask: Decimal,
+    pub bid_size: Option<Decimal>,
+    pub ask_size: Option<Decimal>,
+    pub last_updated: Option<DateTime<Utc>>,
+    pub last_updated_at: Option<Instant>,
+}
+
+impl ExternalQuoteState {
+    pub fn mid_price(&self) -> Decimal {
+        (self.bid + self.ask) / Decimal::from(2u64)
+    }
 }
 
 impl SymbolMarketState {

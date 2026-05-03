@@ -16,8 +16,10 @@ use tracing::warn;
 
 use crate::{
     adapters::{
-        exchange::ExchangeClient, feeds::binance::stream_binance_spot_prices,
-        notifier::telegram::TelegramNotifier, storage::sqlite::FillStore,
+        exchange::ExchangeClient,
+        feeds::{binance::stream_binance_spot_prices, hyperliquid::stream_hyperliquid_bbo},
+        notifier::telegram::TelegramNotifier,
+        storage::sqlite::FillStore,
     },
     config::{AppConfig, ParsedConfig},
     core::{
@@ -25,16 +27,18 @@ use crate::{
         cleanup::{flatten_account_state, CleanupExchange},
         factors::FactorEngine,
         health::HealthTracker,
+        hedging::HedgeSimulator,
         quoting::avellaneda_stoikov::generate_quotes,
         risk::{proportional_vol_widening, run_security_checks, CircuitBreaker},
         runtime_control::RuntimeControl,
         state::BotState,
     },
     domain::{
-        BookSnapshot, CancelEvent, Fill, FillStorageTelemetry, FundingPaymentEvent, InstrumentMeta,
-        LatencySample, MarketEvent, MarketRegime, MidPriceSample, OrderRejectionEvent,
-        OrderRequest, OrderType, PrivateEvent, QuoteFilterEvent, QuotePlacementEvent, Side,
-        StrategySnapshot, TimeInForce,
+        BookSnapshot, CancelEvent, CrossVenueBasisSample, ExternalVenue, Fill,
+        FillStorageTelemetry, FundingPaymentEvent, HedgeSimulationEvent, HedgeSimulationSnapshot,
+        InstrumentMeta, LatencySample, MarketEvent, MarketRegime, MidPriceSample,
+        OrderRejectionEvent, OrderRequest, OrderType, PrivateEvent, QuoteFilterEvent,
+        QuotePlacementEvent, Side, StrategySnapshot, TimeInForce,
     },
 };
 
@@ -167,6 +171,27 @@ where
         Ok(())
     }
 
+    fn persist_cross_venue_basis_sample(&self, sample: CrossVenueBasisSample) -> Result<()> {
+        if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
+            fill_store.insert_cross_venue_basis_sample(&sample)?;
+        }
+        Ok(())
+    }
+
+    fn persist_hedge_simulation_event(&self, event: HedgeSimulationEvent) -> Result<()> {
+        if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
+            fill_store.insert_hedge_simulation_event(&event)?;
+        }
+        Ok(())
+    }
+
+    fn persist_hedge_simulation_snapshot(&self, snapshot: HedgeSimulationSnapshot) -> Result<()> {
+        if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
+            fill_store.insert_hedge_simulation_snapshot(&snapshot)?;
+        }
+        Ok(())
+    }
+
     fn initial_funding_sync_start(&self) -> Result<DateTime<Utc>> {
         let latest = self
             .fill_store
@@ -266,6 +291,86 @@ where
         })
     }
 
+    fn maybe_persist_cross_venue_basis_sample(
+        &self,
+        state: &BotState,
+        symbol: &str,
+        last_basis_sample_at: &mut HashMap<String, Instant>,
+    ) -> Result<bool> {
+        let Some(market) = state.market.symbols.get(symbol) else {
+            return Ok(false);
+        };
+        let Some(hl_quote) = market
+            .external_quotes
+            .get(&ExternalVenue::Hyperliquid)
+            .filter(|quote| {
+                quote
+                    .last_updated_at
+                    .map(|updated| updated.elapsed() <= Duration::from_secs(5))
+                    .unwrap_or(false)
+            })
+        else {
+            return Ok(false);
+        };
+        let (Some(primary_bid), Some(primary_ask)) = (market.best_bid, market.best_ask) else {
+            return Ok(false);
+        };
+        let primary_mid = (primary_bid + primary_ask) / Decimal::from(2u64);
+        let hedge_mid = hl_quote.mid_price();
+        if primary_mid <= Decimal::ZERO || hedge_mid <= Decimal::ZERO {
+            return Ok(false);
+        }
+        let should_sample = last_basis_sample_at
+            .get(symbol)
+            .map(|instant| instant.elapsed() >= Duration::from_secs(1))
+            .unwrap_or(true);
+        if !should_sample {
+            return Ok(false);
+        }
+        last_basis_sample_at.insert(symbol.to_string(), Instant::now());
+        self.persist_cross_venue_basis_sample(CrossVenueBasisSample {
+            ts: Utc::now(),
+            symbol: symbol.to_string(),
+            primary_venue: format!("{:?}", self.config.venue.kind),
+            hedge_venue: "hyperliquid".to_string(),
+            primary_bid,
+            primary_ask,
+            primary_mid,
+            hedge_bid: hl_quote.bid,
+            hedge_ask: hl_quote.ask,
+            hedge_mid,
+            basis_mid_bps: (primary_mid - hedge_mid) / hedge_mid * Decimal::from(10_000u64),
+            basis_open_buy_primary_bps: (primary_ask - hl_quote.bid) / hedge_mid
+                * Decimal::from(10_000u64),
+            basis_open_sell_primary_bps: (primary_bid - hl_quote.ask) / hedge_mid
+                * Decimal::from(10_000u64),
+            primary_mark_price: market.mark_price,
+            primary_spot_price: market.spot_price,
+            is_simulated: self.config.runtime.dry_run,
+        })?;
+        Ok(true)
+    }
+
+    fn persist_hedge_snapshot_for_symbol(
+        &self,
+        state: &BotState,
+        symbol: &str,
+        hedge_simulator: &HedgeSimulator,
+        trigger: &str,
+    ) -> Result<()> {
+        let market = state.market.symbols.get(symbol);
+        let primary_position = state.positions.get(symbol);
+        let snapshot = hedge_simulator.snapshot(
+            Utc::now(),
+            symbol,
+            trigger,
+            market,
+            primary_position,
+            self.config.runtime.dry_run,
+        );
+        self.persist_hedge_simulation_snapshot(snapshot)
+    }
+
     pub fn new(
         config: AppConfig,
         exchange: Arc<E>,
@@ -361,6 +466,7 @@ where
         // quoting until the position is fully cleared, even if flow briefly dips
         // below the spike threshold (prevents oscillation around the threshold).
         let mut flow_spike_committed: HashSet<String> = HashSet::new();
+        let mut inventory_unwind_committed: HashSet<String> = HashSet::new();
         // Post-fill widen: tracks (symbol, side_to_widen) → Instant when widen expires.
         // After a fill on side S, widen the opposite side for post_fill_widen_secs.
         let mut post_fill_widen: HashMap<(String, Side), Instant> = HashMap::new();
@@ -371,7 +477,9 @@ where
             HashMap::new();
         let mut last_mid_sample_at: HashMap<String, Instant> = HashMap::new();
         let mut last_book_snapshot_at: HashMap<String, Instant> = HashMap::new();
+        let mut last_basis_sample_at: HashMap<String, Instant> = HashMap::new();
         let mut next_funding_sync_start = self.initial_funding_sync_start()?;
+        let mut hedge_simulator = HedgeSimulator::new();
 
         loop {
             tokio::select! {
@@ -391,6 +499,7 @@ where
                         &mut minute_stats,
                         &mut cumulative_traded_volume,
                         &mut live_quote_metadata,
+                        &mut hedge_simulator,
                     ).await? {
                         if !fs.is_simulated {
                             last_generation_at = None;
@@ -435,6 +544,7 @@ where
                             &mut minute_stats,
                             &mut cumulative_traded_volume,
                             &mut live_quote_metadata,
+                            &mut hedge_simulator,
                         ).await? {
                             if !fs.is_simulated {
                                 last_generation_at = None;
@@ -609,6 +719,7 @@ where
                         health.rest_failure_count(),
                         &emergency_unwind_symbols,
                         &side_cooldown,
+                        &mut inventory_unwind_committed,
                         &mut flow_spike_committed,
                         &post_fill_widen,
                     )?;
@@ -934,6 +1045,7 @@ where
                             MarketEvent::OrderBookUpdate { symbol, .. } => { deduped.insert((symbol.clone(), 4), e); }
                             MarketEvent::StreamReconnected { .. } => { deduped.insert((String::new(), 255), e); }
                             MarketEvent::FundingRate { symbol, .. } => { deduped.insert((symbol.clone(), 5), e); }
+                            MarketEvent::ExternalBestBidAsk { symbol, .. } => { deduped.insert((symbol.clone(), 6), e); }
                         }
                     }
                     let all_events: Vec<MarketEvent> = deduped.into_values().chain(trade_events).collect();
@@ -959,6 +1071,19 @@ where
                             &event,
                             &mut last_book_snapshot_at,
                         )?;
+                        let sampled_basis = self.maybe_persist_cross_venue_basis_sample(
+                            &state,
+                            symbol,
+                            &mut last_basis_sample_at,
+                        )?;
+                        if sampled_basis {
+                            self.persist_hedge_snapshot_for_symbol(
+                                &state,
+                                symbol,
+                                &hedge_simulator,
+                                "basis_sample",
+                            )?;
+                        }
                     }
                     if state.market.last_updated.is_some()
                         && matches!(
@@ -1010,6 +1135,7 @@ where
                                         &mut fill_tracker,
                                         &mut cumulative_traded_volume,
                                         &mut live_quote_metadata,
+                                        &mut hedge_simulator,
                                     ).await?;
                                     // Post-fill widen for simulated fills.
                                     let widen_secs = self.parsed.model.post_fill_widen_secs;
@@ -1066,6 +1192,7 @@ where
         minute_stats: &mut MinuteStats,
         cumulative_traded_volume: &mut Decimal,
         live_quote_metadata: &mut HashMap<(String, Side, usize), LiveQuoteMetadata>,
+        hedge_simulator: &mut HedgeSimulator,
     ) -> Result<Option<FillStats>> {
         match event {
             PrivateEvent::Fill(fill) => {
@@ -1077,6 +1204,7 @@ where
                         fill_tracker,
                         cumulative_traded_volume,
                         live_quote_metadata,
+                        hedge_simulator,
                     )
                     .await?;
                 minute_stats.accumulate_fill(fs.clone());
@@ -1116,6 +1244,7 @@ where
         fill_tracker: &mut FillTracker,
         cumulative_traded_volume: &mut Decimal,
         live_quote_metadata: &mut HashMap<(String, Side, usize), LiveQuoteMetadata>,
+        hedge_simulator: &mut HedgeSimulator,
     ) -> Result<FillStats> {
         let (level_index, spread_earned_bps) = infer_fill_analytics(state, &fill);
         let total_fees_before = state.pnl.total_fees;
@@ -1138,6 +1267,14 @@ where
             if details.fee_paid.is_none() {
                 details.fee_paid = Some(state.pnl.total_fees - total_fees_before);
             }
+        }
+        let primary_position = state.positions.get(&fill.symbol);
+        if symbol_tracks_hyperliquid(&self.config, &fill.symbol) {
+            let market = state.market.symbols.get(&fill.symbol);
+            let (hedge_event, hedge_snapshot) =
+                hedge_simulator.on_primary_fill(&fill, market, primary_position, is_simulated);
+            self.persist_hedge_simulation_event(hedge_event)?;
+            self.persist_hedge_simulation_snapshot(hedge_snapshot)?;
         }
         if let Some(market) = state.market.symbols.get(&fill.symbol) {
             self.persist_book_snapshot(BookSnapshot {
@@ -1309,6 +1446,18 @@ where
                     .map(|bs| (p.symbol.clone(), bs.clone()))
             })
             .collect();
+        let hyperliquid_symbol_map: HashMap<String, String> = self
+            .config
+            .pairs
+            .iter()
+            .filter(|p| p.enabled)
+            .filter_map(|p| {
+                p.hyperliquid_symbol
+                    .clone()
+                    .or_else(|| infer_hyperliquid_coin(&p.symbol))
+                    .map(|coin| (p.symbol.clone(), coin))
+            })
+            .collect();
         // Binance feed is independent: a GRVT disconnect must not kill it and
         // vice versa.  Spawn it as a fire-and-forget task that writes into the
         // same market channel.  Errors inside it are logged and reconnected
@@ -1317,6 +1466,13 @@ where
         tokio::spawn(async move {
             if let Err(e) = stream_binance_spot_prices(binance_symbol_map, binance_sender).await {
                 tracing::warn!(err = %e, "binance feed task exited unexpectedly");
+            }
+        });
+        let hyperliquid_sender = market_sender.clone();
+        tokio::spawn(async move {
+            if let Err(e) = stream_hyperliquid_bbo(hyperliquid_symbol_map, hyperliquid_sender).await
+            {
+                tracing::warn!(err = %e, "hyperliquid feed task exited unexpectedly");
             }
         });
 
@@ -1344,6 +1500,7 @@ where
         _rest_failures: usize,
         emergency_unwind_symbols: &HashSet<String>,
         side_cooldown: &HashMap<(String, Side), Instant>,
+        inventory_unwind_committed: &mut HashSet<String>,
         flow_spike_committed: &mut HashSet<String>,
         post_fill_widen: &HashMap<(String, Side), Instant>,
     ) -> Result<Vec<OrderRequest>> {
@@ -1353,7 +1510,8 @@ where
         let n_trade_threshold = self.config.factors.n_trade_quote_threshold;
         let hard_toxic_stop_secs = 300u64;
         let min_level_multiplier = Decimal::new(5, 1);
-        let unwind_only_trigger_ratio = Decimal::new(15, 2);
+        let unwind_only_enter_ratio = Decimal::new(15, 2);
+        let unwind_only_exit_ratio = Decimal::new(3, 2);
         let hard_vpin_skip_threshold = Decimal::new(95, 2);
         let passive_stale_close_spread_bps = Decimal::from(30u64);
         let position_hold_timeout =
@@ -1932,19 +2090,38 @@ where
             if dust_position && unwind_only {
                 unwind_only = false;
             }
-            if actionable_position
-                && parsed_pair.max_position_base > Decimal::ZERO
-                && current_position.abs()
-                    > parsed_pair.max_position_base * unwind_only_trigger_ratio
-            {
-                warn!(
-                    symbol = %pair.symbol,
-                    position = %current_position,
-                    max_position_base = %parsed_pair.max_position_base,
-                    trigger_ratio = %unwind_only_trigger_ratio,
-                    "inventory exceeded unwind-only trigger; suppressing accumulation side"
-                );
-                unwind_only = true;
+            if !actionable_position || parsed_pair.max_position_base <= Decimal::ZERO {
+                inventory_unwind_committed.remove(&pair.symbol);
+            } else {
+                let abs_position = current_position.abs();
+                let enter_threshold = parsed_pair.max_position_base * unwind_only_enter_ratio;
+                let exit_threshold = parsed_pair.max_position_base * unwind_only_exit_ratio;
+                if inventory_unwind_committed.contains(&pair.symbol) {
+                    if abs_position <= exit_threshold {
+                        inventory_unwind_committed.remove(&pair.symbol);
+                        warn!(
+                            symbol = %pair.symbol,
+                            position = %current_position,
+                            exit_threshold = %exit_threshold,
+                            exit_ratio = %unwind_only_exit_ratio,
+                            "inventory unwind hysteresis released; resuming normal quoting"
+                        );
+                    }
+                } else if abs_position >= enter_threshold {
+                    inventory_unwind_committed.insert(pair.symbol.clone());
+                    warn!(
+                        symbol = %pair.symbol,
+                        position = %current_position,
+                        max_position_base = %parsed_pair.max_position_base,
+                        enter_threshold = %enter_threshold,
+                        enter_ratio = %unwind_only_enter_ratio,
+                        exit_ratio = %unwind_only_exit_ratio,
+                        "inventory exceeded unwind-only trigger; committing to unwind-only until reduced below exit threshold"
+                    );
+                }
+                if inventory_unwind_committed.contains(&pair.symbol) {
+                    unwind_only = true;
+                }
             }
             let toxic_vpin_gate = factor_snapshot.vpin > hard_vpin_skip_threshold
                 && !dust_position
@@ -3525,7 +3702,8 @@ fn market_event_symbol(event: &MarketEvent) -> Option<&str> {
         | MarketEvent::Trade { symbol, .. }
         | MarketEvent::OrderBookSnapshot { symbol, .. }
         | MarketEvent::OrderBookUpdate { symbol, .. }
-        | MarketEvent::FundingRate { symbol, .. } => Some(symbol.as_str()),
+        | MarketEvent::FundingRate { symbol, .. }
+        | MarketEvent::ExternalBestBidAsk { symbol, .. } => Some(symbol.as_str()),
         MarketEvent::StreamReconnected { .. } => None,
     }
 }
@@ -3539,6 +3717,7 @@ fn market_event_source(event: &MarketEvent) -> &'static str {
         MarketEvent::OrderBookSnapshot { .. } => "orderbook_snapshot",
         MarketEvent::OrderBookUpdate { .. } => "orderbook_update",
         MarketEvent::FundingRate { .. } => "funding_rate",
+        MarketEvent::ExternalBestBidAsk { .. } => "external_best_bid_ask",
         MarketEvent::StreamReconnected { .. } => "stream_reconnected",
     }
 }
@@ -3595,6 +3774,7 @@ fn market_reference(
             timestamp,
             ..
         } => Some((symbol.clone(), *price, *timestamp)),
+        MarketEvent::ExternalBestBidAsk { .. } => None,
         MarketEvent::OrderBookSnapshot {
             symbol,
             bids,
@@ -3632,6 +3812,28 @@ fn market_reference(
         }
         MarketEvent::StreamReconnected { .. } | MarketEvent::FundingRate { .. } => None,
     }
+}
+
+fn infer_hyperliquid_coin(symbol: &str) -> Option<String> {
+    let base = symbol
+        .split(['/', '-', '_'])
+        .next()
+        .map(str::trim)
+        .filter(|part| !part.is_empty())?;
+    Some(base.to_uppercase())
+}
+
+fn symbol_tracks_hyperliquid(config: &AppConfig, symbol: &str) -> bool {
+    config
+        .pairs
+        .iter()
+        .find(|pair| pair.symbol == symbol && pair.enabled)
+        .and_then(|pair| {
+            pair.hyperliquid_symbol
+                .clone()
+                .or_else(|| infer_hyperliquid_coin(&pair.symbol))
+        })
+        .is_some()
 }
 
 fn log_dry_run_orders(_desired: &[OrderRequest]) {}

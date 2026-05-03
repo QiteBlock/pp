@@ -3,6 +3,7 @@ pub mod cleanup;
 pub mod engine;
 pub mod factors;
 pub mod health;
+pub mod hedging;
 pub mod quoting;
 pub mod risk;
 pub mod runtime_control;

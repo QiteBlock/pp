@@ -15,6 +15,12 @@ pub struct InstrumentMeta {
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ExternalVenue {
+    Hyperliquid,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Side {
     Ask,
@@ -173,6 +179,15 @@ pub enum MarketEvent {
         symbol: String,
         bids: BTreeMap<Decimal, Decimal>,
         asks: BTreeMap<Decimal, Decimal>,
+        timestamp: DateTime<Utc>,
+    },
+    ExternalBestBidAsk {
+        symbol: String,
+        venue: ExternalVenue,
+        bid: Decimal,
+        ask: Decimal,
+        bid_size: Option<Decimal>,
+        ask_size: Option<Decimal>,
         timestamp: DateTime<Utc>,
     },
 }
@@ -449,6 +464,64 @@ pub struct FundingPaymentEvent {
     pub payment_type: String,
     pub amount: Decimal,
     pub note: Option<String>,
+    pub is_simulated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct CrossVenueBasisSample {
+    pub ts: DateTime<Utc>,
+    pub symbol: String,
+    pub primary_venue: String,
+    pub hedge_venue: String,
+    pub primary_bid: Decimal,
+    pub primary_ask: Decimal,
+    pub primary_mid: Decimal,
+    pub hedge_bid: Decimal,
+    pub hedge_ask: Decimal,
+    pub hedge_mid: Decimal,
+    pub basis_mid_bps: Decimal,
+    pub basis_open_buy_primary_bps: Decimal,
+    pub basis_open_sell_primary_bps: Decimal,
+    pub primary_mark_price: Option<Decimal>,
+    pub primary_spot_price: Option<Decimal>,
+    pub is_simulated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct HedgeSimulationEvent {
+    pub ts: DateTime<Utc>,
+    pub symbol: String,
+    pub hedge_venue: String,
+    pub action: String,
+    pub status: String,
+    pub primary_fill_side: Side,
+    pub primary_fill_price: Decimal,
+    pub primary_fill_qty: Decimal,
+    pub hedge_side: Side,
+    pub hedge_price: Option<Decimal>,
+    pub hedge_qty: Decimal,
+    pub basis_mid_bps: Option<Decimal>,
+    pub note: Option<String>,
+    pub is_simulated: bool,
+}
+
+#[derive(Clone, Debug)]
+pub struct HedgeSimulationSnapshot {
+    pub ts: DateTime<Utc>,
+    pub symbol: String,
+    pub hedge_venue: String,
+    pub trigger: String,
+    pub primary_position: Decimal,
+    pub primary_entry_price: Decimal,
+    pub primary_mark_price: Option<Decimal>,
+    pub hedge_position: Decimal,
+    pub hedge_entry_price: Decimal,
+    pub hedge_mid_price: Option<Decimal>,
+    pub net_position: Decimal,
+    pub primary_unrealized_pnl: Decimal,
+    pub hedge_unrealized_pnl: Decimal,
+    pub hedge_realized_pnl: Decimal,
+    pub total_pnl: Decimal,
     pub is_simulated: bool,
 }
 

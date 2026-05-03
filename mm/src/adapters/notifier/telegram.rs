@@ -3,6 +3,7 @@ use std::{sync::Arc, time::Duration};
 use anyhow::Result;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use serde_json::from_str;
 use tokio::{sync::Mutex, time::Instant};
 use tracing::warn;
 
@@ -81,8 +82,25 @@ impl TelegramNotifier {
             })
             .send()
             .await?;
-        let body: TelegramGetUpdatesResponse = response.json().await?;
+        let body_text = response.text().await?;
+        let body: TelegramGetUpdatesResponse = match from_str(&body_text) {
+            Ok(body) => body,
+            Err(err) => {
+                let body_preview: String = body_text.chars().take(512).collect();
+                warn!(
+                    ?err,
+                    body = %body_preview,
+                    "telegram getUpdates returned an unparseable response"
+                );
+                return Ok(Vec::new());
+            }
+        };
         if !body.ok {
+            warn!(
+                error_code = ?body.error_code,
+                description = ?body.description,
+                "telegram getUpdates returned non-ok response"
+            );
             return Ok(Vec::new());
         }
 
@@ -195,7 +213,10 @@ struct TelegramGetUpdatesRequest {
 #[derive(Deserialize)]
 struct TelegramGetUpdatesResponse {
     ok: bool,
+    #[serde(default)]
     result: Vec<TelegramUpdate>,
+    error_code: Option<i64>,
+    description: Option<String>,
 }
 
 #[derive(Deserialize)]

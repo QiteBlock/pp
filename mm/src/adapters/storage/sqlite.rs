@@ -9,7 +9,8 @@ use crate::{
     config::StorageConfig,
     core::state::BotState,
     domain::{
-        BookSnapshot, CancelEvent, Fill, FillStorageTelemetry, FundingPaymentEvent, LatencySample,
+        BookSnapshot, CancelEvent, CrossVenueBasisSample, Fill, FillStorageTelemetry,
+        FundingPaymentEvent, HedgeSimulationEvent, HedgeSimulationSnapshot, LatencySample,
         MidPriceSample, OrderRejectionEvent, Position, QuoteFilterEvent, QuotePlacementEvent,
         StrategySnapshot,
     },
@@ -229,6 +230,61 @@ impl FillStore {
                 payment_type TEXT NOT NULL,
                 amount TEXT NOT NULL,
                 note TEXT,
+                is_simulated INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS cross_venue_basis_samples (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                primary_venue TEXT NOT NULL,
+                hedge_venue TEXT NOT NULL,
+                primary_bid TEXT NOT NULL,
+                primary_ask TEXT NOT NULL,
+                primary_mid TEXT NOT NULL,
+                hedge_bid TEXT NOT NULL,
+                hedge_ask TEXT NOT NULL,
+                hedge_mid TEXT NOT NULL,
+                basis_mid_bps TEXT NOT NULL,
+                basis_open_buy_primary_bps TEXT NOT NULL,
+                basis_open_sell_primary_bps TEXT NOT NULL,
+                primary_mark_price TEXT,
+                primary_spot_price TEXT,
+                is_simulated INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS hedge_simulation_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                hedge_venue TEXT NOT NULL,
+                action TEXT NOT NULL,
+                status TEXT NOT NULL,
+                primary_fill_side TEXT NOT NULL,
+                primary_fill_price TEXT NOT NULL,
+                primary_fill_qty TEXT NOT NULL,
+                hedge_side TEXT NOT NULL,
+                hedge_price TEXT,
+                hedge_qty TEXT NOT NULL,
+                basis_mid_bps TEXT,
+                note TEXT,
+                is_simulated INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS hedge_simulation_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                hedge_venue TEXT NOT NULL,
+                trigger TEXT NOT NULL,
+                primary_position TEXT NOT NULL,
+                primary_entry_price TEXT NOT NULL,
+                primary_mark_price TEXT,
+                hedge_position TEXT NOT NULL,
+                hedge_entry_price TEXT NOT NULL,
+                hedge_mid_price TEXT,
+                net_position TEXT NOT NULL,
+                primary_unrealized_pnl TEXT NOT NULL,
+                hedge_unrealized_pnl TEXT NOT NULL,
+                hedge_realized_pnl TEXT NOT NULL,
+                total_pnl TEXT NOT NULL,
                 is_simulated INTEGER NOT NULL
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_funding_payments_unique
@@ -765,6 +821,110 @@ impl FillStore {
                     .context("failed to parse stored funding payment timestamp")
             })
             .transpose()
+    }
+
+    pub fn insert_cross_venue_basis_sample(&self, sample: &CrossVenueBasisSample) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fill store mutex poisoned"))?;
+        connection.execute(
+            "INSERT INTO cross_venue_basis_samples (
+                ts, symbol, primary_venue, hedge_venue,
+                primary_bid, primary_ask, primary_mid,
+                hedge_bid, hedge_ask, hedge_mid,
+                basis_mid_bps, basis_open_buy_primary_bps, basis_open_sell_primary_bps,
+                primary_mark_price, primary_spot_price, is_simulated
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                sample.ts.to_rfc3339(),
+                sample.symbol,
+                sample.primary_venue,
+                sample.hedge_venue,
+                sample.primary_bid.to_string(),
+                sample.primary_ask.to_string(),
+                sample.primary_mid.to_string(),
+                sample.hedge_bid.to_string(),
+                sample.hedge_ask.to_string(),
+                sample.hedge_mid.to_string(),
+                sample.basis_mid_bps.to_string(),
+                sample.basis_open_buy_primary_bps.to_string(),
+                sample.basis_open_sell_primary_bps.to_string(),
+                sample.primary_mark_price.map(|v| v.to_string()),
+                sample.primary_spot_price.map(|v| v.to_string()),
+                if sample.is_simulated { 1 } else { 0 },
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_hedge_simulation_event(&self, event: &HedgeSimulationEvent) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fill store mutex poisoned"))?;
+        connection.execute(
+            "INSERT INTO hedge_simulation_events (
+                ts, symbol, hedge_venue, action, status,
+                primary_fill_side, primary_fill_price, primary_fill_qty,
+                hedge_side, hedge_price, hedge_qty, basis_mid_bps, note, is_simulated
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                event.ts.to_rfc3339(),
+                event.symbol,
+                event.hedge_venue,
+                event.action,
+                event.status,
+                format!("{:?}", event.primary_fill_side),
+                event.primary_fill_price.to_string(),
+                event.primary_fill_qty.to_string(),
+                format!("{:?}", event.hedge_side),
+                event.hedge_price.map(|v| v.to_string()),
+                event.hedge_qty.to_string(),
+                event.basis_mid_bps.map(|v| v.to_string()),
+                event.note,
+                if event.is_simulated { 1 } else { 0 },
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_hedge_simulation_snapshot(
+        &self,
+        snapshot: &HedgeSimulationSnapshot,
+    ) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fill store mutex poisoned"))?;
+        connection.execute(
+            "INSERT INTO hedge_simulation_snapshots (
+                ts, symbol, hedge_venue, trigger,
+                primary_position, primary_entry_price, primary_mark_price,
+                hedge_position, hedge_entry_price, hedge_mid_price,
+                net_position, primary_unrealized_pnl, hedge_unrealized_pnl,
+                hedge_realized_pnl, total_pnl, is_simulated
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                snapshot.ts.to_rfc3339(),
+                snapshot.symbol,
+                snapshot.hedge_venue,
+                snapshot.trigger,
+                snapshot.primary_position.to_string(),
+                snapshot.primary_entry_price.to_string(),
+                snapshot.primary_mark_price.map(|v| v.to_string()),
+                snapshot.hedge_position.to_string(),
+                snapshot.hedge_entry_price.to_string(),
+                snapshot.hedge_mid_price.map(|v| v.to_string()),
+                snapshot.net_position.to_string(),
+                snapshot.primary_unrealized_pnl.to_string(),
+                snapshot.hedge_unrealized_pnl.to_string(),
+                snapshot.hedge_realized_pnl.to_string(),
+                snapshot.total_pnl.to_string(),
+                if snapshot.is_simulated { 1 } else { 0 },
+            ],
+        )?;
+        Ok(())
     }
 }
 
