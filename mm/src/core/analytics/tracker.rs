@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::domain::Side;
+use crate::domain::{MarkoutEvent, Side};
 use chrono::{DateTime, Duration, Utc};
 use rust_decimal::Decimal;
 
@@ -44,13 +44,19 @@ impl PostFillObservation {
         false
     }
 
-    fn log_if_complete(&self) {
-        let Some(p30) = self.price_30s else { return };
-        let Some(p5) = self.price_5s else { return };
-        let Some(p1) = self.price_1s else { return };
+    fn into_markout_event(self, is_simulated: bool) -> Option<MarkoutEvent> {
+        let Some(p30) = self.price_30s else {
+            return None;
+        };
+        let Some(p5) = self.price_5s else {
+            return None;
+        };
+        let Some(p1) = self.price_1s else {
+            return None;
+        };
         let base = self.fill_price;
         if base <= Decimal::ZERO {
-            return;
+            return None;
         }
         let bps = |p: Decimal| {
             let raw = match self.side {
@@ -59,6 +65,20 @@ impl PostFillObservation {
             };
             raw * Decimal::from(10_000u64)
         };
+        Some(MarkoutEvent {
+            ts: self.timestamp + Duration::seconds(30),
+            symbol: self.symbol,
+            side: self.side,
+            fill_price: self.fill_price,
+            fill_ts: self.timestamp,
+            price_1s: p1,
+            price_5s: p5,
+            price_30s: p30,
+            markout_1s_bps: bps(p1),
+            markout_5s_bps: bps(p5),
+            markout_30s_bps: bps(p30),
+            is_simulated,
+        })
     }
 }
 
@@ -182,6 +202,7 @@ pub struct FillTracker {
     pending: VecDeque<TrackedFill>,
     scores: HashMap<String, HashMap<(Side, usize), LevelToxicityScore>>,
     post_fill: HashMap<String, Vec<PostFillObservation>>,
+    markout_30s_history: HashMap<(String, Side), VecDeque<Decimal>>,
     fill_rate: HashMap<String, FillRateState>,
     kappa: HashMap<String, KappaState>,
     /// Symbols that had a level-0 fill since the last `record_quote_cycle` call.
@@ -246,10 +267,13 @@ impl FillTracker {
         symbol: &str,
         reference_price: Decimal,
         timestamp: DateTime<Utc>,
-    ) {
+        is_simulated: bool,
+    ) -> Vec<MarkoutEvent> {
         if reference_price <= Decimal::ZERO {
-            return;
+            return Vec::new();
         }
+
+        let mut completed_markouts = Vec::new();
 
         // Toxicity observation (15-second window).
         let mut finished = Vec::new();
@@ -287,13 +311,29 @@ impl FillTracker {
             for mut obs in observations.drain(..) {
                 let done = obs.observe(reference_price, timestamp);
                 if done {
-                    obs.log_if_complete();
+                    if let Some(event) = obs.into_markout_event(is_simulated) {
+                        self.markout_30s_history
+                            .entry((event.symbol.clone(), event.side))
+                            .or_default()
+                            .push_back(event.markout_30s_bps);
+                        if let Some(history) = self
+                            .markout_30s_history
+                            .get_mut(&(event.symbol.clone(), event.side))
+                        {
+                            while history.len() > 200 {
+                                history.pop_front();
+                            }
+                        }
+                        completed_markouts.push(event);
+                    }
                 } else {
                     keep.push(obs);
                 }
             }
             *observations = keep;
         }
+
+        completed_markouts
     }
 
     pub fn decay(&mut self, now: DateTime<Utc>) {
@@ -341,6 +381,21 @@ impl FillTracker {
         self.kappa
             .get(symbol)?
             .kappa_estimate(min_cycles, half_spread_frac)
+    }
+
+    pub fn trailing_markout_30s_avg_bps(
+        &self,
+        symbol: &str,
+        side: Side,
+        window: usize,
+    ) -> Option<Decimal> {
+        let history = self.markout_30s_history.get(&(symbol.to_string(), side))?;
+        let take = history.len().min(window);
+        if take == 0 {
+            return None;
+        }
+        let sum: Decimal = history.iter().rev().take(take).copied().sum();
+        Some(sum / Decimal::from(take as u64))
     }
 }
 

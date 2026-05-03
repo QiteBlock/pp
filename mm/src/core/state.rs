@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -27,6 +27,7 @@ pub struct BotState {
     pub pnl: PnlState,
     pub account_equity: Decimal,
     pub startup_account_equity: Option<Decimal>,
+    pub unwind_active: HashSet<String>,
     maker_fee_rate: Decimal,
     /// Set to `Some(deadline)` on stream reconnect; position WS updates are
     /// ignored until the deadline to let fill-replay settle first.
@@ -44,6 +45,7 @@ impl BotState {
             pnl: PnlState::default(),
             account_equity: Decimal::ZERO,
             startup_account_equity: None,
+            unwind_active: HashSet::new(),
             maker_fee_rate,
             position_settle_until: None,
         }

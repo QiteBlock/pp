@@ -29,7 +29,7 @@ runtime:
   scan_limit: 200
   scan_pages: 10
   scan_candidate_cap: 100
-  max_active_markets: 2
+  max_active_markets: 20
   unwind_escalation_cycles: 3
   fill_cooldown_seconds: 90
   reconciliation_interval_loops: 25
@@ -47,8 +47,8 @@ pricing:
   quote_improvement_ticks: 1
 
 risk:
-  max_yes_shares_per_market: 25
-  max_no_shares_per_market: 25
+  max_yes_shares_per_market: 5
+  max_no_shares_per_market: 5
   max_net_delta_per_market: 10
   max_total_exposure_usdc: 150
   max_drawdown_usdc: 75

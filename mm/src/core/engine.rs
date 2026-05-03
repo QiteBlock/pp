@@ -36,7 +36,7 @@ use crate::{
     domain::{
         BookSnapshot, CancelEvent, CrossVenueBasisSample, ExternalVenue, Fill,
         FillStorageTelemetry, FundingPaymentEvent, HedgeSimulationEvent, HedgeSimulationSnapshot,
-        InstrumentMeta, LatencySample, MarketEvent, MarketRegime, MidPriceSample,
+        InstrumentMeta, LatencySample, MarketEvent, MarketRegime, MarkoutEvent, MidPriceSample,
         OrderRejectionEvent, OrderRequest, OrderType, PrivateEvent, QuoteFilterEvent,
         QuotePlacementEvent, Side, StrategySnapshot, TimeInForce,
     },
@@ -176,6 +176,43 @@ where
     fn persist_latency_sample(&self, sample: LatencySample) -> Result<()> {
         if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
             fill_store.insert_latency_sample(&sample)?;
+        }
+        Ok(())
+    }
+
+    fn persist_markout_event(&self, event: MarkoutEvent) -> Result<()> {
+        if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
+            fill_store.insert_markout_event(&event)?;
+        }
+        Ok(())
+    }
+
+    fn handle_completed_markouts(
+        &self,
+        fill_tracker: &FillTracker,
+        completed_markouts: Vec<MarkoutEvent>,
+    ) -> Result<()> {
+        let auto_pause_threshold_bps = Decimal::from(-5i32);
+        for event in completed_markouts {
+            let symbol = event.symbol.clone();
+            let side = event.side;
+            self.persist_markout_event(event)?;
+            if !self.control.is_paused() {
+                if let Some(avg_markout_30s_bps) =
+                    fill_tracker.trailing_markout_30s_avg_bps(&symbol, side, 50)
+                {
+                    if avg_markout_30s_bps < auto_pause_threshold_bps {
+                        self.control.pause();
+                        warn!(
+                            symbol = %symbol,
+                            side = ?side,
+                            trailing_30s_markout_bps = %avg_markout_30s_bps,
+                            threshold_bps = %auto_pause_threshold_bps,
+                            "auto-paused runtime after adverse trailing 30s markout"
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -581,7 +618,6 @@ where
         // quoting until the position is fully cleared, even if flow briefly dips
         // below the spike threshold (prevents oscillation around the threshold).
         let mut flow_spike_committed: HashSet<String> = HashSet::new();
-        let mut inventory_unwind_committed: HashSet<String> = HashSet::new();
         // Post-fill widen: tracks (symbol, side_to_widen) → Instant when widen expires.
         // After a fill on side S, widen the opposite side for post_fill_widen_secs.
         let mut post_fill_widen: HashMap<(String, Side), Instant> = HashMap::new();
@@ -590,6 +626,7 @@ where
         let force_market_reconnect_after = Duration::from_secs(30);
         let mut live_quote_metadata: HashMap<(String, Side, usize), LiveQuoteMetadata> =
             HashMap::new();
+        let mut pending_cancel_order_ids: HashMap<String, Instant> = HashMap::new();
         let mut last_mid_sample_at: HashMap<String, Instant> = HashMap::new();
         let mut last_book_snapshot_at: HashMap<String, Instant> = HashMap::new();
         let mut last_basis_sample_at: HashMap<String, Instant> = HashMap::new();
@@ -615,6 +652,7 @@ where
                         &mut minute_stats,
                         &mut cumulative_traded_volume,
                         &mut live_quote_metadata,
+                        &mut pending_cancel_order_ids,
                         &mut hedge_simulator,
                     ).await? {
                         if !fs.is_simulated {
@@ -660,6 +698,7 @@ where
                             &mut minute_stats,
                             &mut cumulative_traded_volume,
                             &mut live_quote_metadata,
+                            &mut pending_cancel_order_ids,
                             &mut hedge_simulator,
                         ).await? {
                             if !fs.is_simulated {
@@ -679,10 +718,12 @@ where
                         }
                     }
 
+                    let effective_open_orders_count =
+                        effective_live_open_order_count(&state, &pending_cancel_order_ids);
                     if matches!(
                         last_breaker_message.as_deref(),
                         Some(message) if message.contains("open order count limit breached")
-                    ) && state.open_orders.len() <= self.config.risk.max_open_orders
+                    ) && effective_open_orders_count <= self.config.risk.max_open_orders
                     {
                         circuit_breaker.force_reset();
                         last_breaker_message = None;
@@ -745,7 +786,12 @@ where
                         }
                     }
 
-                    if let Err(err) = run_security_checks(&self.config, &self.parsed, &state) {
+                    if let Err(err) = run_security_checks(
+                        &self.config,
+                        &self.parsed,
+                        &state,
+                        effective_open_orders_count,
+                    ) {
                         circuit_breaker.trip(err.to_string());
                     } else {
                         circuit_breaker.reset();
@@ -772,7 +818,13 @@ where
                                 ))?;
                             }
                             self.exchange.cancel_all_orders().await?;
+                            state.open_orders.clear();
                             live_quote_metadata.clear();
+                            pending_cancel_order_ids.clear();
+                            if breaker_message.contains("open order count limit breached") {
+                                let exchange_orders = self.exchange.fetch_open_orders().await?;
+                                state.apply_private_event(PrivateEvent::OpenOrders(exchange_orders));
+                            }
                             if should_flatten_on_breaker(&breaker_message) {
                                 flatten_account_state(
                                     self.exchange.as_ref(),
@@ -827,7 +879,7 @@ where
                         .collect();
                     let desired = self.build_desired_orders(
                         &mut factors,
-                        &state,
+                        &mut state,
                         &instrument_by_symbol,
                         &fill_tracker,
                         degraded,
@@ -835,7 +887,6 @@ where
                         health.rest_failure_count(),
                         &emergency_unwind_symbols,
                         &side_cooldown,
-                        &mut inventory_unwind_committed,
                         &mut flow_spike_committed,
                         &post_fill_widen,
                     )?;
@@ -980,6 +1031,7 @@ where
                         self.exchange.cancel_all_orders().await?;
                         state.open_orders.clear();
                         live_quote_metadata.clear();
+                        pending_cancel_order_ids.clear();
                         last_generation_at = None;
                         continue;
                     }
@@ -989,127 +1041,86 @@ where
                         current_orders,
                         &desired,
                     )?;
-                    if recon.should_update() {
+                    let cancel_guard_window = pending_cancel_guard_window(
+                        self.config.runtime.reconcile_interval_ms,
+                    );
+                    prune_stale_pending_cancels(
+                        &mut pending_cancel_order_ids,
+                        cancel_guard_window,
+                    );
+                    let duplicate_live_guard_ms = i64::try_from(
+                        self.config
+                            .runtime
+                            .reconcile_interval_ms
+                            .saturating_mul(10)
+                            .max(10_000),
+                    )
+                    .unwrap_or(10_000);
+                    let effective_to_place = suppress_duplicate_live_order_requests(
+                        recon.to_place.clone(),
+                        &live_quote_metadata,
+                        Utc::now(),
+                        chrono::Duration::milliseconds(duplicate_live_guard_ms),
+                    );
+                    if !recon.to_cancel_order_ids.is_empty() || !effective_to_place.is_empty() {
                         if self.config.runtime.dry_run {
-                            state.apply_dry_run_plan(&recon.to_cancel_order_ids, &recon.to_place);
+                            state.apply_dry_run_plan(&recon.to_cancel_order_ids, &effective_to_place);
                             log_dry_run_inventory(&state);
-                            log_dry_run_orders(&recon.to_place);
+                            log_dry_run_orders(&effective_to_place);
                             last_generation_at = Some(Instant::now());
                         } else {
                             let decision_ts = Utc::now();
                             // Set last_generation_at before the await so any ticker ticks
                             // that fire during cancel/place are blocked by the cooldown guard.
                             last_generation_at = Some(Instant::now());
-                            let (pre_cancel_candidates, post_cancel_candidates) =
-                                split_orders_for_two_phase_place(
-                                    &current_orders_snapshot,
-                                    &recon.to_place,
-                                    self.config.risk.max_open_orders,
-                                );
-
-                            let filtered_pre_cancel = filter_orders_against_current_bbo(
+                            let filtered_desired = filter_orders_against_current_bbo(
                                 &self.parsed,
                                 &state,
-                                &pre_cancel_candidates,
+                                &desired,
                             );
-                            if !filtered_pre_cancel.is_empty() {
-                                let ready_to_place_ts = Utc::now();
-                                let place_dispatch_ts = Utc::now();
-                                if let Err(err) =
-                                    self.exchange.place_orders(filtered_pre_cancel.clone()).await
-                                {
-                                    let reason = err.to_string();
-                                    for order in &filtered_pre_cancel {
-                                        self.persist_order_rejection(OrderRejectionEvent {
-                                            ts: Utc::now(),
-                                            symbol: order.symbol.clone(),
-                                            side: order.side,
-                                            level_index: Some(order.level_index as i64),
-                                            price: order.price,
-                                            quantity: order.quantity,
-                                            reason: reason.clone(),
-                                            stage: "exchange_place_pre_cancel".to_string(),
-                                            is_simulated: self.config.runtime.dry_run,
-                                        })?;
-                                    }
-                                    return Err(err);
-                                }
-                                let place_response_ts = Utc::now();
-                                self.record_successful_quote_placements(
-                                    &state,
-                                    &filtered_pre_cancel,
-                                    &current_orders_snapshot,
-                                    PlacementTiming {
-                                        decision_ts,
-                                        cancel_start_ts: None,
-                                        cancel_done_ts: None,
-                                        ready_to_place_ts,
-                                        place_dispatch_ts,
-                                        place_response_ts,
-                                    },
-                                    &mut live_quote_metadata,
-                                )?;
-                            }
-
                             let mut cancel_start_ts = None;
                             let mut cancel_done_ts = None;
-                            if !recon.to_cancel_order_ids.is_empty() {
-                                let cancel_ids: HashSet<&str> =
-                                    recon.to_cancel_order_ids.iter().map(String::as_str).collect();
+
+                            if !current_orders_snapshot.is_empty() {
                                 for order in &current_orders_snapshot {
-                                    if order
-                                        .order_id
-                                        .as_deref()
-                                        .map(|id| cancel_ids.contains(id))
-                                        .unwrap_or(false)
-                                    {
-                                        self.persist_cancel_event(build_cancel_event(
-                                            order,
-                                            "reconcile_replace",
-                                            decision_ts,
-                                            self.config.runtime.dry_run,
-                                            &live_quote_metadata,
-                                        ))?;
-                                    }
+                                    self.persist_cancel_event(build_cancel_event(
+                                        order,
+                                        "reconcile_cancel_all_before_replace",
+                                        decision_ts,
+                                        self.config.runtime.dry_run,
+                                        &live_quote_metadata,
+                                    ))?;
                                 }
                                 let started_at = Utc::now();
-                                self.exchange
-                                    .cancel_orders(recon.to_cancel_order_ids.clone())
-                                    .await?;
+                                self.exchange.cancel_all_orders().await?;
                                 let done_at = Utc::now();
                                 cancel_start_ts = Some(started_at);
                                 cancel_done_ts = Some(done_at);
+                                let cancel_order_ids: Vec<String> = current_orders_snapshot
+                                    .iter()
+                                    .filter_map(|order| order.order_id.clone())
+                                    .collect();
                                 self.persist_cancel_latency_samples(
                                     &current_orders_snapshot,
-                                    &recon.to_cancel_order_ids,
+                                    &cancel_order_ids,
                                     decision_ts,
                                     started_at,
                                     done_at,
                                 )?;
-                                for order_id in &recon.to_cancel_order_ids {
-                                    state.open_orders.remove(order_id);
-                                }
-                                live_quote_metadata.retain(|_, meta| {
-                                    !recon
-                                        .to_cancel_order_ids
-                                        .iter()
-                                        .any(|order_id| meta.order_id.as_deref() == Some(order_id.as_str()))
-                                });
+                                state.open_orders.clear();
+                                live_quote_metadata.clear();
+                                pending_cancel_order_ids.clear();
                             }
 
-                            let filtered_post_cancel = filter_orders_against_current_bbo(
-                                &self.parsed,
-                                &state,
-                                &post_cancel_candidates,
-                            );
-                            if !filtered_post_cancel.is_empty() {
-                                let ready_to_place_ts = Utc::now();
+                            if !filtered_desired.is_empty() {
+                                let ready_to_place_ts =
+                                    cancel_done_ts.unwrap_or_else(Utc::now);
                                 let place_dispatch_ts = Utc::now();
                                 if let Err(err) =
-                                    self.exchange.place_orders(filtered_post_cancel.clone()).await
+                                    self.exchange.place_orders(filtered_desired.clone()).await
                                 {
                                     let reason = err.to_string();
-                                    for order in &filtered_post_cancel {
+                                    for order in &filtered_desired {
                                         self.persist_order_rejection(OrderRejectionEvent {
                                             ts: Utc::now(),
                                             symbol: order.symbol.clone(),
@@ -1118,7 +1129,7 @@ where
                                             price: order.price,
                                             quantity: order.quantity,
                                             reason: reason.clone(),
-                                            stage: "exchange_place_post_cancel".to_string(),
+                                            stage: "exchange_place_after_cancel_all".to_string(),
                                             is_simulated: self.config.runtime.dry_run,
                                         })?;
                                     }
@@ -1127,7 +1138,7 @@ where
                                 let place_response_ts = Utc::now();
                                 self.record_successful_quote_placements(
                                     &state,
-                                    &filtered_post_cancel,
+                                    &filtered_desired,
                                     &current_orders_snapshot,
                                     PlacementTiming {
                                         decision_ts,
@@ -1168,7 +1179,13 @@ where
                         if let Some(price) = state.market.symbols.get(&pair.symbol)
                             .and_then(|s| s.mark_price.or_else(|| s.mid_price()))
                         {
-                            fill_tracker.observe_price(&pair.symbol, price, now);
+                            let completed_markouts = fill_tracker.observe_price(
+                                &pair.symbol,
+                                price,
+                                now,
+                                self.config.runtime.dry_run,
+                            );
+                            self.handle_completed_markouts(&fill_tracker, completed_markouts)?;
                             self.maybe_persist_mid_price_sample(
                                 &state,
                                 &pair.symbol,
@@ -1288,7 +1305,13 @@ where
                         last_breaker_message = None;
                     }
                     if let Some((symbol, reference_price, timestamp)) = market_reference(&state, &event) {
-                        fill_tracker.observe_price(&symbol, reference_price, timestamp);
+                        let completed_markouts = fill_tracker.observe_price(
+                            &symbol,
+                            reference_price,
+                            timestamp,
+                            self.config.runtime.dry_run,
+                        );
+                        self.handle_completed_markouts(&fill_tracker, completed_markouts)?;
                     }
                     fill_tracker.decay(Utc::now());
                     if self.config.runtime.dry_run {
@@ -1383,6 +1406,7 @@ where
         minute_stats: &mut MinuteStats,
         cumulative_traded_volume: &mut Decimal,
         live_quote_metadata: &mut HashMap<(String, Side, usize), LiveQuoteMetadata>,
+        pending_cancel_order_ids: &mut HashMap<String, Instant>,
         hedge_simulator: &mut HedgeSimulator,
     ) -> Result<Option<FillStats>> {
         match event {
@@ -1402,6 +1426,7 @@ where
                 Ok(Some(fs))
             }
             PrivateEvent::OpenOrders(orders) => {
+                reconcile_pending_cancels_with_open_orders(&orders, pending_cancel_order_ids);
                 let ack_ts = Utc::now();
                 for order in &orders {
                     self.record_quote_ack(order, ack_ts, force_simulated, live_quote_metadata)?;
@@ -1416,6 +1441,9 @@ where
                 Ok(None)
             }
             PrivateEvent::RemoveOpenOrder { order_id, nonce } => {
+                if let Some(order_id) = order_id.as_deref() {
+                    pending_cancel_order_ids.remove(order_id);
+                }
                 self.clear_live_quote_metadata(order_id.as_deref(), nonce, live_quote_metadata);
                 state.apply_private_event(PrivateEvent::RemoveOpenOrder { order_id, nonce });
                 Ok(None)
@@ -1502,7 +1530,13 @@ where
                             .or_else(|| market.mid_price()),
                     })
             {
-                fill_tracker.observe_price(&fill.symbol, reference_price, fill.timestamp);
+                let completed_markouts = fill_tracker.observe_price(
+                    &fill.symbol,
+                    reference_price,
+                    fill.timestamp,
+                    self.config.runtime.dry_run,
+                );
+                self.handle_completed_markouts(fill_tracker, completed_markouts)?;
             }
         }
         if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
@@ -1690,7 +1724,7 @@ where
     fn build_desired_orders(
         &self,
         factors: &mut FactorEngine,
-        state: &BotState,
+        state: &mut BotState,
         instrument_by_symbol: &HashMap<String, InstrumentMeta>,
         fill_tracker: &FillTracker,
         degraded: bool,
@@ -1698,7 +1732,6 @@ where
         _rest_failures: usize,
         emergency_unwind_symbols: &HashSet<String>,
         side_cooldown: &HashMap<(String, Side), Instant>,
-        inventory_unwind_committed: &mut HashSet<String>,
         flow_spike_committed: &mut HashSet<String>,
         post_fill_widen: &HashMap<(String, Side), Instant>,
     ) -> Result<Vec<OrderRequest>> {
@@ -1712,8 +1745,18 @@ where
         let unwind_only_exit_ratio = Decimal::new(3, 2);
         let hard_vpin_skip_threshold = Decimal::new(95, 2);
         let passive_stale_close_spread_bps = Decimal::from(30u64);
-        let position_hold_timeout =
+        let legacy_position_hold_timeout =
             ChronoDuration::seconds(self.parsed.risk.stale_position_timeout_secs as i64);
+        let bid_position_hold_timeout = if self.parsed.risk.stale_position_bid_hold_secs > 0 {
+            ChronoDuration::seconds(self.parsed.risk.stale_position_bid_hold_secs as i64)
+        } else {
+            legacy_position_hold_timeout
+        };
+        let ask_position_hold_timeout = if self.parsed.risk.stale_position_ask_hold_secs > 0 {
+            ChronoDuration::seconds(self.parsed.risk.stale_position_ask_hold_secs as i64)
+        } else {
+            legacy_position_hold_timeout
+        };
         let stale_close_slippage_cap_frac =
             self.parsed.risk.stale_position_close_slippage_cap_bps / Decimal::from(10_000u64);
         let stale_close_chunk_base = self.parsed.risk.stale_position_close_chunk_base;
@@ -1727,13 +1770,21 @@ where
         let mut stale_flatten_orders = Vec::new();
         let mut stale_maker_unwind_symbols = HashSet::new();
 
-        if self.parsed.risk.stale_position_timeout_secs > 0 {
+        if self.parsed.risk.stale_position_timeout_secs > 0
+            || self.parsed.risk.stale_position_bid_hold_secs > 0
+            || self.parsed.risk.stale_position_ask_hold_secs > 0
+        {
             for pair in &enabled_pairs {
                 let Some(position) = state.positions.get(&pair.symbol) else {
                     continue;
                 };
                 let Some(opened_at) = position.opened_at else {
                     continue;
+                };
+                let position_hold_timeout = if position.quantity > Decimal::ZERO {
+                    ask_position_hold_timeout
+                } else {
+                    bid_position_hold_timeout
                 };
                 let position_age = now_utc - opened_at;
                 if position_age <= position_hold_timeout {
@@ -2289,14 +2340,14 @@ where
                 unwind_only = false;
             }
             if !actionable_position || parsed_pair.max_position_base <= Decimal::ZERO {
-                inventory_unwind_committed.remove(&pair.symbol);
+                state.unwind_active.remove(&pair.symbol);
             } else {
                 let abs_position = current_position.abs();
                 let enter_threshold = parsed_pair.max_position_base * unwind_only_enter_ratio;
                 let exit_threshold = parsed_pair.max_position_base * unwind_only_exit_ratio;
-                if inventory_unwind_committed.contains(&pair.symbol) {
+                if state.unwind_active.contains(&pair.symbol) {
                     if abs_position <= exit_threshold {
-                        inventory_unwind_committed.remove(&pair.symbol);
+                        state.unwind_active.remove(&pair.symbol);
                         warn!(
                             symbol = %pair.symbol,
                             position = %current_position,
@@ -2306,7 +2357,7 @@ where
                         );
                     }
                 } else if abs_position >= enter_threshold {
-                    inventory_unwind_committed.insert(pair.symbol.clone());
+                    state.unwind_active.insert(pair.symbol.clone());
                     warn!(
                         symbol = %pair.symbol,
                         position = %current_position,
@@ -2317,7 +2368,7 @@ where
                         "inventory exceeded unwind-only trigger; committing to unwind-only until reduced below exit threshold"
                     );
                 }
-                if inventory_unwind_committed.contains(&pair.symbol) {
+                if state.unwind_active.contains(&pair.symbol) {
                     unwind_only = true;
                 }
             }
@@ -2537,27 +2588,31 @@ where
                 );
                 if !is_unwind && min_quote_quantity > Decimal::ZERO && quantity < min_quote_quantity
                 {
-                    self.persist_quote_filter_event(build_quote_filter_event(
-                        &pair.symbol,
-                        self.config.runtime.dry_run,
-                        "below_min_quote_quantity",
-                        quote.side,
-                        quote.level_index,
-                        is_unwind,
-                        unwind_only,
-                        stale_maker_unwind,
-                        emergency_unwind,
-                        current_position,
-                        quantity,
-                        Some(Decimal::ZERO),
-                        None,
-                        Some(price),
-                        None,
-                        Some(quote_min_trade_amount),
-                        best_bid,
-                        best_ask,
-                    ))?;
-                    continue;
+                    if quote.level_index == 0 {
+                        quantity = min_quote_quantity;
+                    } else {
+                        self.persist_quote_filter_event(build_quote_filter_event(
+                            &pair.symbol,
+                            self.config.runtime.dry_run,
+                            "below_min_quote_quantity",
+                            quote.side,
+                            quote.level_index,
+                            is_unwind,
+                            unwind_only,
+                            stale_maker_unwind,
+                            emergency_unwind,
+                            current_position,
+                            quantity,
+                            Some(Decimal::ZERO),
+                            None,
+                            Some(price),
+                            None,
+                            Some(quote_min_trade_amount),
+                            best_bid,
+                            best_ask,
+                        ))?;
+                        continue;
+                    }
                 }
 
                 // Fix 2: for the unwind side, floor quantity to min_trade_amount/price
@@ -3527,6 +3582,183 @@ fn split_orders_for_two_phase_place(
     }
 
     (pre_cancel, post_cancel)
+}
+
+fn pending_cancel_guard_window(reconcile_interval_ms: u64) -> Duration {
+    Duration::from_millis(reconcile_interval_ms.saturating_mul(10).max(10_000))
+}
+
+fn effective_live_open_order_count(
+    state: &BotState,
+    pending_cancel_order_ids: &HashMap<String, Instant>,
+) -> usize {
+    state
+        .open_orders
+        .values()
+        .filter(|order| {
+            order
+                .order_id
+                .as_deref()
+                .map(|order_id| !pending_cancel_order_ids.contains_key(order_id))
+                .unwrap_or(true)
+        })
+        .count()
+}
+
+fn prune_stale_pending_cancels(
+    pending_cancel_order_ids: &mut HashMap<String, Instant>,
+    guard_window: Duration,
+) {
+    pending_cancel_order_ids.retain(|_, started_at| started_at.elapsed() <= guard_window);
+}
+
+fn filter_cancel_ids_against_pending(
+    cancel_ids: Vec<String>,
+    pending_cancel_order_ids: &HashMap<String, Instant>,
+) -> Vec<String> {
+    cancel_ids
+        .into_iter()
+        .filter(|order_id| !pending_cancel_order_ids.contains_key(order_id))
+        .collect()
+}
+
+fn suppress_duplicate_live_order_requests(
+    to_place: Vec<OrderRequest>,
+    live_quote_metadata: &HashMap<(String, Side, usize), LiveQuoteMetadata>,
+    now: DateTime<Utc>,
+    pending_guard_window: chrono::Duration,
+) -> Vec<OrderRequest> {
+    to_place
+        .into_iter()
+        .filter(|order| {
+            let key = (order.symbol.clone(), order.side, order.level_index);
+            let Some(meta) = live_quote_metadata.get(&key) else {
+                return true;
+            };
+            if meta.ack_ts.is_some() || meta.order_id.is_some() {
+                return true;
+            }
+            now - meta.place_dispatch_ts > pending_guard_window
+        })
+        .collect()
+}
+
+fn filter_replace_batches_against_pending_cancels(
+    replace_batches: Vec<(Vec<String>, Vec<OrderRequest>)>,
+    pending_cancel_order_ids: &HashMap<String, Instant>,
+) -> Vec<(Vec<String>, Vec<OrderRequest>)> {
+    let mut filtered_batches = Vec::new();
+    for (cancel_ids, orders) in replace_batches {
+        let mut filtered_cancel_ids = Vec::new();
+        let mut filtered_orders = Vec::new();
+        for (cancel_id, order) in cancel_ids.into_iter().zip(orders.into_iter()) {
+            if pending_cancel_order_ids.contains_key(&cancel_id) {
+                continue;
+            }
+            filtered_cancel_ids.push(cancel_id);
+            filtered_orders.push(order);
+        }
+        if !filtered_cancel_ids.is_empty() {
+            filtered_batches.push((filtered_cancel_ids, filtered_orders));
+        }
+    }
+    filtered_batches
+}
+
+fn reconcile_pending_cancels_with_open_orders(
+    open_orders: &[crate::domain::OpenOrder],
+    pending_cancel_order_ids: &mut HashMap<String, Instant>,
+) {
+    let active_order_ids: HashSet<&str> = open_orders
+        .iter()
+        .filter_map(|order| order.order_id.as_deref())
+        .collect();
+    pending_cancel_order_ids.retain(|order_id, _| active_order_ids.contains(order_id.as_str()));
+}
+
+fn partition_cancel_replace_batches(
+    current_orders: &[crate::domain::OpenOrder],
+    cancel_order_ids: &[String],
+    post_cancel_orders: &[OrderRequest],
+    live_quote_metadata: &HashMap<(String, Side, usize), LiveQuoteMetadata>,
+) -> (
+    Vec<(Vec<String>, Vec<OrderRequest>)>,
+    Vec<String>,
+    Vec<OrderRequest>,
+) {
+    let metadata_level_by_order_id: HashMap<&str, usize> = live_quote_metadata
+        .iter()
+        .filter_map(|((_, _, level), meta)| {
+            meta.order_id.as_deref().map(|order_id| (order_id, *level))
+        })
+        .collect();
+
+    let mut cancel_by_key: HashMap<(String, Side, usize), String> = HashMap::new();
+    let mut unmatched_cancel_ids = Vec::new();
+    let current_by_order_id: HashMap<&str, (String, Side, usize)> = current_orders
+        .iter()
+        .filter_map(|order| {
+            let order_id = order.order_id.as_deref()?;
+            let level_index = order
+                .level_index
+                .or_else(|| metadata_level_by_order_id.get(order_id).copied())?;
+            Some((order_id, (order.symbol.clone(), order.side, level_index)))
+        })
+        .collect();
+
+    for order_id in cancel_order_ids {
+        if let Some(key) = current_by_order_id.get(order_id.as_str()) {
+            cancel_by_key.insert(key.clone(), order_id.clone());
+        } else {
+            unmatched_cancel_ids.push(order_id.clone());
+        }
+    }
+
+    let mut orders_by_key: HashMap<(String, Side, usize), OrderRequest> = HashMap::new();
+    for order in post_cancel_orders {
+        orders_by_key.insert(
+            (order.symbol.clone(), order.side, order.level_index),
+            order.clone(),
+        );
+    }
+
+    let mut replace_entries_by_symbol: HashMap<String, Vec<(usize, String, OrderRequest)>> =
+        HashMap::new();
+    let mut cancel_only_ids = unmatched_cancel_ids;
+    let mut plain_post_cancel_orders = Vec::new();
+
+    for (key, cancel_id) in cancel_by_key {
+        if let Some(order) = orders_by_key.remove(&key) {
+            replace_entries_by_symbol
+                .entry(key.0.clone())
+                .or_default()
+                .push((key.2, cancel_id, order));
+        } else {
+            cancel_only_ids.push(cancel_id);
+        }
+    }
+
+    plain_post_cancel_orders.extend(orders_by_key.into_values());
+
+    let mut replace_batches = Vec::new();
+    for (_symbol, mut entries) in replace_entries_by_symbol {
+        entries.sort_by_key(|(level_index, _, _)| *level_index);
+        let mut offset = 0usize;
+        while offset < entries.len() {
+            let end = (offset + 100).min(entries.len());
+            let chunk = &entries[offset..end];
+            replace_batches.push((
+                chunk
+                    .iter()
+                    .map(|(_, cancel_id, _)| cancel_id.clone())
+                    .collect(),
+                chunk.iter().map(|(_, _, order)| order.clone()).collect(),
+            ));
+            offset = end;
+        }
+    }
+
+    (replace_batches, cancel_only_ids, plain_post_cancel_orders)
 }
 
 fn log_dry_run_inventory(state: &BotState) {

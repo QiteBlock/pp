@@ -99,6 +99,7 @@ pub fn run_security_checks(
     config: &AppConfig,
     parsed: &ParsedConfig,
     state: &BotState,
+    effective_open_orders_count: usize,
 ) -> Result<()> {
     if state.effective_total_pnl() <= -parsed.risk.max_drawdown_usd {
         bail!("drawdown limit breached");
@@ -146,7 +147,7 @@ pub fn run_security_checks(
         bail!("correlated position limit breached");
     }
 
-    if state.open_orders.len() > config.risk.max_open_orders {
+    if effective_open_orders_count > config.risk.max_open_orders {
         bail!("open order count limit breached");
     }
 

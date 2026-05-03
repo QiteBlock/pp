@@ -685,7 +685,7 @@ impl GrvtClient {
             .await
     }
 
-    async fn build_grvt_order_payload(
+    async fn build_grvt_order_value(
         &self,
         request: &OrderRequest,
         instrument: &GrvtInstrument,
@@ -696,7 +696,8 @@ impl GrvtClient {
             .parse()
             .context("invalid grvt private key")?;
         let nonce = self.now_grvt_nonce();
-        let expiration = self.now_nanos()? + (self.config.creation_deadline_ms as i64 * 1_000_000);
+        let create_time_nanos = self.now_nanos()?;
+        let expiration = create_time_nanos + (self.config.creation_deadline_ms as i64 * 1_000_000);
         let quantized_size = grvt_quantize_size(
             request.quantity,
             instrument.base_decimals,
@@ -759,8 +760,8 @@ impl GrvtClient {
                 "chain_id": self.config.grvt_chain_id
             },
             "metadata": {
-                "client_order_id": format!("{nonce}"),
-                "create_time": self.now_nanos()?.to_string()
+                "client_order_id": self.build_grvt_client_order_id(request, create_time_nanos),
+                "create_time": create_time_nanos.to_string()
             }
         });
 
@@ -773,7 +774,72 @@ impl GrvtClient {
             order["builder_fee"] = Value::String(self.config.grvt_builder_fee.clone());
         }
 
-        Ok(json!({ "order": order }))
+        Ok(order)
+    }
+
+    async fn post_grvt_bulk_orders(
+        &self,
+        orders: Vec<Value>,
+        order_ids: Vec<String>,
+    ) -> Result<Value> {
+        let client_order_ids: Vec<String> = orders
+            .iter()
+            .filter_map(extract_grvt_client_order_id)
+            .collect();
+        let mut payload = json!({
+            "sub_account_id": self.config.grvt_sub_account_id,
+            "orders": orders,
+        });
+        if !order_ids.is_empty() {
+            payload["order_ids"] = json!(order_ids);
+        }
+
+        let response = match self
+            .post_trading_order("/full/v2/bulk_orders", &payload)
+            .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                warn!(
+                    create_count = client_order_ids.len(),
+                    ?client_order_ids,
+                    cancel_count = order_ids.len(),
+                    ?order_ids,
+                    payload = %payload,
+                    err = %err,
+                    "grvt bulk_orders request failed"
+                );
+                return Err(err);
+            }
+        };
+        if response.get("error").is_some() {
+            bail!("grvt bulk_orders rejected: {response}");
+        }
+        Ok(response)
+    }
+
+    fn validate_grvt_bulk_cancel_acks(&self, response: &Value) {
+        let cancel_acks = response
+            .get("cancel_acks")
+            .or_else(|| response.get("ca"))
+            .and_then(Value::as_array);
+        if let Some(cancel_acks) = cancel_acks {
+            for ack in cancel_acks {
+                let success = ack
+                    .get("ack")
+                    .or_else(|| ack.get("a"))
+                    .map(|value| match value {
+                        Value::Bool(flag) => *flag,
+                        Value::String(flag) => flag.eq_ignore_ascii_case("true"),
+                        _ => false,
+                    })
+                    .unwrap_or(false);
+                if !success {
+                    warn!(response = %response, "grvt bulk cancel ack returned false");
+                    break;
+                }
+            }
+        }
     }
 
     fn now_grvt_nonce(&self) -> u32 {
@@ -790,6 +856,14 @@ impl GrvtClient {
 
     fn grvt_chain_id(&self) -> u64 {
         self.config.grvt_chain_id.parse::<u64>().unwrap_or(325)
+    }
+
+    fn build_grvt_client_order_id(&self, request: &OrderRequest, create_time_nanos: i64) -> String {
+        let counter = self.nonce_counter.fetch_add(1, Ordering::Relaxed);
+        let level = request.level_index.min(99);
+        let epoch_millis = create_time_nanos / 1_000_000;
+        let counter_suffix = counter % 1_000;
+        format!("{level:02}{epoch_millis}{counter_suffix:03}")
     }
 
     fn now_nanos(&self) -> Result<i64> {
@@ -810,6 +884,47 @@ impl ExchangeClient for GrvtClient {
             .into_values()
             .map(|instrument| instrument.meta)
             .collect())
+    }
+
+    async fn replace_orders(
+        &self,
+        order_ids: Vec<String>,
+        requests: Vec<OrderRequest>,
+    ) -> Result<()> {
+        if requests.is_empty() {
+            return self.cancel_orders(order_ids).await;
+        }
+
+        let instruments = self.instruments_by_symbol().await?;
+        let symbol = requests
+            .first()
+            .map(|request| request.symbol.clone())
+            .context("grvt replace_orders called without requests")?;
+        if requests.iter().any(|request| request.symbol != symbol) {
+            bail!("grvt replace_orders requires all create orders to target the same symbol");
+        }
+        let instrument = instruments
+            .get(&symbol)
+            .with_context(|| format!("missing grvt instrument for {symbol}"))?;
+
+        let mut cancel_offset = 0usize;
+        let mut order_offset = 0usize;
+        while cancel_offset < order_ids.len() || order_offset < requests.len() {
+            let cancel_end = (cancel_offset + 100).min(order_ids.len());
+            let order_end = (order_offset + 100).min(requests.len());
+            let cancel_chunk = order_ids[cancel_offset..cancel_end].to_vec();
+            let mut order_chunk_values = Vec::with_capacity(order_end.saturating_sub(order_offset));
+            for request in &requests[order_offset..order_end] {
+                order_chunk_values.push(self.build_grvt_order_value(request, instrument).await?);
+            }
+            let response = self
+                .post_grvt_bulk_orders(order_chunk_values, cancel_chunk)
+                .await?;
+            self.validate_grvt_bulk_cancel_acks(&response);
+            cancel_offset = cancel_end;
+            order_offset = order_end;
+        }
+        Ok(())
     }
 
     async fn fetch_market_snapshot(&self, symbols: &[String]) -> Vec<MarketEvent> {
@@ -1160,66 +1275,55 @@ impl GrvtClient {
 #[async_trait]
 impl OrderExecutor for GrvtClient {
     async fn place_orders(&self, requests: Vec<OrderRequest>) -> Result<()> {
-        let instruments = Arc::new(self.instruments_by_symbol().await?);
-        let futs = requests.into_iter().map(|request| {
-            let client = self.clone();
-            let instruments = Arc::clone(&instruments);
-            async move {
-                let instrument = instruments
-                    .get(&request.symbol)
-                    .with_context(|| format!("missing grvt instrument for {}", request.symbol))?;
-                let payload = client
-                    .build_grvt_order_payload(&request, instrument)
-                    .await?;
-                let response = match client
-                    .post_trading_order("/full/v1/create_order", &payload)
-                    .await
-                {
-                    Ok(response) => response,
-                    Err(err) if is_grvt_min_notional_error(&err.to_string()) => {
-                        warn!(
-                            symbol = %request.symbol,
-                            side = ?request.side,
-                            order_type = ?request.order_type,
-                            quantity = %request.quantity,
-                            price = ?request.price,
-                            err = %err,
-                            "skipping grvt order rejected below minimum notional"
-                        );
-                        return Ok(());
+        let instruments = self.instruments_by_symbol().await?;
+        let mut requests_by_symbol: HashMap<String, Vec<OrderRequest>> = HashMap::new();
+        for request in requests {
+            requests_by_symbol
+                .entry(request.symbol.clone())
+                .or_default()
+                .push(request);
+        }
+
+        for (symbol, symbol_requests) in requests_by_symbol {
+            let instrument = instruments
+                .get(&symbol)
+                .with_context(|| format!("missing grvt instrument for {symbol}"))?;
+            for order_chunk in symbol_requests.chunks(100) {
+                let mut orders = Vec::with_capacity(order_chunk.len());
+                for request in order_chunk {
+                    match self.build_grvt_order_value(request, instrument).await {
+                        Ok(order) => orders.push(order),
+                        Err(err) if is_grvt_min_notional_error(&err.to_string()) => {
+                            warn!(
+                                symbol = %request.symbol,
+                                side = ?request.side,
+                                order_type = ?request.order_type,
+                                quantity = %request.quantity,
+                                price = ?request.price,
+                                err = %err,
+                                "skipping grvt order rejected below minimum notional"
+                            );
+                        }
+                        Err(err) => return Err(err),
                     }
-                    Err(err) => return Err(err),
-                };
-                if response.get("error").is_some() {
-                    bail!("grvt create_order rejected: {response}");
                 }
-                Ok::<(), anyhow::Error>(())
+                if orders.is_empty() {
+                    continue;
+                }
+                let response = self.post_grvt_bulk_orders(orders, Vec::new()).await?;
+                self.validate_grvt_bulk_cancel_acks(&response);
             }
-        });
-        futures_util::future::try_join_all(futs).await?;
+        }
         Ok(())
     }
 
     async fn cancel_orders(&self, order_ids: Vec<String>) -> Result<()> {
-        let futs = order_ids.into_iter().map(|order_id| {
-            let client = self.clone();
-            async move {
-                let response = client
-                    .post_trading_order(
-                        "/full/v1/cancel_order",
-                        &json!({
-                            "sub_account_id": client.config.grvt_sub_account_id,
-                            "order_id": order_id,
-                        }),
-                    )
-                    .await?;
-                if response.get("error").is_some() {
-                    warn!(response = %response, "grvt cancel_order returned error payload");
-                }
-                Ok::<(), anyhow::Error>(())
-            }
-        });
-        futures_util::future::try_join_all(futs).await?;
+        for chunk in order_ids.chunks(100) {
+            let response = self
+                .post_grvt_bulk_orders(Vec::new(), chunk.to_vec())
+                .await?;
+            self.validate_grvt_bulk_cancel_acks(&response);
+        }
         Ok(())
     }
 
@@ -1394,8 +1498,20 @@ fn parse_market_events(stream_name: &str, frame: &str) -> Result<Vec<MarketEvent
                 taker_side: feed
                     .get("is_taker_buyer")
                     .or_else(|| feed.get("it"))
+                    .or_else(|| feed.get("is_buyer"))
+                    .or_else(|| feed.get("ib"))
                     .and_then(Value::as_bool)
-                    .map(|is_buyer| if is_buyer { Side::Bid } else { Side::Ask }),
+                    .map(|is_buyer| if is_buyer { Side::Bid } else { Side::Ask })
+                    .or_else(|| {
+                        feed.get("side")
+                            .or_else(|| feed.get("sd"))
+                            .and_then(Value::as_str)
+                            .and_then(|side| match side {
+                                "BUY" | "Bid" | "BID" | "buy" | "bid" => Some(Side::Bid),
+                                "SELL" | "Ask" | "ASK" | "sell" | "ask" => Some(Side::Ask),
+                                _ => None,
+                            })
+                    }),
                 timestamp,
             }]
         }
@@ -1497,7 +1613,9 @@ fn parse_grvt_open_order(value: &Value) -> Option<OpenOrder> {
             .and_then(|signature| signature.get("nonce").or_else(|| signature.get("n")))
             .and_then(Value::as_u64)
             .unwrap_or_default(),
-        level_index: None,
+        level_index: extract_grvt_client_order_id(value)
+            .as_deref()
+            .and_then(parse_grvt_level_index_from_client_order_id),
         symbol: grvt_symbol_to_internal(
             leg.get("instrument")
                 .or_else(|| leg.get("i"))
@@ -1518,6 +1636,30 @@ fn parse_grvt_open_order(value: &Value) -> Option<OpenOrder> {
             .and_then(as_decimal),
         remaining_quantity: book_size,
     })
+}
+
+fn extract_grvt_client_order_id(value: &Value) -> Option<String> {
+    value
+        .get("metadata")
+        .and_then(|metadata| {
+            metadata
+                .get("client_order_id")
+                .or_else(|| metadata.get("co"))
+        })
+        .or_else(|| value.get("client_order_id"))
+        .or_else(|| value.get("co"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn parse_grvt_level_index_from_client_order_id(client_order_id: &str) -> Option<usize> {
+    if client_order_id.chars().all(|ch| ch.is_ascii_digit()) && client_order_id.len() >= 2 {
+        return client_order_id.get(0..2)?.parse::<usize>().ok();
+    }
+
+    let after_prefix = client_order_id.strip_prefix("mm-l")?;
+    let level_part = after_prefix.split('-').next()?;
+    level_part.parse::<usize>().ok()
 }
 
 /// Convert a `v1.order` WS feed item into a `PrivateEvent`.

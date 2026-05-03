@@ -52,7 +52,7 @@ pub fn generate_quotes(
     } else {
         parsed.venue.maker_fee_rate + parsed.venue.taker_fee_rate
     };
-    let fee_floor_bps = fee_floor_rate * Decimal::from(10_000u64);
+    let fee_floor_bps = (fee_floor_rate * Decimal::from(10_000u64)).max(Decimal::ONE);
     let flow_spike_widen_mult = factors.flow_spike_widen_multiplier.max(Decimal::ONE);
     let mut max_quote_notional = positive_min_cap(None, Some(v0 * factors.price_index));
     if let Some(parsed_pair) = parsed
@@ -240,8 +240,9 @@ pub fn generate_quotes(
     // S2+P3: size asymmetry: inventory + flow direction.
     let size_skew_weight = parsed.model.position_size_skew_weight;
     let size_skew = (pos_ratio - flow_dir * Decimal::new(5, 1)) * size_skew_weight;
-    let bid_size_skew = (Decimal::ONE - size_skew).max(Decimal::new(2, 1));
-    let ask_size_skew = (Decimal::ONE + size_skew).max(Decimal::new(2, 1));
+    let max_skew = Decimal::new(3, 0);
+    let bid_size_skew = (Decimal::ONE - size_skew).clamp(Decimal::new(2, 1), max_skew);
+    let ask_size_skew = (Decimal::ONE + size_skew).clamp(Decimal::new(2, 1), max_skew);
 
     let mut quotes = Vec::with_capacity(model.n_points * 2);
     let side_notional_cap = max_quote_notional.map(|cap| cap * Decimal::from(2u64));
@@ -261,15 +262,10 @@ pub fn generate_quotes(
             .min(parsed.model.max_spread_bps);
         let level_half_spread_frac = level_spread_bps / Decimal::from(20_000u64); // half-spread
 
-        // Fill-rate competitive skew: when bid fills faster (skew > 0) → lower ask price.
-        // Adjustment only at level 0 (anchor); deeper levels inherit via spread.
-        let fr_ask_adj = if level == 0 {
-            mid * fill_rate_comp_frac * fill_rate_skew.max(Decimal::ZERO)
-        } else {
-            Decimal::ZERO
-        };
-        let fr_bid_adj = if level == 0 {
-            mid * fill_rate_comp_frac * (-fill_rate_skew).max(Decimal::ZERO)
+        // When one side fills faster, shift both quotes in that direction:
+        // tighten the fast side and loosen the opposite side symmetrically.
+        let fr_shift = if level == 0 {
+            mid * fill_rate_comp_frac * fill_rate_skew
         } else {
             Decimal::ZERO
         };
@@ -277,8 +273,7 @@ pub fn generate_quotes(
         // S1: Level 0 anchors to BBO (clamped to A-S); deeper levels step from anchor.
         // OB imbalance multipliers widen the swept side and tighten the safe side.
         let (bid_price, ask_price) = if level == 0 {
-            // Fill-rate: move toward mid on slow-filling side.
-            (anchor_bid + fr_bid_adj, anchor_ask - fr_ask_adj)
+            (anchor_bid + fr_shift, anchor_ask + fr_shift)
         } else {
             let bid_spread =
                 level_half_spread_frac * Decimal::TWO * bid_skew * ob_bid_spread_mult * bid_widen;

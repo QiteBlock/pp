@@ -470,6 +470,22 @@ pub struct LatencySample {
 }
 
 #[derive(Clone, Debug)]
+pub struct MarkoutEvent {
+    pub ts: DateTime<Utc>,
+    pub symbol: String,
+    pub side: Side,
+    pub fill_price: Decimal,
+    pub fill_ts: DateTime<Utc>,
+    pub price_1s: Decimal,
+    pub price_5s: Decimal,
+    pub price_30s: Decimal,
+    pub markout_1s_bps: Decimal,
+    pub markout_5s_bps: Decimal,
+    pub markout_30s_bps: Decimal,
+    pub is_simulated: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct FundingPaymentEvent {
     pub ts: DateTime<Utc>,
     pub symbol: Option<String>,

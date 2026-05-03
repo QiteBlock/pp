@@ -6,4 +6,5 @@ data/*.jsonl
 data/fill_state.json
 data/bot_state.json
 data/telegram_state.json
+data/discovered_positions.json
 .env

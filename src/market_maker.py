@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
+import json
 
 import yaml
 
@@ -48,6 +49,8 @@ class BotContext:
     last_scan_ts: float
     active_market: Optional[MarketConfig]
     active_markets: list[MarketConfig]
+    positions_to_unwind: list[MarketConfig]
+    discovered_positions_path: Path
     filters: dict[str, Any]
 
 
@@ -76,6 +79,7 @@ def run_market_maker(config_path: str) -> None:
                 fills_processed = context.fill_poller.poll_fills(token_mapping)
                 if fills_processed > 0:
                     print(f"Processed {fills_processed} new fill(s)")
+                sync_positions_to_unwind_from_inventory(context)
                 if context.reconciliation_interval_loops > 0 and loop_count % context.reconciliation_interval_loops == 0:
                     reconciliation_report = perform_reconciliation(
                         context,
@@ -130,12 +134,14 @@ def load_context(config_path: str) -> BotContext:
     inventory = InventoryBook()
     analytics = AnalyticsWriter(runtime["log_dir"])
     control = BotControl(runtime["log_dir"])
+    control.enable("startup:forced")
     telegram = TelegramController(config.get("telegram", {}), runtime["log_dir"])
     fill_poller = FillPoller(client, inventory, analytics, runtime["log_dir"], fill_handler=telegram.notify_fill)
     reconciler = PositionReconciler(client, inventory)
     duplicate_detector = OrderDuplicateDetector(runtime["log_dir"])
-    
-    return BotContext(
+    discovered_positions_path = Path(runtime["log_dir"]) / "discovered_positions.json"
+
+    context = BotContext(
         client=client,
         markets=markets,
         pricing=PricingConfig(**config["pricing"]),
@@ -162,8 +168,84 @@ def load_context(config_path: str) -> BotContext:
         last_scan_ts=0.0,
         active_market=None,
         active_markets=[],
+        positions_to_unwind=[],
+        discovered_positions_path=discovered_positions_path,
         filters=config.get("filters", {}),
     )
+    hydrate_discovered_position_markets(context)
+    return context
+
+
+def hydrate_discovered_position_markets(context: BotContext) -> None:
+    persisted_markets = load_discovered_position_markets(context.discovered_positions_path)
+    if not persisted_markets:
+        return
+    merged = merge_unique_markets(context.markets, persisted_markets)
+    if len(merged) != len(context.markets):
+        print(f"Loaded {len(merged) - len(context.markets)} persisted position market(s)")
+    context.markets = merged
+
+
+def load_discovered_position_markets(path: Path) -> list[MarketConfig]:
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, list):
+        return []
+    return parse_market_configs([item for item in payload if isinstance(item, dict)])
+
+
+def save_discovered_position_markets(context: BotContext) -> None:
+    path = context.discovered_positions_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = [
+        market_to_dict(market)
+        for market in context.positions_to_unwind
+        if context.inventory.get(market.slug).gross_shares > 0.01
+    ]
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def market_to_dict(market: MarketConfig) -> dict[str, Any]:
+    return {
+        "slug": market.slug,
+        "question": market.question,
+        "yes_token_id": market.yes_token_id,
+        "no_token_id": market.no_token_id,
+        "end_date": market.end_date.isoformat() if market.end_date else None,
+        "neg_risk": market.neg_risk,
+    }
+
+
+def merge_unique_markets(*market_lists: list[MarketConfig]) -> list[MarketConfig]:
+    merged: list[MarketConfig] = []
+    by_slug: dict[str, int] = {}
+    for markets in market_lists:
+        for market in markets:
+            existing_index = by_slug.get(market.slug)
+            if existing_index is None:
+                by_slug[market.slug] = len(merged)
+                merged.append(market)
+                continue
+            merged[existing_index] = prefer_market_metadata(merged[existing_index], market)
+    return merged
+
+
+def prefer_market_metadata(current: MarketConfig, candidate: MarketConfig) -> MarketConfig:
+    if not current.question and candidate.question:
+        current.question = candidate.question
+    if not current.yes_token_id and candidate.yes_token_id:
+        current.yes_token_id = candidate.yes_token_id
+    if not current.no_token_id and candidate.no_token_id:
+        current.no_token_id = candidate.no_token_id
+    if current.end_date is None and candidate.end_date is not None:
+        current.end_date = candidate.end_date
+    if current.neg_risk is None and candidate.neg_risk is not None:
+        current.neg_risk = candidate.neg_risk
+    return current
 
 
 def _build_token_mapping(context: BotContext) -> dict[str, tuple[str, str]]:
@@ -181,6 +263,9 @@ def _build_token_mapping(context: BotContext) -> dict[str, tuple[str, str]]:
 
 def markets_for_state_tracking(context: BotContext) -> list[MarketConfig]:
     markets = list(context.markets)
+    for unwind_market in context.positions_to_unwind:
+        if all(market.slug != unwind_market.slug for market in markets):
+            markets.append(unwind_market)
     for active_market in context.active_markets:
         if all(market.slug != active_market.slug for market in markets):
             markets.append(active_market)
@@ -189,6 +274,7 @@ def markets_for_state_tracking(context: BotContext) -> list[MarketConfig]:
 
 def perform_reconciliation(context: BotContext, trigger: str, **details: Any) -> Any:
     report = context.reconciler.reconcile_positions(markets_for_state_tracking(context))
+    sync_positions_to_unwind(context, report)
     payload = {
         "trigger": trigger,
         "status": report.status,
@@ -225,6 +311,26 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
     recent_prices = context.client.fetch_market_history(market.yes_token_id)
     signal = build_signal(book.midpoint, book.last_trade_price, recent_prices, market.end_date)
     inventory = context.inventory.get(market.slug)
+    if is_unwind_priority_market(context, market) and inventory.gross_shares > 0.01:
+        process_unwind_market(
+            context,
+            market,
+            inventory,
+            build_yes_quote(
+                context.pricing,
+                signal,
+                inventory.net_delta,
+                book.tick_size,
+                book.spread,
+                best_bid=book.best_bid,
+                best_ask=book.best_ask,
+            ),
+            book,
+            "priority position unwind",
+            mode="flatten",
+            aggressive=False,
+        )
+        return
     inventory_bias = inventory.net_delta
     quote = build_yes_quote(
         context.pricing,
@@ -491,7 +597,7 @@ def process_unwind_market(
                 f"reason={reason}\n"
                 "trading paused, attempting unwind"
             )
-    effective_aggressive = aggressive or (
+    effective_aggressive = mode == "flatten" or aggressive or (
         mode == "trim" and inventory.unwind_cycles_without_fill >= context.unwind_escalation_cycles
     )
     order_request = build_unwind_order_request(
@@ -766,9 +872,10 @@ def build_flatten_order_request(
 
 def bounded_unwind_size(requested_size: float, available_size: float, min_order_size: float) -> Optional[float]:
     available = max(float(available_size), 0.0)
-    if available < min_order_size:
+    requested = max(float(requested_size), 0.0)
+    if available <= 0.0 or requested <= 0.0:
         return None
-    return min(max(float(requested_size), min_order_size), available)
+    return min(requested, available)
 
 
 def prepare_sell_unwind_order(
@@ -779,7 +886,18 @@ def prepare_sell_unwind_order(
 ) -> bool:
     live_balance = get_live_conditional_balance(context, order_request["token_id"])
     if live_balance is None:
-        return True
+        context.analytics.log_event(
+            "unwind_skip",
+            {
+                "market": market.slug,
+                "reason": "conditional balance unavailable for sell unwind",
+                "token_id": order_request["token_id"],
+                "requested_size": order_request["size"],
+                "label": order_request["label"],
+            },
+        )
+        print(f"[{market.slug}] skipped: {order_request['label']} conditional balance unavailable, retry next cycle")
+        return False
     sync_inventory_balance(market, inventory, order_request["token_id"], live_balance)
     adjusted_size = bounded_unwind_size(
         requested_size=min(order_request["size"], live_balance),
@@ -791,17 +909,14 @@ def prepare_sell_unwind_order(
             "unwind_skip",
             {
                 "market": market.slug,
-                "reason": "live balance below min order size for sell unwind",
+                "reason": "live balance unavailable for sell unwind size",
                 "token_id": order_request["token_id"],
                 "requested_size": order_request["size"],
                 "live_balance": live_balance,
                 "label": order_request["label"],
             },
         )
-        print(
-            f"[{market.slug}] skipped: {order_request['label']} live balance {live_balance:.4f} "
-            f"below min order size {context.risk.min_order_size:.4f}"
-        )
+        print(f"[{market.slug}] skipped: {order_request['label']} no available live balance to sell")
         return False
     if adjusted_size + 1e-9 < order_request["size"]:
         context.analytics.log_event(
@@ -820,15 +935,19 @@ def prepare_sell_unwind_order(
 
 
 def get_live_conditional_balance(context: BotContext, token_id: str) -> Optional[float]:
-    try:
-        payload = context.client.get_conditional_balance_allowance(token_id)
-    except Exception as exc:
-        context.analytics.log_event(
-            "conditional_balance_check_error",
-            {"token_id": token_id, "details": str(exc)},
-        )
-        return None
-    return parse_usdc_amount(payload.get("balance"))
+    last_error: Optional[str] = None
+    for attempt in range(2):
+        try:
+            payload = context.client.get_conditional_balance_allowance(token_id)
+            return parse_usdc_amount(payload.get("balance"))
+        except Exception as exc:
+            last_error = str(exc)
+            context.analytics.log_event(
+                "conditional_balance_check_error",
+                {"token_id": token_id, "attempt": attempt + 1, "details": last_error},
+            )
+            time.sleep(0.5)
+    return None
 
 
 def sync_inventory_balance(market: MarketConfig, inventory: Any, token_id: str, live_balance: float) -> None:
@@ -1033,6 +1152,7 @@ def handle_telegram_commands(context: BotContext) -> None:
 def build_status_message(context: BotContext, prefix: str) -> str:
     active_market = context.active_market.slug if context.active_market else "none"
     active_markets = ", ".join(market.slug for market in context.active_markets) if context.active_markets else "none"
+    unwind_markets = ", ".join(market.slug for market in context.positions_to_unwind) if context.positions_to_unwind else "none"
     inventory_lines: list[str] = []
     for market_key, market_inventory in sorted(context.inventory.markets.items()):
         if market_inventory.gross_shares <= 0:
@@ -1048,6 +1168,7 @@ def build_status_message(context: BotContext, prefix: str) -> str:
         f"dry_run={context.dry_run}\n"
         f"active_market={active_market}\n"
         f"active_markets={active_markets}\n"
+        f"positions_to_unwind={unwind_markets}\n"
         f"loop_interval_seconds={context.loop_interval_seconds}\n"
         f"last_control_source={context.control.state.source}\n"
         f"inventory={inventory_text}"
@@ -1152,6 +1273,9 @@ def initialize_market_selection(context: BotContext) -> None:
     if manual_markets and not context.auto_scan_enabled:
         validate_market_config(manual_markets)
         context.markets = manual_markets
+        context.positions_to_unwind = [
+            market for market in manual_markets if context.inventory.get(market.slug).gross_shares > 0.01
+        ]
         context.active_markets = manual_markets[: context.max_active_markets]
         context.active_market = context.active_markets[0] if context.active_markets else None
         return
@@ -1162,6 +1286,9 @@ def initialize_market_selection(context: BotContext) -> None:
 def refresh_market_selection(context: BotContext, force: bool = False) -> None:
     if not context.auto_scan_enabled:
         return
+    context.positions_to_unwind = [
+        market for market in context.positions_to_unwind if context.inventory.get(market.slug).gross_shares > 0.01
+    ]
     now = time.time()
     must_rescan = (
         force
@@ -1261,6 +1388,10 @@ def select_best_markets(context: BotContext) -> Optional[list[MarketConfig]]:
                 continue
             filtered_candidates.append(normalized)
     if not filtered_candidates:
+        fallback = merge_selected_markets(context, [])
+        if fallback:
+            print(f"Market scan found no candidates; keeping {len(fallback)} unwind market(s)")
+            return fallback
         print(f"Market scan found no candidates: raw={raw_count} normalized={normalized_count}")
         return None
     filtered_candidates.sort(key=lambda item: float(item.get("volume_24h", 0.0)), reverse=True)
@@ -1298,6 +1429,14 @@ def select_best_markets(context: BotContext) -> Optional[list[MarketConfig]]:
         score = score_market_candidate(normalized["volume_24h"], spread_bps)
         candidates.append((score, market))
     if not candidates:
+        fallback = merge_selected_markets(context, [])
+        if fallback:
+            print(
+                "Market scan found no live-book candidates; "
+                f"keeping {len(fallback)} unwind market(s): raw={raw_count} normalized={normalized_count} "
+                f"filter_pass={len(filtered_candidates)} checked_books={checked_books}"
+            )
+            return fallback
         print(
             "Market scan found no live-book candidates: "
             f"raw={raw_count} normalized={normalized_count} filter_pass={len(filtered_candidates)} checked_books={checked_books}"
@@ -1318,6 +1457,11 @@ def merge_selected_markets(context: BotContext, ranked_candidates: list[MarketCo
     selected_slugs: set[str] = set()
     ranked_by_slug = {market.slug: market for market in ranked_candidates}
 
+    for market in context.positions_to_unwind:
+        if context.inventory.get(market.slug).gross_shares > 0.01 and market.slug not in selected_slugs:
+            selected.append(ranked_by_slug.get(market.slug, market))
+            selected_slugs.add(market.slug)
+
     for market in context.active_markets:
         if context.inventory.get(market.slug).gross_shares > 0.01 and market.slug not in selected_slugs:
             selected.append(ranked_by_slug.get(market.slug, market))
@@ -1332,6 +1476,85 @@ def merge_selected_markets(context: BotContext, ranked_candidates: list[MarketCo
         selected_slugs.add(market.slug)
 
     return selected[: context.max_active_markets]
+
+
+def sync_positions_to_unwind(context: BotContext, report: Any) -> None:
+    discovered_markets = discover_markets_for_unknown_positions(context, getattr(report, "unknown_positions", {}))
+    context.markets = merge_unique_markets(context.markets, discovered_markets)
+    known_by_slug = {market.slug: market for market in markets_for_state_tracking(context)}
+
+    positions: list[MarketConfig] = []
+    for market in known_by_slug.values():
+        if context.inventory.get(market.slug).gross_shares > 0.01:
+            positions.append(market)
+    positions.sort(key=lambda market: context.inventory.get(market.slug).gross_shares, reverse=True)
+    context.positions_to_unwind = positions
+    save_discovered_position_markets(context)
+
+
+def sync_positions_to_unwind_from_inventory(context: BotContext) -> None:
+    known_by_slug = {market.slug: market for market in markets_for_state_tracking(context)}
+    positions: list[MarketConfig] = []
+    for market in known_by_slug.values():
+        if context.inventory.get(market.slug).gross_shares > 0.01:
+            positions.append(market)
+    positions.sort(key=lambda market: context.inventory.get(market.slug).gross_shares, reverse=True)
+    context.positions_to_unwind = positions
+    save_discovered_position_markets(context)
+
+
+def discover_markets_for_unknown_positions(context: BotContext, unknown_positions: dict[str, float]) -> list[MarketConfig]:
+    target_token_ids = {token_id for token_id, balance in unknown_positions.items() if float(balance or 0.0) > 0.01}
+    if not target_token_ids:
+        return []
+
+    discovered: list[MarketConfig] = []
+    matched_tokens: set[str] = set()
+    scan_pages = max(context.scan_pages, 25)
+
+    for page in range(scan_pages):
+        if matched_tokens == target_token_ids:
+            break
+        try:
+            raw_markets = context.client.scan_markets(limit=context.scan_limit, offset=page * context.scan_limit)
+        except Exception as exc:
+            context.analytics.log_event("position_discovery_scan_error", {"page": page, "details": str(exc)})
+            continue
+        for item in raw_markets:
+            normalized = normalize_gamma_market(item)
+            if not normalized:
+                continue
+            yes_token_id = normalized["yes_token_id"]
+            no_token_id = normalized["no_token_id"]
+            matched_here = False
+            market = MarketConfig(
+                slug=normalized["slug"],
+                question=normalized["question"],
+                yes_token_id=yes_token_id,
+                no_token_id=no_token_id,
+                end_date=parse_end_date(normalized.get("end_date")),
+                neg_risk=normalized.get("neg_risk"),
+            )
+            inventory = context.inventory.get(market.slug)
+            if yes_token_id in target_token_ids:
+                inventory.yes_shares = max(float(unknown_positions[yes_token_id]), 0.0)
+                matched_tokens.add(yes_token_id)
+                matched_here = True
+            if no_token_id in target_token_ids:
+                inventory.no_shares = max(float(unknown_positions[no_token_id]), 0.0)
+                matched_tokens.add(no_token_id)
+                matched_here = True
+            if matched_here and all(existing.slug != market.slug for existing in discovered):
+                discovered.append(market)
+
+    unresolved = sorted(target_token_ids - matched_tokens)
+    if unresolved:
+        context.analytics.log_event("position_discovery_unresolved", {"token_ids": unresolved})
+    return discovered
+
+
+def is_unwind_priority_market(context: BotContext, market: MarketConfig) -> bool:
+    return any(existing.slug == market.slug for existing in context.positions_to_unwind)
 
 
 def market_passes_filters(market: dict[str, Any], filters: dict[str, Any], min_days: float) -> bool:

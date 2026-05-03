@@ -11,8 +11,8 @@ use crate::{
     domain::{
         BookSnapshot, CancelEvent, CrossVenueBasisSample, Fill, FillStorageTelemetry,
         FundingPaymentEvent, HedgeSimulationEvent, HedgeSimulationSnapshot, LatencySample,
-        MidPriceSample, OrderRejectionEvent, Position, QuoteFilterEvent, QuotePlacementEvent,
-        StrategySnapshot,
+        MarkoutEvent, MidPriceSample, OrderRejectionEvent, Position, QuoteFilterEvent,
+        QuotePlacementEvent, StrategySnapshot,
     },
 };
 
@@ -233,6 +233,21 @@ impl FillStore {
                 ack_ts TEXT,
                 client_order_key TEXT,
                 order_id TEXT,
+                is_simulated INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS markout_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                fill_price TEXT NOT NULL,
+                fill_ts TEXT NOT NULL,
+                price_1s TEXT NOT NULL,
+                price_5s TEXT NOT NULL,
+                price_30s TEXT NOT NULL,
+                markout_1s_bps TEXT NOT NULL,
+                markout_5s_bps TEXT NOT NULL,
+                markout_30s_bps TEXT NOT NULL,
                 is_simulated INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS funding_payments (
@@ -832,6 +847,36 @@ impl FillStore {
                 sample.client_order_key,
                 sample.order_id,
                 if sample.is_simulated { 1 } else { 0 },
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn insert_markout_event(&self, event: &MarkoutEvent) -> Result<()> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fill store mutex poisoned"))?;
+        connection.execute(
+            "INSERT INTO markout_events (
+                ts, symbol, side, fill_price, fill_ts,
+                price_1s, price_5s, price_30s,
+                markout_1s_bps, markout_5s_bps, markout_30s_bps,
+                is_simulated
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                event.ts.to_rfc3339(),
+                event.symbol,
+                format!("{:?}", event.side),
+                event.fill_price.to_string(),
+                event.fill_ts.to_rfc3339(),
+                event.price_1s.to_string(),
+                event.price_5s.to_string(),
+                event.price_30s.to_string(),
+                event.markout_1s_bps.to_string(),
+                event.markout_5s_bps.to_string(),
+                event.markout_30s_bps.to_string(),
+                if event.is_simulated { 1 } else { 0 },
             ],
         )?;
         Ok(())

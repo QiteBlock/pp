@@ -573,12 +573,70 @@ impl ExtendedClient {
             }
         }))
     }
+
+    async fn submit_order_payload(&self, op_name: &'static str, payload: &Value) -> Result<()> {
+        let response = self
+            .request_policy
+            .send_with_retry_allow_status(&self.rest_governor, op_name, || {
+                self.http
+                    .post(self.endpoint("/api/v1/user/order"))
+                    .json(payload)
+                    .send()
+            })
+            .await?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            bail!("Extended {op_name} failed with HTTP {status}: {body}");
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl ExchangeClient for ExtendedClient {
     async fn load_instruments(&self) -> Result<Vec<InstrumentMeta>> {
         Ok(self.instruments_by_symbol().await?.into_values().collect())
+    }
+
+    async fn replace_orders(
+        &self,
+        order_ids: Vec<String>,
+        requests: Vec<OrderRequest>,
+    ) -> Result<()> {
+        if order_ids.is_empty() {
+            return self.place_orders(requests).await;
+        }
+        if requests.is_empty() {
+            return self.cancel_orders(order_ids).await;
+        }
+        if order_ids.len() != requests.len() {
+            self.cancel_orders(order_ids).await?;
+            return self.place_orders(requests).await;
+        }
+
+        let maker_fee_rate = parse_decimal_string(&self.config.maker_fee_ratio)?;
+        let taker_fee_rate = parse_decimal_string(&self.config.max_fee_rate)?;
+        let markets = self.markets_by_symbol().await?;
+        let account = self.account_identity().await?;
+
+        for (cancel_id, request) in order_ids.into_iter().zip(requests.into_iter()) {
+            let market = markets
+                .get(&request.symbol)
+                .with_context(|| format!("unknown Extended market {}", request.symbol))?;
+            let mut payload = self.build_order_payload(
+                &request,
+                market,
+                &account,
+                maker_fee_rate,
+                taker_fee_rate,
+            )?;
+            payload["cancelId"] = Value::String(cancel_id);
+            self.submit_order_payload("extended_replace_order", &payload)
+                .await?;
+        }
+
+        Ok(())
     }
 
     async fn fetch_market_snapshot(&self, symbols: &[String]) -> Vec<MarketEvent> {
@@ -800,20 +858,8 @@ impl OrderExecutor for ExtendedClient {
                 maker_fee_rate,
                 taker_fee_rate,
             )?;
-            let response = self
-                .request_policy
-                .send_with_retry_allow_status(&self.rest_governor, "extended_place_order", || {
-                    self.http
-                        .post(self.endpoint("/api/v1/user/order"))
-                        .json(&payload)
-                        .send()
-                })
+            self.submit_order_payload("extended_place_order", &payload)
                 .await?;
-            if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                bail!("Extended place_order failed with HTTP {status}: {body}");
-            }
         }
         Ok(())
     }

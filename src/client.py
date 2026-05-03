@@ -67,6 +67,7 @@ class PolymarketClient:
         self.clob_config = config["clob"]
         self.sdk = config["clob"].get("sdk", "v2")
         self.clob_host = config["clob"]["host"]
+        self.data_api_host = config.get("data", {}).get("host", "https://data-api.polymarket.com").rstrip("/")
         self.chain_id = int(config["clob"]["chain_id"])
         self.gamma_host = config["gamma"]["host"].rstrip("/")
         self.signature_type = config["clob"].get("signature_type", 0)
@@ -387,23 +388,58 @@ class PolymarketClient:
         """Fetch user's current positions (balances of each outcome token).
         Returns dict mapping token_id to balance amount.
         """
-        self.ensure_api_credentials()
-        if self.trading_client is None:
-            raise RuntimeError("Trading client unavailable.")
-        try:
-            if self.sdk == "v1":
-                if hasattr(self.trading_client, "get_balances"):
-                    return self.trading_client.get_balances()
-                if hasattr(self.trading_client, "get_positions"):
-                    return self.trading_client.get_positions()
-            else:
-                if hasattr(self.trading_client, "get_user_balances"):
-                    return self.trading_client.get_user_balances()
-                if hasattr(self.trading_client, "get_positions"):
-                    return self.trading_client.get_positions()
-        except Exception as exc:
-            print(f"Warning: Failed to fetch positions from trading client: {exc}")
-        return {}
+        user_address = self._resolve_positions_user_address()
+        if not user_address:
+            raise RuntimeError(
+                "Unable to determine Polymarket profile/proxy wallet address for position lookup. "
+                "Set clob.funder in config.yaml to the wallet shown in Polymarket."
+            )
+
+        aggregated: dict[str, float] = {}
+        offset = 0
+        limit = 500
+
+        while True:
+            response = self.session.get(
+                f"{self.data_api_host}/positions",
+                params={
+                    "user": user_address,
+                    "sizeThreshold": 0,
+                    "limit": limit,
+                    "offset": offset,
+                },
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, list):
+                raise RuntimeError(f"Unexpected positions payload type: {type(payload).__name__}")
+
+            for item in payload:
+                if not isinstance(item, dict):
+                    continue
+                asset = str(item.get("asset") or "").strip()
+                size = _to_float(item.get("size"))
+                if not asset or size is None:
+                    continue
+                aggregated[asset] = aggregated.get(asset, 0.0) + size
+
+            if len(payload) < limit:
+                break
+            offset += limit
+
+        return aggregated
+
+    def _resolve_positions_user_address(self) -> Optional[str]:
+        if self.funder:
+            return self.funder
+        if self.signature_type == 0 and self.private_key:
+            try:
+                from eth_account import Account  # type: ignore
+            except ImportError:
+                return None
+            return Account.from_key(self.private_key).address
+        return None
 
     def try_upgrade_from_v1_order_version_mismatch(self, exc: Exception) -> bool:
         if self.sdk != "v1":

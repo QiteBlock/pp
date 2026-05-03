@@ -166,7 +166,9 @@ impl CleanupExchange for AnyExchangeClient {
                     .active_cleanup_positions(positions, min_close_notional)
                     .await
             }
-            AnyExchangeClient::Hibachi(_) | AnyExchangeClient::Extended(_) => {
+            AnyExchangeClient::Hibachi(_)
+            | AnyExchangeClient::Extended(_)
+            | AnyExchangeClient::Decibel(_) => {
                 Ok(default_active_positions(positions, min_close_notional))
             }
         }
@@ -185,6 +187,7 @@ impl CleanupExchange for AnyExchangeClient {
             }
             AnyExchangeClient::Hibachi(_) => Ok(()),
             AnyExchangeClient::Extended(_) => Ok(()),
+            AnyExchangeClient::Decibel(_) => Ok(()),
         }
     }
 
@@ -201,6 +204,7 @@ impl CleanupExchange for AnyExchangeClient {
             }
             AnyExchangeClient::Hibachi(_) => Ok(()),
             AnyExchangeClient::Extended(_) => Ok(()),
+            AnyExchangeClient::Decibel(_) => Ok(()),
         }
     }
 

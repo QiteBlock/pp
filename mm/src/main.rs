@@ -3,7 +3,8 @@ use std::{env, sync::Arc};
 use anyhow::{Context, Result};
 use market_making::{
     adapters::exchange::{
-        extended::ExtendedClient, grvt::GrvtClient, hibachi::HibachiClient, AnyExchangeClient,
+        decibel::DecibelClient, extended::ExtendedClient, grvt::GrvtClient,
+        hibachi::HibachiClient, AnyExchangeClient,
     },
     adapters::notifier::telegram::{TelegramCommand, TelegramNotifier},
     adapters::storage::sqlite::FillStore,
@@ -30,6 +31,11 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "config/settings.toml".to_string());
     let config = AppConfig::from_path(&config_path)
         .with_context(|| format!("failed to load config from {config_path}"))?;
+    if matches!(config.venue.kind, ExchangeKind::Decibel) && !config.runtime.dry_run {
+        anyhow::bail!(
+            "Decibel integration is currently read-only. Set runtime.dry_run = true until the on-chain order write path is implemented."
+        );
+    }
     let cleanup_min_notional = config.parsed()?.model.min_trade_amount;
 
     let notifier = TelegramNotifier::from_config(config.telegram.clone());
@@ -42,6 +48,9 @@ async fn main() -> Result<()> {
         }
         ExchangeKind::Extended => {
             AnyExchangeClient::Extended(ExtendedClient::new(config.venue.clone(), &config.network)?)
+        }
+        ExchangeKind::Decibel => {
+            AnyExchangeClient::Decibel(DecibelClient::new(config.venue.clone(), &config.network)?)
         }
     });
     let fill_store = Arc::new(FillStore::from_config(config.storage.as_ref())?);

@@ -249,6 +249,8 @@ impl AppConfig {
                 )?,
                 emergency_unwind_cycles: self.risk.emergency_unwind_cycles,
                 stale_position_timeout_secs: self.risk.stale_position_timeout_secs,
+                stale_position_bid_hold_secs: self.risk.stale_position_bid_hold_secs,
+                stale_position_ask_hold_secs: self.risk.stale_position_ask_hold_secs,
                 stale_position_close_slippage_cap_bps: parse_decimal(
                     "risk.stale_position_close_slippage_cap_bps",
                     &self.risk.stale_position_close_slippage_cap_bps,
@@ -480,6 +482,8 @@ pub struct ParsedRiskConfig {
     pub emergency_unwind_threshold: Decimal,
     pub emergency_unwind_cycles: usize,
     pub stale_position_timeout_secs: u64,
+    pub stale_position_bid_hold_secs: u64,
+    pub stale_position_ask_hold_secs: u64,
     pub stale_position_close_slippage_cap_bps: Decimal,
     pub stale_position_close_chunk_base: Decimal,
 }
@@ -581,6 +585,10 @@ pub struct VenueConfig {
     pub grvt_builder_id: String,
     #[serde(default = "default_zero_string")]
     pub grvt_builder_fee: String,
+    #[serde(default)]
+    pub decibel_origin: String,
+    #[serde(default)]
+    pub decibel_account_address: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, Default, PartialEq, Eq)]
@@ -590,6 +598,7 @@ pub enum ExchangeKind {
     Hibachi,
     Grvt,
     Extended,
+    Decibel,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -633,6 +642,14 @@ fn default_emergency_unwind_cycles() -> usize {
 
 fn default_stale_position_timeout_secs() -> u64 {
     10 * 60
+}
+
+fn default_stale_position_bid_hold_secs() -> u64 {
+    5 * 60
+}
+
+fn default_stale_position_ask_hold_secs() -> u64 {
+    60
 }
 
 fn default_stale_position_close_slippage_cap_bps() -> String {
@@ -868,6 +885,12 @@ pub struct RiskConfig {
     /// Age in seconds after which stale positions switch to IOC limit-close logic.
     #[serde(default = "default_stale_position_timeout_secs")]
     pub stale_position_timeout_secs: u64,
+    /// Side-specific stale-position timeout for short inventory (close via bids).
+    #[serde(default = "default_stale_position_bid_hold_secs")]
+    pub stale_position_bid_hold_secs: u64,
+    /// Side-specific stale-position timeout for long inventory (close via asks).
+    #[serde(default = "default_stale_position_ask_hold_secs")]
+    pub stale_position_ask_hold_secs: u64,
     /// Slippage cap in bps applied to IOC stale closes versus mid/reference price.
     #[serde(default = "default_stale_position_close_slippage_cap_bps")]
     pub stale_position_close_slippage_cap_bps: String,
