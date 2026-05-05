@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -18,11 +19,11 @@ if VENDOR_PATH.exists() and str(VENDOR_PATH) not in sys.path:
 
 try:
     from py_clob_client_v2 import ApiCreds, ClobClient, OrderArgs, OrderType, PartialCreateOrderOptions, Side
-    from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams
+    from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams, OpenOrderParams, OrderMarketCancelParams
     from py_clob_client_v2.clob_types import OrderArgsV1, OrderArgsV2
 except ImportError:  # pragma: no cover
     ApiCreds = ClobClient = OrderArgs = OrderType = PartialCreateOrderOptions = Side = None
-    AssetType = BalanceAllowanceParams = OrderArgsV1 = OrderArgsV2 = None
+    AssetType = BalanceAllowanceParams = OpenOrderParams = OrderMarketCancelParams = OrderArgsV1 = OrderArgsV2 = None
 
 try:
     from py_clob_client.client import ClobClient as V1ClobClient
@@ -48,6 +49,11 @@ class MarketConfig:
     no_token_id: str
     end_date: Optional[datetime]
     neg_risk: Optional[bool] = None
+    condition_id: Optional[str] = None
+    reward_rate_per_day: Optional[float] = None
+    rewards_min_size: Optional[float] = None
+    rewards_max_spread: Optional[float] = None
+    market_competitiveness: Optional[float] = None
 
 
 @dataclass
@@ -332,7 +338,41 @@ class PolymarketClient:
         if self.sdk == "v1":
             params = V1OpenOrderParams(asset_id=asset_id) if asset_id else None
             return self.trading_client.get_orders(params)
-        return self.trading_client.get_open_orders()
+        params = OpenOrderParams(asset_id=asset_id) if asset_id and OpenOrderParams is not None else None
+        return self.trading_client.get_open_orders(params=params)
+
+    def cancel_market_orders(self, asset_id: str, dry_run: bool = True) -> Any:
+        if dry_run:
+            return {"status": "dry_run", "asset_id": asset_id}
+        self.ensure_api_credentials()
+        if self.trading_client is None:
+            raise RuntimeError("Trading client unavailable.")
+        if self.sdk == "v1":
+            open_orders = self.get_open_orders(asset_id=asset_id)
+            normalized = self._normalize_cancelable_orders(open_orders)
+            order_ids = [order_id for order_id in normalized if order_id]
+            if not order_ids:
+                return []
+            return self.trading_client.cancel_orders(order_ids)
+        if OrderMarketCancelParams is None:
+            raise RuntimeError("OrderMarketCancelParams unavailable in py_clob_client_v2.")
+        return self.trading_client.cancel_market_orders(OrderMarketCancelParams(asset_id=asset_id))
+
+    def _normalize_cancelable_orders(self, response: Any) -> list[str]:
+        if isinstance(response, list):
+            data = response
+        elif isinstance(response, dict):
+            data = response.get("data") or response.get("orders") or response.get("results") or []
+        else:
+            data = []
+        order_ids: list[str] = []
+        for order in data:
+            if not isinstance(order, dict):
+                continue
+            order_id = order.get("id") or order.get("orderId")
+            if order_id:
+                order_ids.append(str(order_id))
+        return order_ids
 
     def check_geoblock(self) -> dict[str, Any]:
         response = self.session.get("https://polymarket.com/api/geoblock", timeout=15)
@@ -347,6 +387,66 @@ class PolymarketClient:
         )
         response.raise_for_status()
         return response.json()
+
+    def fetch_gamma_market_by_slug(self, slug: str) -> Optional[dict[str, Any]]:
+        normalized_slug = str(slug or "").strip()
+        if not normalized_slug:
+            return None
+        response = self.session.get(
+            f"{self.gamma_host}/markets/slug/{normalized_slug}",
+            timeout=30,
+        )
+        if response.status_code == 404:
+            return None
+        response.raise_for_status()
+        payload = response.json()
+        if isinstance(payload, dict):
+            return payload
+        if isinstance(payload, list) and payload:
+            first = payload[0]
+            return first if isinstance(first, dict) else None
+        return None
+
+    def scan_reward_markets(
+        self,
+        page_size: int = 100,
+        next_cursor: Optional[str] = None,
+        tag_slugs: Optional[list[str]] = None,
+        order_by: str = "competitiveness",
+        position: str = "ASC",
+        min_volume_24hr: Optional[float] = None,
+        max_volume_24hr: Optional[float] = None,
+        min_price: Optional[float] = None,
+        max_price: Optional[float] = None,
+    ) -> dict[str, Any]:
+        params: list[tuple[str, Any]] = [
+            ("page_size", min(max(int(page_size), 1), 500)),
+            ("order_by", order_by),
+            ("position", position),
+        ]
+        if next_cursor:
+            params.append(("next_cursor", next_cursor))
+        for tag_slug in tag_slugs or []:
+            if tag_slug:
+                params.append(("tag_slug", tag_slug))
+        if min_volume_24hr is not None:
+            params.append(("min_volume_24hr", min_volume_24hr))
+        if max_volume_24hr is not None:
+            params.append(("max_volume_24hr", max_volume_24hr))
+        if min_price is not None:
+            params.append(("min_price", min_price))
+        if max_price is not None:
+            params.append(("max_price", max_price))
+        response = self.session.get(
+            f"{self.clob_host}/rewards/markets/multi",
+            params=params,
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError(f"Unexpected rewards markets payload type: {type(payload).__name__}")
+        return payload
 
     def fetch_market_history(self, token_id: str, interval: str = "1d", fidelity: int = 60) -> list[float]:
         response = self.session.get(
@@ -469,6 +569,11 @@ def parse_market_configs(raw_markets: list[dict[str, Any]]) -> list[MarketConfig
                 no_token_id=item["no_token_id"],
                 end_date=_parse_datetime(item.get("end_date")),
                 neg_risk=item.get("neg_risk"),
+                condition_id=item.get("condition_id"),
+                reward_rate_per_day=_to_float(item.get("reward_rate_per_day")),
+                rewards_min_size=_to_float(item.get("rewards_min_size")),
+                rewards_max_spread=_to_float(item.get("rewards_max_spread")),
+                market_competitiveness=_to_float(item.get("market_competitiveness")),
             )
         )
     return result
@@ -490,6 +595,61 @@ def normalize_gamma_market(item: dict[str, Any]) -> Optional[dict[str, Any]]:
         "accepting_orders": bool(item.get("acceptingOrders", True)),
         "neg_risk": _to_bool(item.get("negRisk") or item.get("neg_risk")),
         "reference_price": _extract_reference_price(item),
+    }
+
+
+def normalize_reward_market(item: dict[str, Any]) -> Optional[dict[str, Any]]:
+    tokens = item.get("tokens")
+    if not isinstance(tokens, list) or len(tokens) < 2:
+        return None
+    yes_token_id = ""
+    no_token_id = ""
+    for token in tokens:
+        if not isinstance(token, dict):
+            continue
+        outcome = str(token.get("outcome") or "").upper()
+        token_id = str(token.get("token_id") or "").strip()
+        if not token_id:
+            continue
+        if outcome == "YES" and not yes_token_id:
+            yes_token_id = token_id
+        elif outcome == "NO" and not no_token_id:
+            no_token_id = token_id
+    if not yes_token_id or not no_token_id:
+        yes_token_id = str(tokens[0].get("token_id") or "").strip()
+        no_token_id = str(tokens[1].get("token_id") or "").strip()
+    if not yes_token_id or not no_token_id:
+        return None
+    reward_configs = item.get("rewards_config") or []
+    if not isinstance(reward_configs, list):
+        reward_configs = []
+    rate_per_day = 0.0
+    total_rewards = 0.0
+    for config in reward_configs:
+        if not isinstance(config, dict):
+            continue
+        rate_per_day += _to_float(config.get("rate_per_day")) or 0.0
+        total_rewards += _to_float(config.get("total_rewards")) or 0.0
+    first_price = None
+    if isinstance(tokens[0], dict):
+        first_price = _to_float(tokens[0].get("price"))
+    return {
+        "slug": item.get("market_slug") or item.get("slug") or item.get("question"),
+        "question": item.get("question") or "",
+        "category": "",
+        "volume_24h": _to_float(item.get("volume_24hr")) or 0.0,
+        "end_date": item.get("end_date"),
+        "yes_token_id": yes_token_id,
+        "no_token_id": no_token_id,
+        "accepting_orders": True,
+        "neg_risk": _to_bool(item.get("negative_risk") or item.get("neg_risk")),
+        "reference_price": first_price,
+        "condition_id": item.get("condition_id"),
+        "reward_rate_per_day": rate_per_day,
+        "reward_total": total_rewards,
+        "rewards_min_size": _to_float(item.get("rewards_min_size")),
+        "rewards_max_spread": _to_float(item.get("rewards_max_spread")),
+        "market_competitiveness": _to_float(item.get("market_competitiveness")),
     }
 
 
@@ -542,8 +702,10 @@ def _extract_reference_price(item: dict[str, Any]) -> Optional[float]:
 def _parse_datetime(value: Any) -> Optional[datetime]:
     if not value:
         return None
+    text = str(value).strip()
+    text = re.sub(r"([+-]\d{2})$", r"\1:00", text)
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
 

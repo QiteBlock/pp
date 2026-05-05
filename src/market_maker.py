@@ -6,19 +6,23 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 import json
+import re
+import re
 
 import yaml
 
 from .analytics import AnalyticsWriter
-from .client import MarketConfig, PolymarketClient, OrderBookSnapshot, normalize_gamma_market, parse_market_configs
+from .client import MarketConfig, PolymarketClient, OrderBookSnapshot, normalize_gamma_market, normalize_reward_market, parse_market_configs
 from .fills import FillPoller
 from .inventory import InventoryBook
 from .order_duplicates import OrderDuplicateDetector
-from .pricing import PricingConfig, build_yes_quote, clamp_probability, round_to_tick
+from .pricing import PricingConfig, Quote, build_yes_quote, clamp_probability, round_to_tick
 from .reconcile import PositionReconciler
 from .risk import RiskConfig, can_quote_market, exposure_by_market, total_exposure
 from .signals import build_signal
 from .telegram_bot import BotControl, TelegramController
+
+EXCHANGE_MIN_ORDER_SIZE = 5.0
 
 
 @dataclass
@@ -39,6 +43,7 @@ class BotContext:
     dry_run: bool
     cancel_before_requote: bool
     auto_scan_enabled: bool
+    force_unwind_only: bool
     scan_limit: int
     scan_pages: int
     scan_candidate_cap: int
@@ -158,6 +163,7 @@ def load_context(config_path: str) -> BotContext:
         dry_run=bool(runtime["dry_run"]),
         cancel_before_requote=bool(runtime.get("cancel_before_requote", True)),
         auto_scan_enabled=bool(runtime.get("auto_scan_enabled", True)),
+        force_unwind_only=bool(runtime.get("force_unwind_only", False)),
         scan_limit=int(runtime.get("scan_limit", 200)),
         scan_pages=int(runtime.get("scan_pages", 3)),
         scan_candidate_cap=int(runtime.get("scan_candidate_cap", 25)),
@@ -217,6 +223,11 @@ def market_to_dict(market: MarketConfig) -> dict[str, Any]:
         "no_token_id": market.no_token_id,
         "end_date": market.end_date.isoformat() if market.end_date else None,
         "neg_risk": market.neg_risk,
+        "condition_id": market.condition_id,
+        "reward_rate_per_day": market.reward_rate_per_day,
+        "rewards_min_size": market.rewards_min_size,
+        "rewards_max_spread": market.rewards_max_spread,
+        "market_competitiveness": market.market_competitiveness,
     }
 
 
@@ -341,6 +352,8 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
         best_bid=book.best_bid,
         best_ask=book.best_ask,
     )
+    apply_reward_quote_constraints(market, quote, book)
+    quote.size = derive_quote_size(context, market, quote.size)
     mark_prices[market.slug] = quote.fair_value
     fair_value_breach = fair_value_band_breach(quote.fair_value, context.filters)
     if fair_value_breach:
@@ -424,20 +437,34 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
         print(f"[{market.slug}] skipped: portfolio exposure limit breached exposure={portfolio_exposure:.4f}")
         return
     if not passes_post_only_guard(book, quote.bid, quote.ask):
-        context.analytics.log_event(
-            "risk_skip",
-            {
-                "market": market.slug,
-                "reason": "post_only_guard",
-                "best_bid": book.best_bid,
-                "best_ask": book.best_ask,
-                "quote_bid": quote.bid,
-                "quote_ask": quote.ask,
-            },
-        )
-        print(f"[{market.slug}] skipped: post-only guard blocked marketable quote ({quote.bid:.3f},{quote.ask:.3f})")
-        return
+        adjusted = adjust_quote_to_post_only(book, quote)
+        if adjusted and passes_post_only_guard(book, quote.bid, quote.ask):
+            context.analytics.log_event(
+                "quote_adjusted_post_only",
+                {
+                    "market": market.slug,
+                    "best_bid": book.best_bid,
+                    "best_ask": book.best_ask,
+                    "quote_bid": quote.bid,
+                    "quote_ask": quote.ask,
+                },
+            )
+        else:
+            context.analytics.log_event(
+                "risk_skip",
+                {
+                    "market": market.slug,
+                    "reason": "post_only_guard",
+                    "best_bid": book.best_bid,
+                    "best_ask": book.best_ask,
+                    "quote_bid": quote.bid,
+                    "quote_ask": quote.ask,
+                },
+            )
+            print(f"[{market.slug}] skipped: post-only guard blocked marketable quote ({quote.bid:.3f},{quote.ask:.3f})")
+            return
     place_yes_bid, place_no_bid, quote_reason = determine_quote_sides(context, inventory)
+    reward_status = evaluate_reward_eligibility(market, quote, place_both_sides=(place_yes_bid and place_no_bid))
     if not place_yes_bid and not place_no_bid:
         context.analytics.log_event(
             "risk_skip",
@@ -455,6 +482,30 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
     no_bid_price = round_no_bid_price(quote.ask, book.tick_size)
     bid_response: Any = None
     ask_response: Any = None
+
+    existing_yes_orders, existing_no_orders = fetch_market_open_orders(context, market)
+    if not context.dry_run:
+        keep_yes = (not place_yes_bid) or should_keep_existing_quotes(existing_yes_orders, quote.bid, quote.size)
+        keep_no = (not place_no_bid) or should_keep_existing_quotes(existing_no_orders, no_bid_price, quote.size)
+        if keep_yes and keep_no and (existing_yes_orders or existing_no_orders):
+            context.analytics.log_event(
+                "quote_skip_existing_orders",
+                {
+                    "market": market.slug,
+                    "yes_price": quote.bid,
+                    "no_price": no_bid_price,
+                    "size": quote.size,
+                    "yes_open_orders": len(existing_yes_orders),
+                    "no_open_orders": len(existing_no_orders),
+                },
+            )
+            print(
+                f"[{market.slug}] kept existing quotes "
+                f"yes={quote.bid:.3f} no={no_bid_price:.3f} size={quote.size:.4f}"
+            )
+            print_open_orders_from_lists(existing_yes_orders, existing_no_orders)
+            return
+        cancel_market_orders_for_requote(context, market, existing_yes_orders, existing_no_orders)
 
     # Check for duplicate orders before placing new ones
     if not context.dry_run and place_yes_bid and place_no_bid:
@@ -558,6 +609,11 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             "place_yes_bid": place_yes_bid,
             "place_no_bid": place_no_bid,
             "quote_side_reason": quote_reason,
+            "reward_rate_per_day": market.reward_rate_per_day,
+            "rewards_min_size": market.rewards_min_size,
+            "rewards_max_spread": normalize_reward_spread_limit(market.rewards_max_spread),
+            "reward_eligible_now": reward_status["eligible"],
+            "reward_eligibility_reason": reward_status["reason"],
             "responses": {"bid": bid_response, "ask": ask_response},
         },
     )
@@ -574,6 +630,14 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
         print_order_response("NO bid", ask_response)
     else:
         print("  NO bid: skipped")
+    if market.reward_rate_per_day:
+        print(
+            "  rewards:"
+            f" min_size={market.rewards_min_size}"
+            f" max_spread={normalize_reward_spread_limit(market.rewards_max_spread)}"
+            f" eligible={reward_status['eligible']}"
+            f" reason={reward_status['reason']}"
+        )
     print_open_orders(context, market)
 
 
@@ -629,6 +693,11 @@ def process_unwind_market(
         return
 
     if not context.dry_run and order_request["side"].upper() == "SELL":
+        yes_orders, no_orders = fetch_market_open_orders(context, market)
+        cancel_market_orders_for_requote(context, market, yes_orders, no_orders)
+        refresh_sell_unwind_order(context, order_request, aggressive=effective_aggressive)
+
+    if not context.dry_run and order_request["side"].upper() == "SELL":
         if not prepare_sell_unwind_order(context, market, inventory, order_request):
             return
 
@@ -644,6 +713,52 @@ def process_unwind_market(
             post_only=not effective_aggressive,
         )
     except Exception as exc:
+        if order_request["side"].upper() == "SELL" and is_crosses_book_error(exc):
+            retry_response = retry_unwind_with_safe_price(
+                context,
+                market,
+                inventory,
+                order_request,
+                reason,
+                mode,
+                details=str(exc),
+            )
+            if retry_response is not None:
+                response = retry_response
+                context.analytics.log_event(
+                    "unwind_quote_cycle",
+                    {
+                        "market": market.slug,
+                        "reason": reason,
+                        "mode": mode,
+                        "aggressive": False,
+                        "inventory_yes": inventory.yes_shares,
+                        "inventory_no": inventory.no_shares,
+                        "delta": inventory.net_delta,
+                        "order_request": order_request,
+                        "response": response,
+                        "retry": "safe_post_only_after_cross",
+                    },
+                )
+                log_rejected_order_response(
+                    context,
+                    market,
+                    order_request["label"],
+                    response,
+                    kind="unwind",
+                    mode=mode,
+                    aggressive=False,
+                    retry="safe_post_only_after_cross",
+                )
+                print(
+                    f"[{market.slug}] unwind retried with safe price "
+                    f"label={order_request['label']} price={order_request['price']:.3f} size={order_request['size']:.4f}"
+                )
+                if mode == "trim":
+                    inventory.unwind_cycles_without_fill += 1
+                print_order_response(order_request["label"], response)
+                print_open_orders(context, market)
+                return
         context.analytics.log_event(
             "unwind_error",
             {
@@ -918,6 +1033,24 @@ def prepare_sell_unwind_order(
         )
         print(f"[{market.slug}] skipped: {order_request['label']} no available live balance to sell")
         return False
+    if adjusted_size + 1e-9 < EXCHANGE_MIN_ORDER_SIZE:
+        context.analytics.log_event(
+            "unwind_skip",
+            {
+                "market": market.slug,
+                "token_id": order_request["token_id"],
+                "reason": "sell unwind residual below exchange minimum",
+                "label": order_request["label"],
+                "requested_size": order_request["size"],
+                "adjusted_size": adjusted_size,
+                "exchange_min_order_size": EXCHANGE_MIN_ORDER_SIZE,
+            },
+        )
+        print(
+            f"[{market.slug}] skipped: {order_request['label']} residual size "
+            f"{adjusted_size:.4f} below exchange minimum {EXCHANGE_MIN_ORDER_SIZE:.0f}"
+        )
+        return False
     if adjusted_size + 1e-9 < order_request["size"]:
         context.analytics.log_event(
             "unwind_size_adjusted",
@@ -1005,6 +1138,67 @@ def derive_sell_price(book: OrderBookSnapshot, fair_value: float, half_spread: f
         min_post_only = round_to_tick(book.best_bid + max(book.tick_size, 0.01), book.tick_size, down=False)
         price = max(price, min_post_only)
     return clamp_probability(price)
+
+
+def refresh_sell_unwind_order(context: BotContext, order_request: dict[str, Any], aggressive: bool) -> None:
+    book = get_market_book(context, order_request["token_id"])
+    if book is None:
+        return
+    order_request["tick_size"] = book.tick_size
+    if aggressive and book.best_bid is not None:
+        order_request["price"] = clamp_probability(round_to_tick(book.best_bid, book.tick_size, down=True))
+
+
+def retry_unwind_with_safe_price(
+    context: BotContext,
+    market: MarketConfig,
+    inventory: Any,
+    order_request: dict[str, Any],
+    reason: str,
+    mode: str,
+    details: str,
+) -> Optional[Any]:
+    book = get_market_book(context, order_request["token_id"])
+    if book is None:
+        return None
+    safe_price = derive_safe_post_only_sell_price(book)
+    if safe_price is None:
+        return None
+    order_request["price"] = safe_price
+    order_request["tick_size"] = book.tick_size
+    try:
+        return context.client.place_limit_order(
+            token_id=order_request["token_id"],
+            side=order_request["side"],
+            price=order_request["price"],
+            size=order_request["size"],
+            tick_size=order_request["tick_size"],
+            dry_run=context.dry_run,
+            neg_risk=market.neg_risk,
+            post_only=True,
+        )
+    except Exception as retry_exc:
+        context.analytics.log_event(
+            "unwind_retry_error",
+            {
+                "market": market.slug,
+                "reason": reason,
+                "mode": mode,
+                "order_request": order_request,
+                "details": details,
+                "retry_details": str(retry_exc),
+            },
+        )
+        return None
+
+
+def derive_safe_post_only_sell_price(book: OrderBookSnapshot) -> Optional[float]:
+    tick = max(book.tick_size, 0.01)
+    if book.best_bid is not None:
+        return clamp_probability(round_to_tick(book.best_bid + tick, book.tick_size, down=False))
+    if book.best_ask is not None:
+        return clamp_probability(round_to_tick(book.best_ask, book.tick_size, down=False))
+    return None
 
 
 def should_trim_position(reason: str) -> bool:
@@ -1099,11 +1293,14 @@ def log_rejected_order_response(
 
 def print_open_orders(context: BotContext, market: MarketConfig) -> None:
     try:
-        yes_orders = normalize_open_orders(context.client.get_open_orders(asset_id=market.yes_token_id))
-        no_orders = normalize_open_orders(context.client.get_open_orders(asset_id=market.no_token_id))
+        yes_orders, no_orders = fetch_market_open_orders(context, market)
     except Exception as exc:
         print(f"  open orders check failed: {exc}")
         return
+    print_open_orders_from_lists(yes_orders, no_orders)
+
+
+def print_open_orders_from_lists(yes_orders: list[dict[str, Any]], no_orders: list[dict[str, Any]]) -> None:
     orders = yes_orders + no_orders
     print(f"  open_orders={len(orders)}")
     for order in orders[:6]:
@@ -1112,6 +1309,64 @@ def print_open_orders(context: BotContext, market: MarketConfig) -> None:
             f"id={short_id(order.get('id'))} side={order.get('side')} outcome={order.get('outcome')} "
             f"price={order.get('price')} size={order.get('original_size') or order.get('size')}"
         )
+
+
+def fetch_market_open_orders(context: BotContext, market: MarketConfig) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    yes_orders = normalize_open_orders(context.client.get_open_orders(asset_id=market.yes_token_id))
+    no_orders = normalize_open_orders(context.client.get_open_orders(asset_id=market.no_token_id))
+    return yes_orders, no_orders
+
+
+def should_keep_existing_quotes(
+    orders: list[dict[str, Any]],
+    target_price: float,
+    target_size: float,
+    price_tolerance: float = 0.001,
+    size_tolerance: float = 0.1,
+) -> bool:
+    for order in orders:
+        side = str(order.get("side") or "").upper()
+        if side != "BUY":
+            continue
+        order_price = _to_optional_float(order.get("price"))
+        order_size = _to_optional_float(order.get("original_size") or order.get("size") or order.get("remaining_size"))
+        if order_price is None or order_size is None:
+            continue
+        if abs(order_price - target_price) <= price_tolerance and abs(order_size - target_size) <= size_tolerance:
+            return True
+    return False
+
+
+def cancel_market_orders_for_requote(
+    context: BotContext,
+    market: MarketConfig,
+    yes_orders: list[dict[str, Any]],
+    no_orders: list[dict[str, Any]],
+) -> None:
+    if context.dry_run:
+        return
+    if not yes_orders and not no_orders:
+        return
+    try:
+        if yes_orders:
+            context.client.cancel_market_orders(market.yes_token_id, dry_run=False)
+        if no_orders:
+            context.client.cancel_market_orders(market.no_token_id, dry_run=False)
+        context.analytics.log_event(
+            "cancel_market_requote",
+            {
+                "market": market.slug,
+                "yes_orders": len(yes_orders),
+                "no_orders": len(no_orders),
+            },
+        )
+        print(f"[{market.slug}] canceled stale orders yes={len(yes_orders)} no={len(no_orders)}")
+    except Exception as exc:
+        context.analytics.log_event(
+            "cancel_market_requote_error",
+            {"market": market.slug, "error": str(exc)},
+        )
+        print(f"[{market.slug}] stale order cancel failed: {exc}")
 
 
 def handle_telegram_commands(context: BotContext) -> None:
@@ -1166,6 +1421,7 @@ def build_status_message(context: BotContext, prefix: str) -> str:
         f"{prefix}\n"
         f"trading_enabled={context.control.trading_enabled}\n"
         f"dry_run={context.dry_run}\n"
+        f"force_unwind_only={context.force_unwind_only}\n"
         f"active_market={active_market}\n"
         f"active_markets={active_markets}\n"
         f"positions_to_unwind={unwind_markets}\n"
@@ -1202,6 +1458,37 @@ def passes_post_only_guard(book: OrderBookSnapshot, bid: float, ask: float) -> b
     return True
 
 
+def adjust_quote_to_post_only(book: OrderBookSnapshot, quote: Any) -> bool:
+    tick = max(book.tick_size, 0.01)
+    adjusted = False
+
+    if book.best_ask is not None and quote.bid >= book.best_ask:
+        quote.bid = round_to_tick(clamp_probability(book.best_ask - tick), book.tick_size, down=True)
+        adjusted = True
+
+    if book.best_bid is not None and quote.ask <= book.best_bid:
+        quote.ask = round_to_tick(clamp_probability(book.best_bid + tick), book.tick_size, down=False)
+        adjusted = True
+
+    if quote.ask <= quote.bid:
+        quote.ask = round_to_tick(clamp_probability(quote.bid + tick), book.tick_size, down=False)
+        adjusted = True
+
+    if book.best_ask is not None and quote.bid >= book.best_ask:
+        safe_bid = clamp_probability(book.best_ask - tick)
+        if safe_bid < quote.ask:
+            quote.bid = round_to_tick(safe_bid, book.tick_size, down=True)
+            adjusted = True
+
+    if book.best_bid is not None and quote.ask <= book.best_bid:
+        safe_ask = clamp_probability(book.best_bid + tick)
+        if safe_ask > quote.bid:
+            quote.ask = round_to_tick(safe_ask, book.tick_size, down=False)
+            adjusted = True
+
+    return adjusted
+
+
 def is_trading_restricted_error(exc: Exception) -> bool:
     return "Trading restricted in your region" in str(exc)
 
@@ -1209,6 +1496,10 @@ def is_trading_restricted_error(exc: Exception) -> bool:
 def is_insufficient_balance_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return "not enough balance / allowance" in message or "balance is not enough" in message
+
+
+def is_crosses_book_error(exc: Exception) -> bool:
+    return "crosses the book" in str(exc).lower()
 
 
 def round_no_bid_price(yes_ask: float, tick_size: float) -> float:
@@ -1251,6 +1542,79 @@ def determine_quote_sides(context: BotContext, inventory: Any) -> tuple[bool, bo
     return False, False, "inventory_limits_block_both_sides"
 
 
+def derive_quote_size(context: BotContext, market: MarketConfig, base_size: float) -> float:
+    configured_size = max(base_size, context.risk.min_order_size)
+    # In live mode we must respect the user's configured clip size. Reward
+    # minimums inform market selection, but they should not silently upsize
+    # orders beyond the configured exposure budget.
+    max_safe_size = max(
+        context.risk.min_order_size,
+        min(
+            context.risk.max_yes_shares_per_market,
+            context.risk.max_no_shares_per_market,
+            max(context.risk.max_net_delta_per_market, context.risk.min_order_size),
+        ),
+    )
+    return min(configured_size, max_safe_size)
+
+
+def configured_quote_capacity(context: BotContext) -> float:
+    return min(
+        max(context.pricing.size_per_order, context.risk.min_order_size),
+        max(
+            context.risk.min_order_size,
+            min(
+                context.risk.max_yes_shares_per_market,
+                context.risk.max_no_shares_per_market,
+                max(context.risk.max_net_delta_per_market, context.risk.min_order_size),
+            ),
+        ),
+    )
+
+
+def normalize_reward_spread_limit(value: Any) -> Optional[float]:
+    spread = _to_optional_float(value)
+    if spread is None or spread <= 0:
+        return None
+    return spread / 100.0 if spread > 1.0 else spread
+
+
+def apply_reward_quote_constraints(market: MarketConfig, quote: Quote, book: OrderBookSnapshot) -> None:
+    reward_max_spread = normalize_reward_spread_limit(market.rewards_max_spread)
+    if reward_max_spread is None:
+        return
+    if quote.half_spread <= reward_max_spread:
+        return
+    quote.half_spread = reward_max_spread
+    tick = max(book.tick_size, 0.01)
+    capped_bid = clamp_probability(quote.fair_value - reward_max_spread)
+    capped_ask = clamp_probability(quote.fair_value + reward_max_spread)
+    quote.bid = round_to_tick(max(quote.bid, capped_bid), book.tick_size, down=True)
+    quote.ask = round_to_tick(min(quote.ask, capped_ask), book.tick_size, down=False)
+    if book.best_bid is not None:
+        quote.ask = max(quote.ask, clamp_probability(book.best_bid + tick))
+    if quote.ask <= quote.bid:
+        quote.ask = clamp_probability(quote.bid + tick)
+
+
+def evaluate_reward_eligibility(market: MarketConfig, quote: Quote, place_both_sides: bool) -> dict[str, Any]:
+    reward_rate = _to_optional_float(market.reward_rate_per_day) or 0.0
+    if reward_rate <= 0:
+        return {"eligible": False, "reason": "not_reward_market"}
+    reward_min_size = _to_optional_float(market.rewards_min_size)
+    if reward_min_size is not None and quote.size + 1e-9 < reward_min_size:
+        return {"eligible": False, "reason": f"size_below_reward_min ({quote.size:.2f} < {reward_min_size:.2f})"}
+    reward_max_spread = normalize_reward_spread_limit(market.rewards_max_spread)
+    if reward_max_spread is not None and quote.half_spread - reward_max_spread > 1e-9:
+        return {
+            "eligible": False,
+            "reason": f"spread_above_reward_max ({quote.half_spread:.4f} > {reward_max_spread:.4f})",
+        }
+    if (quote.fair_value < 0.10 or quote.fair_value > 0.90) and not place_both_sides:
+        return {"eligible": False, "reason": "extreme_midpoint_requires_two_sided_quotes"}
+    return {"eligible": True, "reason": "eligible"}
+
+
 def validate_market_config(markets: list[MarketConfig]) -> None:
     if not markets:
         raise RuntimeError("No markets configured in config.yaml")
@@ -1268,6 +1632,11 @@ def validate_market_config(markets: list[MarketConfig]) -> None:
 
 def initialize_market_selection(context: BotContext) -> None:
     manual_markets = [market for market in context.markets if not is_placeholder_market(market)]
+    if context.force_unwind_only:
+        context.markets = manual_markets
+        context.active_markets = []
+        context.active_market = None
+        return
     if not context.auto_scan_enabled and not manual_markets:
         raise RuntimeError("Auto-scan is disabled and no valid manual markets are configured in config.yaml")
     if manual_markets and not context.auto_scan_enabled:
@@ -1284,6 +1653,13 @@ def initialize_market_selection(context: BotContext) -> None:
 
 
 def refresh_market_selection(context: BotContext, force: bool = False) -> None:
+    if context.force_unwind_only:
+        context.positions_to_unwind = [
+            market for market in context.positions_to_unwind if context.inventory.get(market.slug).gross_shares > 0.01
+        ]
+        context.active_markets = context.positions_to_unwind[: context.max_active_markets]
+        context.active_market = context.active_markets[0] if context.active_markets else None
+        return
     if not context.auto_scan_enabled:
         return
     context.positions_to_unwind = [
@@ -1320,6 +1696,8 @@ def refresh_market_selection(context: BotContext, force: bool = False) -> None:
 
 
 def get_markets_to_quote(context: BotContext) -> list[MarketConfig]:
+    if context.force_unwind_only:
+        return list(context.positions_to_unwind[: context.max_active_markets])
     if context.auto_scan_enabled:
         return list(context.active_markets)
     return context.markets
@@ -1369,32 +1747,28 @@ def should_rescan_active_market(context: BotContext) -> bool:
 
 
 def select_best_markets(context: BotContext) -> Optional[list[MarketConfig]]:
-    filtered_candidates: list[dict[str, Any]] = []
-    raw_count = 0
-    normalized_count = 0
-    for page in range(context.scan_pages):
-        try:
-            raw_markets = context.client.scan_markets(limit=context.scan_limit, offset=page * context.scan_limit)
-        except Exception as exc:
-            context.analytics.log_event("scan_error", {"page": page, "details": str(exc)})
-            continue
-        for item in raw_markets:
-            raw_count += 1
-            normalized = normalize_gamma_market(item)
-            if not normalized:
-                continue
-            normalized_count += 1
-            if not market_passes_filters(normalized, context.filters, context.risk.min_days_to_resolution):
-                continue
-            filtered_candidates.append(normalized)
+    scan_source = "gamma"
+    reward_reason_counts: dict[str, int] = {}
+    gamma_reason_counts: dict[str, int] = {}
+    live_reason_counts: dict[str, int] = {}
+    filtered_candidates, raw_count, normalized_count, reward_reason_counts = scan_reward_candidates(context)
+    if filtered_candidates:
+        scan_source = "rewards"
+    elif bool(context.filters.get("rewards_only", False)):
+        scan_source = "rewards"
+    else:
+        filtered_candidates, raw_count, normalized_count, gamma_reason_counts = scan_gamma_candidates(context)
     if not filtered_candidates:
         fallback = merge_selected_markets(context, [])
         if fallback:
             print(f"Market scan found no candidates; keeping {len(fallback)} unwind market(s)")
             return fallback
-        print(f"Market scan found no candidates: raw={raw_count} normalized={normalized_count}")
+        print(
+            f"Market scan found no candidates: source={scan_source} raw={raw_count} normalized={normalized_count} "
+            f"reasons={format_reason_counts(reward_reason_counts if scan_source == 'rewards' else gamma_reason_counts)}"
+        )
         return None
-    filtered_candidates.sort(key=lambda item: float(item.get("volume_24h", 0.0)), reverse=True)
+    filtered_candidates.sort(key=prebook_candidate_priority, reverse=True)
     shortlisted = filtered_candidates[: context.scan_candidate_cap]
     candidates: list[tuple[float, MarketConfig]] = []
     checked_books = 0
@@ -1403,13 +1777,16 @@ def select_best_markets(context: BotContext) -> Optional[list[MarketConfig]]:
             book = context.client.get_orderbook(normalized["yes_token_id"])
         except Exception as exc:
             context.analytics.log_event("scan_book_error", {"market": normalized["slug"], "details": str(exc)})
+            increment_reason(live_reason_counts, "orderbook_fetch_failed")
             continue
         checked_books += 1
         spread_bps = ((book.spread or 0.0) * 10000.0)
         if spread_bps < float(context.filters.get("min_spread_bps", 0.0)):
+            increment_reason(live_reason_counts, "live_spread_too_small")
             continue
         live_reference_price = book.midpoint if book.midpoint is not None else normalized.get("reference_price")
         if fair_value_band_breach(live_reference_price, context.filters) is not None:
+            increment_reason(live_reason_counts, "live_fair_value_out_of_band")
             continue
         neg_risk = normalized.get("neg_risk")
         if neg_risk is None:
@@ -1425,57 +1802,349 @@ def select_best_markets(context: BotContext) -> Optional[list[MarketConfig]]:
             no_token_id=normalized["no_token_id"],
             end_date=parse_end_date(normalized.get("end_date")),
             neg_risk=neg_risk,
+            condition_id=normalized.get("condition_id"),
+            reward_rate_per_day=_to_optional_float(normalized.get("reward_rate_per_day")),
+            rewards_min_size=_to_optional_float(normalized.get("rewards_min_size")),
+            rewards_max_spread=_to_optional_float(normalized.get("rewards_max_spread")),
+            market_competitiveness=_to_optional_float(normalized.get("market_competitiveness")),
         )
-        score = score_market_candidate(normalized["volume_24h"], spread_bps)
+        score = score_market_candidate(
+            normalized["volume_24h"],
+            spread_bps,
+            reward_rate_per_day=_to_optional_float(normalized.get("reward_rate_per_day")),
+            market_competitiveness=_to_optional_float(normalized.get("market_competitiveness")),
+            reward_min_size=_to_optional_float(normalized.get("rewards_min_size")),
+            days_to_resolution=days_to_resolution_from_value(normalized.get("end_date")),
+            sports_preference=is_sports_market(normalized),
+        )
         candidates.append((score, market))
     if not candidates:
         fallback = merge_selected_markets(context, [])
         if fallback:
             print(
                 "Market scan found no live-book candidates; "
-                f"keeping {len(fallback)} unwind market(s): raw={raw_count} normalized={normalized_count} "
-                f"filter_pass={len(filtered_candidates)} checked_books={checked_books}"
+                f"keeping {len(fallback)} unwind market(s): source={scan_source} raw={raw_count} normalized={normalized_count} "
+                f"filter_pass={len(filtered_candidates)} checked_books={checked_books} "
+                f"filter_reasons={format_reason_counts(reward_reason_counts if scan_source == 'rewards' else gamma_reason_counts)} "
+                f"live_reasons={format_reason_counts(live_reason_counts)}"
             )
             return fallback
         print(
             "Market scan found no live-book candidates: "
-            f"raw={raw_count} normalized={normalized_count} filter_pass={len(filtered_candidates)} checked_books={checked_books}"
+            f"source={scan_source} raw={raw_count} normalized={normalized_count} "
+            f"filter_pass={len(filtered_candidates)} checked_books={checked_books} "
+            f"filter_reasons={format_reason_counts(reward_reason_counts if scan_source == 'rewards' else gamma_reason_counts)} "
+            f"live_reasons={format_reason_counts(live_reason_counts)}"
         )
         return None
     candidates.sort(key=lambda item: item[0], reverse=True)
     selected = merge_selected_markets(context, [market for _, market in candidates])
     print(
         "Market scan selected "
-        f"{len(selected)} markets: raw={raw_count} normalized={normalized_count} "
-        f"filter_pass={len(filtered_candidates)} checked_books={checked_books}"
+        f"{len(selected)} markets: source={scan_source} raw={raw_count} normalized={normalized_count} "
+        f"filter_pass={len(filtered_candidates)} checked_books={checked_books} "
+        f"filter_reasons={format_reason_counts(reward_reason_counts if scan_source == 'rewards' else gamma_reason_counts)} "
+        f"live_reasons={format_reason_counts(live_reason_counts)}"
     )
     return selected
+
+
+def scan_gamma_candidates(context: BotContext) -> tuple[list[dict[str, Any]], int, int, dict[str, int]]:
+    filtered_candidates: list[dict[str, Any]] = []
+    raw_count = 0
+    normalized_count = 0
+    reason_counts: dict[str, int] = {}
+    for page in range(context.scan_pages):
+        try:
+            raw_markets = context.client.scan_markets(limit=context.scan_limit, offset=page * context.scan_limit)
+        except Exception as exc:
+            context.analytics.log_event("scan_error", {"page": page, "details": str(exc), "source": "gamma"})
+            increment_reason(reason_counts, "gamma_scan_error")
+            continue
+        for item in raw_markets:
+            raw_count += 1
+            normalized = normalize_gamma_market(item)
+            if not normalized:
+                increment_reason(reason_counts, "normalize_failed")
+                continue
+            normalized_count += 1
+            allowed, reject_reason = market_passes_filters(
+                normalized,
+                context.filters,
+                context.risk.min_days_to_resolution,
+                with_reason=True,
+            )
+            if not allowed:
+                increment_reason(reason_counts, reject_reason or "filtered_out")
+                continue
+            filtered_candidates.append(normalized)
+    return filtered_candidates, raw_count, normalized_count, reason_counts
+
+
+def scan_reward_candidates(context: BotContext) -> tuple[list[dict[str, Any]], int, int, dict[str, int]]:
+    if not bool(context.filters.get("prefer_rewards", True)):
+        return [], 0, 0, {}
+    filtered_candidates: list[dict[str, Any]] = []
+    normalized_rewards: list[dict[str, Any]] = []
+    raw_count = 0
+    normalized_count = 0
+    reason_counts: dict[str, int] = {}
+    next_cursor: Optional[str] = None
+    page_size = min(max(context.scan_limit, 1), 50)
+    for _ in range(context.scan_pages):
+        try:
+            payload = context.client.scan_reward_markets(
+                page_size=page_size,
+                next_cursor=next_cursor,
+                tag_slugs=None,
+                order_by="rate_per_day",
+                position="DESC",
+                min_volume_24hr=None,
+                max_volume_24hr=None,
+                min_price=None,
+                max_price=None,
+            )
+        except Exception as exc:
+            context.analytics.log_event("scan_error", {"details": str(exc), "source": "rewards"})
+            increment_reason(reason_counts, "rewards_scan_error")
+            print(f"Rewards scan failed: {exc}")
+            return [], 0, 0, reason_counts
+        data = payload.get("data") or []
+        if not isinstance(data, list):
+            break
+        raw_count += len(data)
+        for item in data:
+            normalized = normalize_reward_market(item)
+            if not normalized:
+                increment_reason(reason_counts, "normalize_failed")
+                continue
+            normalized_count += 1
+            normalized_rewards.append(normalized)
+        next_cursor = payload.get("next_cursor")
+        if not next_cursor or next_cursor == "LTE=":
+            break
+    if not normalized_rewards:
+        return [], raw_count, normalized_count, reason_counts
+
+    gamma_index = build_gamma_reward_metadata_index(context, normalized_rewards)
+    for normalized in normalized_rewards:
+        enrich_reward_market_with_gamma(normalized, gamma_index)
+        allowed, reject_reason = market_passes_filters(
+            normalized,
+            context.filters,
+            context.risk.min_days_to_resolution,
+            with_reason=True,
+        )
+        if not allowed:
+            increment_reason(reason_counts, reject_reason or "filtered_out")
+            continue
+        max_competitiveness = _to_optional_float(context.filters.get("max_competitiveness"))
+        competitiveness = _to_optional_float(normalized.get("market_competitiveness"))
+        if (
+            max_competitiveness is not None
+            and competitiveness is not None
+            and competitiveness > max_competitiveness
+        ):
+            increment_reason(reason_counts, "competitiveness_too_high")
+            continue
+        min_reward_rate = _to_optional_float(context.filters.get("min_reward_rate_per_day"))
+        reward_rate = _to_optional_float(normalized.get("reward_rate_per_day"))
+        if min_reward_rate is not None and (reward_rate or 0.0) < min_reward_rate:
+            increment_reason(reason_counts, "reward_rate_too_low")
+            continue
+        reward_min_size = _to_optional_float(normalized.get("rewards_min_size"))
+        if reward_min_size is not None and configured_quote_capacity(context) + 1e-9 < reward_min_size:
+            increment_reason(reason_counts, "reward_min_size_above_budget")
+            continue
+        filtered_candidates.append(normalized)
+    return filtered_candidates, raw_count, normalized_count, reason_counts
+
+
+def prebook_candidate_priority(candidate: dict[str, Any]) -> tuple[float, float, float]:
+    reward_rate = _to_optional_float(candidate.get("reward_rate_per_day")) or 0.0
+    competitiveness = _to_optional_float(candidate.get("market_competitiveness"))
+    competition_score = 1.0 / (1.0 + max(competitiveness or 0.0, 0.0))
+    return (
+        reward_rate * competition_score,
+        competition_score,
+        float(candidate.get("volume_24h", 0.0)),
+    )
+
+
+def build_gamma_reward_metadata_index(
+    context: BotContext,
+    reward_markets: list[dict[str, Any]],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    target_slugs = {str(market.get("slug") or "").strip().lower() for market in reward_markets if market.get("slug")}
+    target_token_ids = {
+        str(token_id).strip()
+        for market in reward_markets
+        for token_id in (market.get("yes_token_id"), market.get("no_token_id"))
+        if token_id
+    }
+    by_slug: dict[str, dict[str, Any]] = {}
+    by_token_id: dict[str, dict[str, Any]] = {}
+
+    for slug in sorted(target_slugs):
+        try:
+            direct = context.client.fetch_gamma_market_by_slug(slug)
+        except Exception as exc:
+            context.analytics.log_event("reward_gamma_lookup_error", {"slug": slug, "details": str(exc)})
+            continue
+        normalized = normalize_gamma_market(direct) if direct else None
+        if not normalized:
+            continue
+        by_slug[slug] = normalized
+        yes_token_id = str(normalized.get("yes_token_id") or "").strip()
+        no_token_id = str(normalized.get("no_token_id") or "").strip()
+        if yes_token_id:
+            by_token_id[yes_token_id] = normalized
+        if no_token_id:
+            by_token_id[no_token_id] = normalized
+
+    remaining_slugs = {slug for slug in target_slugs if slug not in by_slug}
+    remaining_token_ids = {token_id for token_id in target_token_ids if token_id not in by_token_id}
+    if not remaining_slugs and not remaining_token_ids:
+        return {"by_slug": by_slug, "by_token_id": by_token_id}
+
+    gamma_pages = max(context.scan_pages, 15)
+
+    for page in range(gamma_pages):
+        try:
+            raw_markets = context.client.scan_markets(limit=context.scan_limit, offset=page * context.scan_limit)
+        except Exception as exc:
+            context.analytics.log_event("reward_gamma_enrichment_scan_error", {"page": page, "details": str(exc)})
+            continue
+        for item in raw_markets:
+            normalized = normalize_gamma_market(item)
+            if not normalized:
+                continue
+            slug = str(normalized.get("slug") or "").strip().lower()
+            yes_token_id = str(normalized.get("yes_token_id") or "").strip()
+            no_token_id = str(normalized.get("no_token_id") or "").strip()
+            matched = False
+            if slug and slug in remaining_slugs:
+                by_slug[slug] = normalized
+                matched = True
+            if yes_token_id and yes_token_id in target_token_ids:
+                by_token_id[yes_token_id] = normalized
+                matched = True
+            if no_token_id and no_token_id in target_token_ids:
+                by_token_id[no_token_id] = normalized
+                matched = True
+            if matched:
+                continue
+        if len(by_slug) >= len(target_slugs) and len(by_token_id) >= len(target_token_ids):
+            break
+    return {"by_slug": by_slug, "by_token_id": by_token_id}
+
+
+def enrich_reward_market_with_gamma(
+    reward_market: dict[str, Any],
+    gamma_index: dict[str, dict[str, dict[str, Any]]],
+) -> None:
+    by_slug = gamma_index.get("by_slug", {})
+    by_token_id = gamma_index.get("by_token_id", {})
+    slug = str(reward_market.get("slug") or "").strip().lower()
+    yes_token_id = str(reward_market.get("yes_token_id") or "").strip()
+    no_token_id = str(reward_market.get("no_token_id") or "").strip()
+    gamma_market = (
+        by_slug.get(slug)
+        or by_token_id.get(yes_token_id)
+        or by_token_id.get(no_token_id)
+    )
+    if not gamma_market:
+        return
+    if not reward_market.get("question") and gamma_market.get("question"):
+        reward_market["question"] = gamma_market["question"]
+    if not reward_market.get("category") and gamma_market.get("category"):
+        reward_market["category"] = gamma_market["category"]
+    if not reward_market.get("end_date") and gamma_market.get("end_date"):
+        reward_market["end_date"] = gamma_market["end_date"]
+    if not reward_market.get("reference_price") and gamma_market.get("reference_price") is not None:
+        reward_market["reference_price"] = gamma_market["reference_price"]
+    gamma_volume = _to_optional_float(gamma_market.get("volume_24h"))
+    reward_volume = _to_optional_float(reward_market.get("volume_24h"))
+    if gamma_volume is not None and (reward_volume is None or gamma_volume > reward_volume):
+        reward_market["volume_24h"] = gamma_volume
+    if reward_market.get("neg_risk") is None and gamma_market.get("neg_risk") is not None:
+        reward_market["neg_risk"] = gamma_market["neg_risk"]
 
 
 def merge_selected_markets(context: BotContext, ranked_candidates: list[MarketConfig]) -> list[MarketConfig]:
     selected: list[MarketConfig] = []
     selected_slugs: set[str] = set()
+    family_counts: dict[str, int] = {}
     ranked_by_slug = {market.slug: market for market in ranked_candidates}
+    max_markets_per_family = max(int(context.filters.get("max_markets_per_family", 0) or 0), 0)
 
     for market in context.positions_to_unwind:
         if context.inventory.get(market.slug).gross_shares > 0.01 and market.slug not in selected_slugs:
             selected.append(ranked_by_slug.get(market.slug, market))
             selected_slugs.add(market.slug)
+            family = market_family_key(market)
+            family_counts[family] = family_counts.get(family, 0) + 1
 
     for market in context.active_markets:
         if context.inventory.get(market.slug).gross_shares > 0.01 and market.slug not in selected_slugs:
             selected.append(ranked_by_slug.get(market.slug, market))
             selected_slugs.add(market.slug)
+            family = market_family_key(market)
+            family_counts[family] = family_counts.get(family, 0) + 1
 
     for market in ranked_candidates:
         if len(selected) >= context.max_active_markets:
             break
         if market.slug in selected_slugs:
             continue
+        family = market_family_key(market)
+        if max_markets_per_family > 0 and family_counts.get(family, 0) >= max_markets_per_family:
+            continue
         selected.append(market)
         selected_slugs.add(market.slug)
+        family_counts[family] = family_counts.get(family, 0) + 1
 
     return selected[: context.max_active_markets]
+
+
+def market_family_key(market: MarketConfig) -> str:
+    base_text = f"{market.slug} {market.question}".lower()
+    cleaned = re.sub(r"[^a-z0-9]+", " ", base_text)
+    stopwords = {
+        "will",
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "of",
+        "on",
+        "to",
+        "by",
+        "for",
+        "between",
+        "over",
+        "under",
+        "more",
+        "less",
+        "than",
+        "get",
+        "gets",
+        "video",
+        "next",
+        "views",
+        "day",
+        "week",
+        "million",
+    }
+    tokens = [
+        token
+        for token in cleaned.split()
+        if token and not token.isdigit() and token not in stopwords and len(token) > 2
+    ]
+    if not tokens:
+        return market.slug
+    return " ".join(tokens[:2])
 
 
 def sync_positions_to_unwind(context: BotContext, report: Any) -> None:
@@ -1557,31 +2226,51 @@ def is_unwind_priority_market(context: BotContext, market: MarketConfig) -> bool
     return any(existing.slug == market.slug for existing in context.positions_to_unwind)
 
 
-def market_passes_filters(market: dict[str, Any], filters: dict[str, Any], min_days: float) -> bool:
-    category = (market.get("category") or "").lower()
+def market_passes_filters(
+    market: dict[str, Any],
+    filters: dict[str, Any],
+    min_days: float,
+    with_reason: bool = False,
+) -> bool | tuple[bool, Optional[str]]:
+    category = (market.get("category") or infer_market_category(market)).lower()
     allowed_categories = {entry.lower() for entry in filters.get("categories", [])}
     excluded_categories = {entry.lower() for entry in filters.get("excluded_categories", [])}
     excluded_keywords = {entry.lower() for entry in filters.get("excluded_keywords", [])}
     searchable_text = f"{market.get('slug', '')} {market.get('question', '')}".lower()
     if category in excluded_categories:
-        return False
+        return reject_filter_result(with_reason, "excluded_category")
     if any(keyword in searchable_text for keyword in excluded_keywords):
-        return False
-    if category and allowed_categories and category not in allowed_categories:
-        return False
+        return reject_filter_result(with_reason, "excluded_keyword")
+    if allowed_categories:
+        if not category:
+            return reject_filter_result(with_reason, "category_not_allowed")
+        if category not in allowed_categories:
+            return reject_filter_result(with_reason, "category_not_allowed")
     if not market.get("accepting_orders", True):
-        return False
-    if float(market.get("volume_24h", 0.0)) < float(filters.get("min_volume_24h", 0.0)):
-        return False
+        return reject_filter_result(with_reason, "not_accepting_orders")
+    volume_24h = float(market.get("volume_24h", 0.0))
+    if volume_24h < float(filters.get("min_volume_24h", 0.0)):
+        return reject_filter_result(with_reason, "volume_too_low")
+    max_volume_24h = _to_optional_float(filters.get("max_volume_24h"))
+    if max_volume_24h is not None and volume_24h > max_volume_24h:
+        return reject_filter_result(with_reason, "volume_too_high")
     reference_price = market.get("reference_price")
     if fair_value_band_breach(reference_price, filters) is not None:
-        return False
+        return reject_filter_result(with_reason, "fair_value_out_of_band")
+    if bool(filters.get("rewards_only", False)) and (_to_optional_float(market.get("reward_rate_per_day")) or 0.0) <= 0.0:
+        return reject_filter_result(with_reason, "not_reward_market")
     end_date = parse_end_date(market.get("end_date"))
+    if min_days > 0 and end_date is None:
+        return reject_filter_result(with_reason, "missing_end_date")
     if end_date is not None:
         days_left = max((end_date - datetime.now(timezone.utc)).total_seconds() / 86400.0, 0.0)
         if days_left < min_days:
-            return False
-    return True
+            return reject_filter_result(with_reason, "too_close_to_resolution")
+    return (True, None) if with_reason else True
+
+
+def reject_filter_result(with_reason: bool, reason: str) -> bool | tuple[bool, Optional[str]]:
+    return (False, reason) if with_reason else False
 
 
 def fair_value_band_breach(fair_value: Optional[float], filters: dict[str, Any]) -> Optional[str]:
@@ -1605,17 +2294,88 @@ def _to_optional_float(value: Any) -> Optional[float]:
         return None
 
 
-def score_market_candidate(volume_24h: float, spread_bps: float) -> float:
-    return spread_bps * max(volume_24h, 1.0)
+def increment_reason(reason_counts: dict[str, int], reason: str) -> None:
+    reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+
+def format_reason_counts(reason_counts: dict[str, int]) -> str:
+    if not reason_counts:
+        return "none"
+    ordered = sorted(reason_counts.items(), key=lambda item: (-item[1], item[0]))
+    return ",".join(f"{reason}={count}" for reason, count in ordered)
+
+
+def score_market_candidate(
+    volume_24h: float,
+    spread_bps: float,
+    reward_rate_per_day: Optional[float] = None,
+    market_competitiveness: Optional[float] = None,
+    reward_min_size: Optional[float] = None,
+    days_to_resolution: Optional[float] = None,
+    sports_preference: bool = False,
+) -> float:
+    reward_rate = max(reward_rate_per_day or 0.0, 0.0)
+    competition_penalty = 1.0 + max(market_competitiveness or 0.0, 0.0)
+    size_penalty = 1.0 + max((reward_min_size or 0.0) / 100.0, 0.0)
+    reward_component = (reward_rate * max(spread_bps, 1.0)) / (competition_penalty * size_penalty)
+    liquidity_component = spread_bps * max(volume_24h, 1.0)
+    duration_component = min(max(days_to_resolution or 0.0, 0.0), 60.0)
+    sports_bonus = 25.0 if sports_preference else 0.0
+    if reward_rate > 0:
+        return reward_component * 1_000_000.0 + liquidity_component + duration_component + sports_bonus
+    return liquidity_component + duration_component + sports_bonus
 
 
 def parse_end_date(value: Any) -> Optional[datetime]:
     if not value:
         return None
+    text = str(value).strip()
+    text = re.sub(r"([+-]\d{2})$", r"\1:00", text)
     try:
-        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def days_to_resolution_from_value(value: Any) -> Optional[float]:
+    end_date = parse_end_date(value)
+    if end_date is None:
+        return None
+    return max((end_date - datetime.now(timezone.utc)).total_seconds() / 86400.0, 0.0)
+
+
+def is_sports_market(market: dict[str, Any]) -> bool:
+    category = str(market.get("category") or infer_market_category(market) or "").lower()
+    question = str(market.get("question") or "").lower()
+    slug = str(market.get("slug") or "").lower()
+    return (
+        category == "sports"
+        or any(keyword in question for keyword in ("nba", "nfl", "mlb", "fifa", "premier league", "champions league"))
+        or any(keyword in slug for keyword in ("nba", "nfl", "mlb", "fifa", "premier-league", "champions-league"))
+    )
+
+
+def infer_market_category(market: dict[str, Any]) -> str:
+    text = f"{market.get('slug') or ''} {market.get('question') or ''}".lower()
+    sports_keywords = (
+        "nba", "nfl", "mlb", "nhl", "fifa", "uefa", "premier league", "champions league",
+        "la liga", "serie a", "bundesliga", "world cup", "arsenal", "bayern", "psg",
+        "real madrid", "barcelona", "lakers", "celtics", "thunder", "spurs", "finals",
+    )
+    politics_keywords = (
+        "election", "president", "vote", "congress", "senate", "house", "trump", "romania",
+        "prime minister", "parliament", "democratic", "republican", "nomination", "government",
+    )
+    crypto_keywords = (
+        "bitcoin", "btc", "ethereum", "eth", "solana", "sol", "xrp", "doge", "crypto", "coinbase",
+    )
+    if any(keyword in text for keyword in sports_keywords):
+        return "sports"
+    if any(keyword in text for keyword in politics_keywords):
+        return "politics"
+    if any(keyword in text for keyword in crypto_keywords):
+        return "crypto"
+    return ""
 
 
 def is_placeholder_market(market: MarketConfig) -> bool:

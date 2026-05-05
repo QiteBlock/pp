@@ -91,6 +91,9 @@ class FillPoller:
         if not fills:
             return 0
 
+        if self.state.last_fetch_ts <= 0:
+            return self._bootstrap_fill_cursor(fills)
+
         processed_count = 0
         max_fill_ts = self.state.last_fetch_ts
         recent_ids = set(self.state.recent_fill_ids or [])
@@ -104,6 +107,10 @@ class FillPoller:
                 continue
 
             if not self._apply_fill(fill, market_slug_mapping):
+                if fill_identity:
+                    self._remember_fill_id(fill_identity)
+                    recent_ids.add(fill_identity)
+                    self.state.last_processed_fill_id = fill.get("id") or fill.get("orderId") or fill_identity
                 continue
 
             processed_count += 1
@@ -112,11 +119,43 @@ class FillPoller:
                 self._remember_fill_id(fill_identity)
                 recent_ids.add(fill_identity)
 
+        state_changed = max_fill_ts != self.state.last_fetch_ts
         self.state.last_fetch_ts = max_fill_ts
-        if processed_count > 0:
+        if processed_count > 0 or state_changed:
             self._save_state()
 
         return processed_count
+
+    def _bootstrap_fill_cursor(self, fills: list[dict[str, Any]]) -> int:
+        """Initialize fill cursor from existing history without replaying it.
+
+        Startup reconciliation already syncs inventory to the current API state,
+        so applying the entire historical fill backlog again would corrupt
+        inventory. On first run (or when state is missing/corrupt), treat the
+        current fill list as already-seen history and start polling from the
+        newest timestamp forward.
+        """
+        sorted_fills = self._sort_fills(fills)
+        max_fill_ts = max((self._extract_timestamp(fill) or 0) for fill in sorted_fills)
+        recent_ids: list[str] = []
+        for fill in sorted_fills[-RECENT_FILL_ID_LIMIT:]:
+            fill_id = self._fill_identity(fill)
+            if fill_id:
+                recent_ids.append(fill_id)
+        self.state.last_fetch_ts = max_fill_ts
+        self.state.last_processed_fill_id = recent_ids[-1] if recent_ids else None
+        self.state.recent_fill_ids = recent_ids
+        self._save_state()
+        self.analytics.log_event(
+            "fill_cursor_bootstrap",
+            {
+                "fills_seen": len(fills),
+                "last_fetch_ts": max_fill_ts,
+                "recent_ids_saved": len(recent_ids),
+            },
+        )
+        print(f"Bootstrapped fill cursor from {len(fills)} historical fill(s)")
+        return 0
 
     def _should_skip_fill(self, fill: dict[str, Any], recent_ids: set[str]) -> bool:
         """Check if we should skip processing this fill (already processed)."""
@@ -141,13 +180,19 @@ class FillPoller:
 
     def _extract_timestamp(self, fill: dict[str, Any]) -> Optional[int]:
         """Extract timestamp from fill record in milliseconds."""
-        for key in ["createdAt", "timestamp", "created_at", "time"]:
+        for key in ["createdAt", "timestamp", "created_at", "time", "match_time", "last_update", "matchTime", "lastUpdate"]:
             ts = fill.get(key)
             if ts:
                 try:
                     if isinstance(ts, str):
+                        stripped = ts.strip()
+                        if stripped.isdigit():
+                            numeric = int(stripped)
+                            if numeric > 100000000000:
+                                return numeric
+                            return numeric * 1000
                         # Parse ISO format timestamp
-                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        dt = datetime.fromisoformat(stripped.replace("Z", "+00:00"))
                         return int(dt.timestamp() * 1000)
                     elif isinstance(ts, (int, float)):
                         # Assume milliseconds if large, seconds if small

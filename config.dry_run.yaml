@@ -1,0 +1,97 @@
+clob:
+  sdk: "v2"
+  host: "https://clob.polymarket.com"
+  chain_id: 137
+  private_key_env: "POLY_PRIVATE_KEY"
+  api_key_env: "POLY_CLOB_API_KEY"
+  api_secret_env: "POLY_CLOB_SECRET"
+  api_passphrase_env: "POLY_CLOB_PASS_PHRASE"
+  signature_type: 2
+  funder: "0x2429CeEe3c7E2160614047AF03F3C3ddF14C0dF3"
+
+gamma:
+  host: "https://gamma-api.polymarket.com"
+
+telegram:
+  enabled: false
+  bot_token_env: "TELEGRAM_BOT_TOKEN"
+  chat_id_env: "TELEGRAM_CHAT_ID"
+  poll_timeout_seconds: 0
+  notify_fills: false
+  notify_market_switch: false
+
+runtime:
+  loop_interval_seconds: 3
+  dry_run: true
+  cancel_before_requote: false
+  log_dir: "data/dryrun"
+  auto_scan_enabled: true
+  force_unwind_only: false
+  scan_limit: 200
+  scan_pages: 5
+  scan_candidate_cap: 60
+  max_active_markets: 3
+  unwind_escalation_cycles: 3
+  fill_cooldown_seconds: 10
+  reconciliation_interval_loops: 0
+  rescan_interval_seconds: 180
+
+pricing:
+  min_half_spread: 0.002
+  max_half_spread: 0.008
+  inventory_skew_per_share: 0.001
+  resolution_risk_multiplier: 0.02
+  volatility_multiplier: 0.35
+  book_spread_multiplier: 0.55
+  probability_edge_multiplier: 0.003
+  size_per_order: 10.0
+  quote_improvement_ticks: 0
+
+risk:
+  max_yes_shares_per_market: 20
+  max_no_shares_per_market: 20
+  max_net_delta_per_market: 20
+  max_total_exposure_usdc: 120
+  max_drawdown_usdc: 50
+  min_days_to_resolution: 1
+  min_order_size: 5
+  requote_inventory_fraction_limit: 0.8
+
+filters:
+  prefer_rewards: true
+  rewards_only: true
+  min_reward_rate_per_day: 5
+  max_competitiveness: 1.2
+  max_markets_per_family: 1
+  min_volume_24h: 3000
+  max_volume_24h: 5000000
+  min_spread_bps: 20
+  min_fair_value: 0.05
+  max_fair_value: 0.95
+  categories:
+    - sports
+    - politics
+    - business
+    - science
+    - tech
+    - economy
+  excluded_categories:
+    - crypto
+  excluded_keywords:
+    - bitcoin
+    - btc
+    - ethereum
+    - eth
+    - solana
+    - sol
+    - xrp
+    - dogecoin
+    - doge
+    - crypto
+    - cryptocurrency
+    - coinbase
+    - binance
+    - tether
+    - usdt
+
+markets: []
