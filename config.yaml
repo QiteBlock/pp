@@ -32,6 +32,7 @@ runtime:
   scan_candidate_cap: 80
   max_active_markets: 3
   unwind_escalation_cycles: 3
+  post_unwind_cooldown_seconds: 1800
   fill_cooldown_seconds: 20
   reconciliation_interval_loops: 25
   rescan_interval_seconds: 300
@@ -45,7 +46,7 @@ pricing:
   book_spread_multiplier: 0.55
   probability_edge_multiplier: 0.003
   size_per_order: 20.0
-  quote_improvement_ticks: 0
+  quote_improvement_ticks: 1
 
 risk:
   max_yes_shares_per_market: 20
@@ -53,7 +54,7 @@ risk:
   max_net_delta_per_market: 20
   max_total_exposure_usdc: 120
   max_drawdown_usdc: 40
-  min_days_to_resolution: 3
+  min_days_to_resolution: 2
   min_order_size: 5
   requote_inventory_fraction_limit: 0.8
 
@@ -61,13 +62,13 @@ filters:
   prefer_rewards: true
   rewards_only: true
   min_reward_rate_per_day: 5
-  max_competitiveness: 1.5
+  max_competitiveness: 2.0
   max_markets_per_family: 1
-  min_volume_24h: 500
+  min_volume_24h: 250
   max_volume_24h: 5000000
   min_spread_bps: 20
-  min_fair_value: 0.10
-  max_fair_value: 0.90
+  min_fair_value: 0.05
+  max_fair_value: 0.95
   categories: []
   excluded_categories:
     - crypto
@@ -88,7 +89,6 @@ filters:
     - tether
     - usdt
     - shutdown
-    - announce
     - airspace
     - invade
     - peace deal

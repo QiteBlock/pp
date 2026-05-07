@@ -1,0 +1,28 @@
+[
+  {
+    "slug": "will-russia-enter-novooleksandrivka-by-may-31-2026",
+    "question": "Will Russia enter Novooleksandrivka by May 31, 2026?",
+    "yes_token_id": "53977334760226546487346002683262680792627051079355230662561651090248063805325",
+    "no_token_id": "81431351308040964692647704422622523612522347077885663081053953612197805444604",
+    "end_date": "2026-05-31T00:00:00+00:00",
+    "neg_risk": false,
+    "condition_id": "0x6fd1df75a50347e4ec77ce31419d4a672a11485ceeef337cc0fbef6bb1edaf1c",
+    "reward_rate_per_day": 50.0,
+    "rewards_min_size": 20.0,
+    "rewards_max_spread": 5.5,
+    "market_competitiveness": 1.539336
+  },
+  {
+    "slug": "will-openai-announce-earbuds-or-headphones-in-2026",
+    "question": "Will OpenAI announce earbuds or headphones in 2026?",
+    "yes_token_id": "16040470176590332178266575986841073712697460370218768293287706373316090538021",
+    "no_token_id": "2495741164869514855992472185546919768592825594811693043740639350245507358833",
+    "end_date": "2026-12-31T00:00:00+00:00",
+    "neg_risk": false,
+    "condition_id": "0x3ff9124b87f05d7a65ec801f28cb336b86c16a2197afb0139731610d55e21d27",
+    "reward_rate_per_day": 50.0,
+    "rewards_min_size": 20.0,
+    "rewards_max_spread": 4.5,
+    "market_competitiveness": 0.828542
+  }
+]

@@ -56,6 +56,10 @@ class BotContext:
     active_markets: list[MarketConfig]
     positions_to_unwind: list[MarketConfig]
     discovered_positions_path: Path
+    market_cache_path: Path
+    reentry_cooldown_path: Path
+    post_unwind_cooldown_seconds: int
+    reentry_cooldowns: dict[str, float]
     filters: dict[str, Any]
 
 
@@ -145,6 +149,8 @@ def load_context(config_path: str) -> BotContext:
     reconciler = PositionReconciler(client, inventory)
     duplicate_detector = OrderDuplicateDetector(runtime["log_dir"])
     discovered_positions_path = Path(runtime["log_dir"]) / "discovered_positions.json"
+    market_cache_path = Path(runtime["log_dir"]) / "market_cache.json"
+    reentry_cooldown_path = Path(runtime["log_dir"]) / "reentry_cooldowns.json"
 
     context = BotContext(
         client=client,
@@ -176,9 +182,14 @@ def load_context(config_path: str) -> BotContext:
         active_markets=[],
         positions_to_unwind=[],
         discovered_positions_path=discovered_positions_path,
+        market_cache_path=market_cache_path,
+        reentry_cooldown_path=reentry_cooldown_path,
+        post_unwind_cooldown_seconds=max(int(runtime.get("post_unwind_cooldown_seconds", 1800)), 0),
+        reentry_cooldowns=load_reentry_cooldowns(reentry_cooldown_path),
         filters=config.get("filters", {}),
     )
     hydrate_discovered_position_markets(context)
+    hydrate_market_cache(context)
     return context
 
 
@@ -190,6 +201,79 @@ def hydrate_discovered_position_markets(context: BotContext) -> None:
     if len(merged) != len(context.markets):
         print(f"Loaded {len(merged) - len(context.markets)} persisted position market(s)")
     context.markets = merged
+
+
+def hydrate_market_cache(context: BotContext) -> None:
+    cached_markets = load_cached_markets(context.market_cache_path)
+    if not cached_markets:
+        return
+    context.markets = merge_unique_markets(context.markets, cached_markets)
+
+
+def load_cached_markets(path: Path) -> list[MarketConfig]:
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, list):
+        return []
+    return parse_market_configs([item for item in payload if isinstance(item, dict)])
+
+
+def save_market_cache(context: BotContext) -> None:
+    path = context.market_cache_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = [market_to_dict(market) for market in markets_for_state_tracking(context)]
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def save_market_cache_entries(context: BotContext, markets: list[MarketConfig]) -> None:
+    if not markets:
+        return
+    cached = load_cached_markets(context.market_cache_path)
+    merged = merge_unique_markets(cached, markets)
+    context.market_cache_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = [market_to_dict(market) for market in merged]
+    context.market_cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def load_reentry_cooldowns(path: Path) -> dict[str, float]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    result: dict[str, float] = {}
+    now = time.time()
+    for slug, expires_at in payload.items():
+        try:
+            expires = float(expires_at)
+        except (TypeError, ValueError):
+            continue
+        if expires > now:
+            result[str(slug)] = expires
+    return result
+
+
+def save_reentry_cooldowns(context: BotContext) -> None:
+    prune_reentry_cooldowns(context)
+    path = context.reentry_cooldown_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(context.reentry_cooldowns, indent=2), encoding="utf-8")
+
+
+def prune_reentry_cooldowns(context: BotContext) -> None:
+    now = time.time()
+    context.reentry_cooldowns = {
+        slug: expires_at
+        for slug, expires_at in context.reentry_cooldowns.items()
+        if expires_at > now
+    }
 
 
 def load_discovered_position_markets(path: Path) -> list[MarketConfig]:
@@ -286,6 +370,7 @@ def markets_for_state_tracking(context: BotContext) -> list[MarketConfig]:
 def perform_reconciliation(context: BotContext, trigger: str, **details: Any) -> Any:
     report = context.reconciler.reconcile_positions(markets_for_state_tracking(context))
     sync_positions_to_unwind(context, report)
+    save_market_cache(context)
     payload = {
         "trigger": trigger,
         "status": report.status,
@@ -819,6 +904,22 @@ def process_unwind_market(
         f"[{market.slug}] unwind-only: mode={mode} aggressive={effective_aggressive} reason={reason} "
         f"placing {order_request['label']} price={order_request['price']:.3f} size={order_request['size']:.4f}"
     )
+    if (
+        mode == "flatten"
+        and order_request["side"].upper() == "SELL"
+        and response_is_success(response)
+        and context.post_unwind_cooldown_seconds > 0
+    ):
+        context.reentry_cooldowns[market.slug] = time.time() + context.post_unwind_cooldown_seconds
+        save_reentry_cooldowns(context)
+        context.analytics.log_event(
+            "market_reentry_cooldown",
+            {
+                "market": market.slug,
+                "reason": reason,
+                "cooldown_seconds": context.post_unwind_cooldown_seconds,
+            },
+        )
     if mode == "trim":
         inventory.unwind_cycles_without_fill += 1
     print_order_response(order_request["label"], response)
@@ -1190,6 +1291,15 @@ def retry_unwind_with_safe_price(
             },
         )
         return None
+
+
+def response_is_success(response: Any) -> bool:
+    if not isinstance(response, dict):
+        return False
+    if bool(response.get("success")):
+        return True
+    status = str(response.get("status") or "").lower()
+    return status in {"matched", "live", "filled"}
 
 
 def derive_safe_post_only_sell_price(book: OrderBookSnapshot) -> Optional[float]:
@@ -1653,6 +1763,7 @@ def initialize_market_selection(context: BotContext) -> None:
 
 
 def refresh_market_selection(context: BotContext, force: bool = False) -> None:
+    prune_reentry_cooldowns(context)
     if context.force_unwind_only:
         context.positions_to_unwind = [
             market for market in context.positions_to_unwind if context.inventory.get(market.slug).gross_shares > 0.01
@@ -1851,6 +1962,7 @@ def select_best_markets(context: BotContext) -> Optional[list[MarketConfig]]:
 
 def scan_gamma_candidates(context: BotContext) -> tuple[list[dict[str, Any]], int, int, dict[str, int]]:
     filtered_candidates: list[dict[str, Any]] = []
+    cache_candidates: list[MarketConfig] = []
     raw_count = 0
     normalized_count = 0
     reason_counts: dict[str, int] = {}
@@ -1868,6 +1980,7 @@ def scan_gamma_candidates(context: BotContext) -> tuple[list[dict[str, Any]], in
                 increment_reason(reason_counts, "normalize_failed")
                 continue
             normalized_count += 1
+            cache_candidates.append(market_config_from_normalized(normalized))
             allowed, reject_reason = market_passes_filters(
                 normalized,
                 context.filters,
@@ -1878,6 +1991,7 @@ def scan_gamma_candidates(context: BotContext) -> tuple[list[dict[str, Any]], in
                 increment_reason(reason_counts, reject_reason or "filtered_out")
                 continue
             filtered_candidates.append(normalized)
+    save_market_cache_entries(context, cache_candidates)
     return filtered_candidates, raw_count, normalized_count, reason_counts
 
 
@@ -1886,6 +2000,7 @@ def scan_reward_candidates(context: BotContext) -> tuple[list[dict[str, Any]], i
         return [], 0, 0, {}
     filtered_candidates: list[dict[str, Any]] = []
     normalized_rewards: list[dict[str, Any]] = []
+    cache_candidates: list[MarketConfig] = []
     raw_count = 0
     normalized_count = 0
     reason_counts: dict[str, int] = {}
@@ -1929,6 +2044,7 @@ def scan_reward_candidates(context: BotContext) -> tuple[list[dict[str, Any]], i
     gamma_index = build_gamma_reward_metadata_index(context, normalized_rewards)
     for normalized in normalized_rewards:
         enrich_reward_market_with_gamma(normalized, gamma_index)
+        cache_candidates.append(market_config_from_normalized(normalized))
         allowed, reject_reason = market_passes_filters(
             normalized,
             context.filters,
@@ -1957,6 +2073,7 @@ def scan_reward_candidates(context: BotContext) -> tuple[list[dict[str, Any]], i
             increment_reason(reason_counts, "reward_min_size_above_budget")
             continue
         filtered_candidates.append(normalized)
+    save_market_cache_entries(context, cache_candidates)
     return filtered_candidates, raw_count, normalized_count, reason_counts
 
 
@@ -2071,6 +2188,22 @@ def enrich_reward_market_with_gamma(
         reward_market["neg_risk"] = gamma_market["neg_risk"]
 
 
+def market_config_from_normalized(normalized: dict[str, Any]) -> MarketConfig:
+    return MarketConfig(
+        slug=normalized["slug"],
+        question=normalized.get("question") or normalized["slug"],
+        yes_token_id=normalized["yes_token_id"],
+        no_token_id=normalized["no_token_id"],
+        end_date=parse_end_date(normalized.get("end_date")),
+        neg_risk=normalized.get("neg_risk"),
+        condition_id=normalized.get("condition_id"),
+        reward_rate_per_day=_to_optional_float(normalized.get("reward_rate_per_day")),
+        rewards_min_size=_to_optional_float(normalized.get("rewards_min_size")),
+        rewards_max_spread=_to_optional_float(normalized.get("rewards_max_spread")),
+        market_competitiveness=_to_optional_float(normalized.get("market_competitiveness")),
+    )
+
+
 def merge_selected_markets(context: BotContext, ranked_candidates: list[MarketConfig]) -> list[MarketConfig]:
     selected: list[MarketConfig] = []
     selected_slugs: set[str] = set()
@@ -2096,6 +2229,8 @@ def merge_selected_markets(context: BotContext, ranked_candidates: list[MarketCo
         if len(selected) >= context.max_active_markets:
             break
         if market.slug in selected_slugs:
+            continue
+        if market_in_reentry_cooldown(context, market) and context.inventory.get(market.slug).gross_shares <= 0.01:
             continue
         family = market_family_key(market)
         if max_markets_per_family > 0 and family_counts.get(family, 0) >= max_markets_per_family:
@@ -2159,6 +2294,7 @@ def sync_positions_to_unwind(context: BotContext, report: Any) -> None:
     positions.sort(key=lambda market: context.inventory.get(market.slug).gross_shares, reverse=True)
     context.positions_to_unwind = positions
     save_discovered_position_markets(context)
+    save_market_cache(context)
 
 
 def sync_positions_to_unwind_from_inventory(context: BotContext) -> None:
@@ -2170,6 +2306,7 @@ def sync_positions_to_unwind_from_inventory(context: BotContext) -> None:
     positions.sort(key=lambda market: context.inventory.get(market.slug).gross_shares, reverse=True)
     context.positions_to_unwind = positions
     save_discovered_position_markets(context)
+    save_market_cache(context)
 
 
 def discover_markets_for_unknown_positions(context: BotContext, unknown_positions: dict[str, float]) -> list[MarketConfig]:
@@ -2179,6 +2316,22 @@ def discover_markets_for_unknown_positions(context: BotContext, unknown_position
 
     discovered: list[MarketConfig] = []
     matched_tokens: set[str] = set()
+    cached_markets = load_cached_markets(context.market_cache_path)
+
+    for market in cached_markets:
+        matched_here = False
+        inventory = context.inventory.get(market.slug)
+        if market.yes_token_id in target_token_ids:
+            inventory.yes_shares = max(float(unknown_positions[market.yes_token_id]), 0.0)
+            matched_tokens.add(market.yes_token_id)
+            matched_here = True
+        if market.no_token_id in target_token_ids:
+            inventory.no_shares = max(float(unknown_positions[market.no_token_id]), 0.0)
+            matched_tokens.add(market.no_token_id)
+            matched_here = True
+        if matched_here and all(existing.slug != market.slug for existing in discovered):
+            discovered.append(market)
+
     scan_pages = max(context.scan_pages, 25)
 
     for page in range(scan_pages):
@@ -2219,11 +2372,24 @@ def discover_markets_for_unknown_positions(context: BotContext, unknown_position
     unresolved = sorted(target_token_ids - matched_tokens)
     if unresolved:
         context.analytics.log_event("position_discovery_unresolved", {"token_ids": unresolved})
+    if discovered:
+        save_market_cache_entries(context, discovered)
     return discovered
 
 
 def is_unwind_priority_market(context: BotContext, market: MarketConfig) -> bool:
     return any(existing.slug == market.slug for existing in context.positions_to_unwind)
+
+
+def market_in_reentry_cooldown(context: BotContext, market: MarketConfig) -> bool:
+    expires_at = context.reentry_cooldowns.get(market.slug)
+    if expires_at is None:
+        return False
+    if expires_at <= time.time():
+        context.reentry_cooldowns.pop(market.slug, None)
+        save_reentry_cooldowns(context)
+        return False
+    return True
 
 
 def market_passes_filters(
