@@ -709,6 +709,7 @@ impl PrivateDataSource for HibachiClient {
             .map(|order| {
                 Ok(OpenOrder {
                     order_id: order.order_id,
+                    client_order_id: None,
                     nonce: order.nonce.unwrap_or_default(),
                     level_index: None,
                     symbol: order.symbol,
@@ -972,6 +973,7 @@ fn parse_open_order(value: &Value) -> Option<OpenOrder> {
             .get("orderId")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
+        client_order_id: None,
         nonce: value
             .get("nonce")
             .and_then(Value::as_u64)

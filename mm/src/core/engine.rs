@@ -1607,10 +1607,10 @@ where
         is_simulated: bool,
         live_quote_metadata: &mut HashMap<(String, Side, usize), LiveQuoteMetadata>,
     ) -> Result<()> {
-        let Some(level_index) = order.level_index else {
+        let Some(key) = find_live_quote_metadata_key_for_ack(order, live_quote_metadata) else {
             return Ok(());
         };
-        let key = (order.symbol.clone(), order.side, level_index);
+        let level_index = key.2;
         if let Some(meta) = live_quote_metadata.get_mut(&key) {
             if meta.ack_ts.is_none() {
                 meta.ack_ts = Some(ack_ts);
@@ -2938,6 +2938,80 @@ where
         }
         Ok(orders)
     }
+}
+
+fn find_live_quote_metadata_key_for_ack(
+    order: &crate::domain::OpenOrder,
+    live_quote_metadata: &HashMap<(String, Side, usize), LiveQuoteMetadata>,
+) -> Option<(String, Side, usize)> {
+    if let Some(client_order_id) = order.client_order_id.as_deref() {
+        if let Some((key, _)) = live_quote_metadata
+            .iter()
+            .find(|(_, meta)| meta.client_order_key == client_order_id)
+        {
+            return Some(key.clone());
+        }
+    }
+
+    if let Some(level_index) = order.level_index {
+        let key = (order.symbol.clone(), order.side, level_index);
+        if live_quote_metadata.contains_key(&key) {
+            return Some(key);
+        }
+    }
+
+    if let Some(order_id) = order.order_id.as_deref() {
+        if let Some((key, _)) = live_quote_metadata
+            .iter()
+            .find(|(_, meta)| meta.order_id.as_deref() == Some(order_id))
+        {
+            return Some(key.clone());
+        }
+    }
+
+    let mut candidates: Vec<(&(String, Side, usize), &LiveQuoteMetadata)> = live_quote_metadata
+        .iter()
+        .filter(|((symbol, side, _), meta)| {
+            symbol == &order.symbol && *side == order.side && meta.ack_ts.is_none()
+        })
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    if candidates.len() == 1 {
+        return Some(candidates[0].0.clone());
+    }
+
+    if let Some(order_price) = order.price {
+        let price_matches: Vec<_> = candidates
+            .iter()
+            .copied()
+            .filter(|(_, meta)| meta.quote_price == Some(order_price))
+            .collect();
+        if price_matches.len() == 1 {
+            return Some(price_matches[0].0.clone());
+        }
+        if !price_matches.is_empty() {
+            candidates = price_matches;
+        }
+    }
+
+    let qty_matches: Vec<_> = candidates
+        .iter()
+        .copied()
+        .filter(|(_, meta)| meta.quantity == order.remaining_quantity)
+        .collect();
+    if qty_matches.len() == 1 {
+        return Some(qty_matches[0].0.clone());
+    }
+    if !qty_matches.is_empty() {
+        candidates = qty_matches;
+    }
+
+    candidates
+        .into_iter()
+        .max_by_key(|(_, meta)| meta.placed_at)
+        .map(|(key, _)| key.clone())
 }
 
 fn build_strategy_snapshot(

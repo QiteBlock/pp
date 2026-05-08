@@ -1590,6 +1590,7 @@ fn parse_grvt_timestamp(value: Option<&Value>) -> Option<DateTime<Utc>> {
 
 fn parse_grvt_open_order(value: &Value) -> Option<OpenOrder> {
     let leg = value.get("legs")?.as_array()?.first()?;
+    let client_order_id = extract_grvt_client_order_id(value);
     let book_size = value
         .get("state")
         .and_then(|state| state.get("book_size").or_else(|| state.get("bs")))
@@ -1608,12 +1609,13 @@ fn parse_grvt_open_order(value: &Value) -> Option<OpenOrder> {
             .or_else(|| value.get("oi"))
             .and_then(Value::as_str)
             .map(ToOwned::to_owned),
+        client_order_id: client_order_id.clone(),
         nonce: value
             .get("signature")
             .and_then(|signature| signature.get("nonce").or_else(|| signature.get("n")))
             .and_then(Value::as_u64)
             .unwrap_or_default(),
-        level_index: extract_grvt_client_order_id(value)
+        level_index: client_order_id
             .as_deref()
             .and_then(parse_grvt_level_index_from_client_order_id),
         symbol: grvt_symbol_to_internal(

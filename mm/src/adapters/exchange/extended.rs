@@ -1144,6 +1144,7 @@ fn parse_extended_open_order(order: &ExtendedOrder) -> Option<OpenOrder> {
     }
     Some(OpenOrder {
         order_id: Some(order.id.to_string()),
+        client_order_id: order.external_id.clone(),
         nonce: 0,
         level_index: None,
         symbol: order.market.clone(),
@@ -1515,6 +1516,8 @@ struct ExtendedPosition {
 #[serde(rename_all = "camelCase")]
 struct ExtendedOrder {
     id: u64,
+    #[serde(alias = "externalId", alias = "external_id")]
+    external_id: Option<String>,
     market: String,
     side: String,
     price: Option<String>,

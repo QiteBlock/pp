@@ -3,8 +3,8 @@ use std::{env, sync::Arc};
 use anyhow::{Context, Result};
 use market_making::{
     adapters::exchange::{
-        decibel::DecibelClient, extended::ExtendedClient, grvt::GrvtClient,
-        hibachi::HibachiClient, AnyExchangeClient,
+        decibel::DecibelClient, extended::ExtendedClient, grvt::GrvtClient, hibachi::HibachiClient,
+        AnyExchangeClient,
     },
     adapters::notifier::telegram::{TelegramCommand, TelegramNotifier},
     adapters::storage::sqlite::FillStore,

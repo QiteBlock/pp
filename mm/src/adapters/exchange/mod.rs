@@ -8,7 +8,9 @@ use crate::domain::{
     PrivateEvent,
 };
 
-use self::{decibel::DecibelClient, extended::ExtendedClient, grvt::GrvtClient, hibachi::HibachiClient};
+use self::{
+    decibel::DecibelClient, extended::ExtendedClient, grvt::GrvtClient, hibachi::HibachiClient,
+};
 
 pub mod decibel;
 pub mod extended;

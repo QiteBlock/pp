@@ -646,7 +646,13 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             )
             print_open_orders_from_lists(existing_yes_orders, existing_no_orders)
             return
-        cancel_market_orders_for_requote(context, market, existing_yes_orders, existing_no_orders)
+        if not cancel_market_orders_for_requote(context, market, existing_yes_orders, existing_no_orders):
+            context.analytics.log_event(
+                "risk_skip",
+                {"market": market.slug, "reason": "cancel_failed_before_requote"},
+            )
+            print(f"[{market.slug}] skipped: cancel failed before requote")
+            return
 
     # Check for duplicate orders before placing new ones
     if not context.dry_run and place_yes_bid and place_no_bid:
@@ -803,6 +809,10 @@ def process_unwind_market(
                 f"reason={reason}\n"
                 "trading paused, attempting unwind"
             )
+    if mode == "flatten":
+        merge_result = attempt_merge_before_flatten(context, market, inventory, reason)
+        if merge_result == "merged_all":
+            return
     effective_aggressive = mode == "flatten" or aggressive or (
         mode == "trim" and inventory.unwind_cycles_without_fill >= context.unwind_escalation_cycles
     )
@@ -840,11 +850,24 @@ def process_unwind_market(
 
     if not context.dry_run and order_request["side"].upper() == "SELL":
         yes_orders, no_orders = fetch_market_open_orders(context, market)
-        cancel_market_orders_for_requote(context, market, yes_orders, no_orders)
+        if not cancel_market_orders_for_requote(context, market, yes_orders, no_orders):
+            context.analytics.log_event(
+                "unwind_skip",
+                {
+                    "market": market.slug,
+                    "reason": "cancel_failed_before_unwind",
+                    "mode": mode,
+                    "aggressive": effective_aggressive,
+                    "label": order_request["label"],
+                },
+            )
+            print(f"[{market.slug}] skipped: cancel failed before {order_request['label']}")
+            return
         refresh_sell_unwind_order(context, order_request, aggressive=effective_aggressive)
 
     if not context.dry_run and order_request["side"].upper() == "SELL":
         if not prepare_sell_unwind_order(context, market, inventory, order_request):
+            maybe_handle_dust_position(context, market, inventory)
             return
 
     try:
@@ -1326,7 +1349,7 @@ def derive_sell_price(
         escaped = max(book.best_bid - max(book.tick_size, 0.01), 0.01)
         return clamp_probability(round_to_tick(escaped, book.tick_size, down=True))
     if aggressive and book.best_bid is not None:
-        return clamp_probability(round_to_tick(book.best_bid, book.tick_size, down=True))
+        return clamp_probability(round_sell_at_best_bid(book.best_bid, book.tick_size))
     target = clamp_probability(fair_value + half_spread)
     price = round_to_tick(target, book.tick_size, down=False)
     if book.best_bid is not None:
@@ -1344,7 +1367,7 @@ def refresh_sell_unwind_order(context: BotContext, order_request: dict[str, Any]
         order_request["price"] = derive_sell_price(book, 0.5, 0.0, aggressive=True, ioc_escape=True)
         return
     if aggressive and book.best_bid is not None:
-        order_request["price"] = clamp_probability(round_to_tick(book.best_bid, book.tick_size, down=True))
+        order_request["price"] = clamp_probability(round_sell_at_best_bid(book.best_bid, book.tick_size))
 
 
 def retry_unwind_with_safe_price(
@@ -1528,7 +1551,7 @@ def should_keep_existing_quotes(
     orders: list[dict[str, Any]],
     target_price: float,
     target_size: float,
-    price_tolerance: float = 0.001,
+    price_tolerance: float = 0.01,
     size_tolerance: float = 0.1,
 ) -> bool:
     for order in orders:
@@ -1549,11 +1572,11 @@ def cancel_market_orders_for_requote(
     market: MarketConfig,
     yes_orders: list[dict[str, Any]],
     no_orders: list[dict[str, Any]],
-) -> None:
+) -> bool:
     if context.dry_run:
-        return
+        return True
     if not yes_orders and not no_orders:
-        return
+        return True
     try:
         if yes_orders:
             context.client.cancel_market_orders(market.yes_token_id, dry_run=False)
@@ -1568,12 +1591,14 @@ def cancel_market_orders_for_requote(
             },
         )
         print(f"[{market.slug}] canceled stale orders yes={len(yes_orders)} no={len(no_orders)}")
+        return True
     except Exception as exc:
         context.analytics.log_event(
             "cancel_market_requote_error",
             {"market": market.slug, "error": str(exc)},
         )
         print(f"[{market.slug}] stale order cancel failed: {exc}")
+        return False
 
 
 def handle_telegram_commands(context: BotContext) -> None:
@@ -2018,6 +2043,61 @@ def maybe_handle_dust_position(context: BotContext, market: MarketConfig, invent
                 "no_shares": inventory.no_shares,
             },
         )
+
+
+def attempt_merge_before_flatten(context: BotContext, market: MarketConfig, inventory: Any, reason: str) -> Optional[str]:
+    paired_shares = min(inventory.yes_shares, inventory.no_shares)
+    if paired_shares <= 0.01:
+        return None
+    if not market.condition_id:
+        context.analytics.log_event(
+            "merge_skip",
+            {"market": market.slug, "reason": "missing_condition_id", "paired_shares": paired_shares},
+        )
+        return None
+    try:
+        response = context.client.merge_position_pair(market.condition_id, paired_shares, dry_run=context.dry_run)
+    except Exception as exc:
+        context.analytics.log_event(
+            "merge_error",
+            {
+                "market": market.slug,
+                "reason": reason,
+                "paired_shares": paired_shares,
+                "details": str(exc),
+            },
+        )
+        print(f"[{market.slug}] merge before flatten failed: {exc}")
+        return None
+    inventory.yes_shares = max(inventory.yes_shares - paired_shares, 0.0)
+    inventory.no_shares = max(inventory.no_shares - paired_shares, 0.0)
+    context.analytics.log_event(
+        "flatten_pair_merge",
+        {
+            "market": market.slug,
+            "reason": reason,
+            "paired_shares": paired_shares,
+            "response": response,
+        },
+    )
+    print(
+        f"[{market.slug}] merged paired YES/NO before flatten "
+        f"paired={paired_shares:.4f} status={response.get('status', 'submitted')}"
+    )
+    if not context.dry_run:
+        run_recovery_reconciliation(context, "flatten_pair_merge", market=market.slug, shares=paired_shares)
+    if inventory.gross_shares <= 0.01:
+        return "merged_all"
+    return "merged_partial"
+
+
+def round_sell_at_best_bid(best_bid: float, tick_size: float) -> float:
+    down_price = round_to_tick(best_bid, tick_size, down=True)
+    if best_bid - down_price > 1e-9:
+        up_price = round_to_tick(best_bid, tick_size, down=False)
+        if up_price >= best_bid - 1e-9:
+            return up_price
+    return down_price
 
 
 def is_non_actionable_dust_position(context: BotContext, market: MarketConfig, inventory: Any) -> bool:

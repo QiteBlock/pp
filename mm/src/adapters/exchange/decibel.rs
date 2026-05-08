@@ -113,7 +113,9 @@ impl DecibelClient {
     }
 
     async fn ensure_market_cache(&self) -> Result<()> {
-        if self.market_by_symbol.read().await.is_some() && self.symbol_by_market_addr.read().await.is_some() {
+        if self.market_by_symbol.read().await.is_some()
+            && self.symbol_by_market_addr.read().await.is_some()
+        {
             return Ok(());
         }
 
@@ -167,7 +169,13 @@ impl DecibelClient {
             .context("invalid Decibel websocket protocol header")
     }
 
-    async fn connect_ws(&self) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>> {
+    async fn connect_ws(
+        &self,
+    ) -> Result<
+        tokio_tungstenite::WebSocketStream<
+            tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+        >,
+    > {
         let mut request = self
             .ws_url()
             .into_client_request()
@@ -176,19 +184,17 @@ impl DecibelClient {
             HeaderName::from_static(SEC_WEBSOCKET_PROTOCOL),
             self.websocket_protocol_header_value()?,
         );
-        request.headers_mut().insert(
-            USER_AGENT,
-            HeaderValue::from_str(&self.config.user_agent)?,
-        );
+        request
+            .headers_mut()
+            .insert(USER_AGENT, HeaderValue::from_str(&self.config.user_agent)?);
         let origin = if self.config.decibel_origin.trim().is_empty() {
             "https://app.decibel.trade/trade"
         } else {
             self.config.decibel_origin.trim()
         };
-        request.headers_mut().insert(
-            ORIGIN,
-            HeaderValue::from_str(origin)?,
-        );
+        request
+            .headers_mut()
+            .insert(ORIGIN, HeaderValue::from_str(origin)?);
         let (ws_stream, _) = connect_async(request).await?;
         Ok(ws_stream)
     }
@@ -437,6 +443,10 @@ impl DecibelClient {
                 .get("order_id")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned),
+            client_order_id: value
+                .get("client_order_id")
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned),
             nonce: 0,
             level_index: None,
             symbol,
@@ -526,8 +536,13 @@ impl MarketDataSource for DecibelClient {
             .into_iter()
             .map(|(_, market_addr)| format!("market_price:{market_addr}"))
             .collect();
-        self.run_market_ws_loop("decibel_market_price", topics, sender, parse_decibel_market_price_events)
-            .await
+        self.run_market_ws_loop(
+            "decibel_market_price",
+            topics,
+            sender,
+            parse_decibel_market_price_events,
+        )
+        .await
     }
 
     async fn stream_spot_prices(
@@ -541,8 +556,13 @@ impl MarketDataSource for DecibelClient {
             .into_iter()
             .map(|(_, market_addr)| format!("market_price:{market_addr}"))
             .collect();
-        self.run_market_ws_loop("decibel_oracle_price", topics, sender, parse_decibel_oracle_price_events)
-            .await
+        self.run_market_ws_loop(
+            "decibel_oracle_price",
+            topics,
+            sender,
+            parse_decibel_oracle_price_events,
+        )
+        .await
     }
 
     async fn stream_best_bid_ask(
@@ -556,8 +576,13 @@ impl MarketDataSource for DecibelClient {
             .into_iter()
             .map(|(_, market_addr)| format!("depth:{market_addr}:1"))
             .collect();
-        self.run_market_ws_loop("decibel_depth_bbo", topics, sender, parse_decibel_bbo_events)
-            .await
+        self.run_market_ws_loop(
+            "decibel_depth_bbo",
+            topics,
+            sender,
+            parse_decibel_bbo_events,
+        )
+        .await
     }
 
     async fn stream_trades(
@@ -586,17 +611,19 @@ impl MarketDataSource for DecibelClient {
             .into_iter()
             .map(|(_, market_addr)| format!("depth:{market_addr}:1"))
             .collect();
-        self.run_market_ws_loop("decibel_depth_book", topics, sender, parse_decibel_orderbook_events)
-            .await
+        self.run_market_ws_loop(
+            "decibel_depth_book",
+            topics,
+            sender,
+            parse_decibel_orderbook_events,
+        )
+        .await
     }
 }
 
 #[async_trait]
 impl PrivateDataSource for DecibelClient {
-    async fn stream_private_data(
-        &self,
-        sender: mpsc::Sender<PrivateEvent>,
-    ) -> Result<()> {
+    async fn stream_private_data(&self, sender: mpsc::Sender<PrivateEvent>) -> Result<()> {
         self.request_policy
             .run_ws_loop(
                 "decibel_private",
@@ -634,7 +661,10 @@ impl PrivateDataSource for DecibelClient {
         let response: DecibelPaginated<DecibelOpenOrderItem> = response.json().await?;
         let mut orders = Vec::new();
         for item in response.items {
-            if let Some(order) = self.parse_open_order_value(&serde_json::to_value(item)?).await? {
+            if let Some(order) = self
+                .parse_open_order_value(&serde_json::to_value(item)?)
+                .await?
+            {
                 orders.push(order);
             }
         }
@@ -662,7 +692,10 @@ impl PrivateDataSource for DecibelClient {
             if item.is_deleted {
                 continue;
             }
-            if let Some(position) = self.parse_position_value(&serde_json::to_value(item)?).await? {
+            if let Some(position) = self
+                .parse_position_value(&serde_json::to_value(item)?)
+                .await?
+            {
                 positions.push(position);
             }
         }
@@ -723,7 +756,8 @@ impl ExchangeClient for DecibelClient {
         let Ok(prices) = response.json::<Vec<DecibelPriceItem>>().await else {
             return Vec::new();
         };
-        let Ok(symbol_by_market_addr) = self.symbol_by_market_addr.read().await.clone().ok_or(()) else {
+        let Ok(symbol_by_market_addr) = self.symbol_by_market_addr.read().await.clone().ok_or(())
+        else {
             return Vec::new();
         };
         let wanted: std::collections::HashSet<&str> = symbols.iter().map(String::as_str).collect();

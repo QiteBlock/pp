@@ -133,6 +133,7 @@ impl BotState {
                 order_id.clone(),
                 OpenOrder {
                     order_id: Some(order_id),
+                    client_order_id: None,
                     nonce: 0,
                     level_index: Some(order.level_index),
                     symbol: order.symbol.clone(),

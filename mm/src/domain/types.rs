@@ -99,6 +99,7 @@ pub struct OrderRequest {
 #[derive(Clone, Debug, Default)]
 pub struct OpenOrder {
     pub order_id: Option<String>,
+    pub client_order_id: Option<String>,
     pub nonce: u64,
     pub level_index: Option<usize>,
     pub symbol: String,
