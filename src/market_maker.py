@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional
 import json
@@ -23,6 +23,14 @@ from .signals import build_signal
 from .telegram_bot import BotControl, TelegramController
 
 EXCHANGE_MIN_ORDER_SIZE = 5.0
+TOXIC_FLOW_TRADE_WINDOW = 12
+TOXIC_FLOW_ONE_WAY_THRESHOLD = 0.70
+TOXIC_FLOW_VOL_MULTIPLIER = 1.0
+UNWIND_IOC_ESCAPE_VOL_MULTIPLIER = 1.5
+UNWIND_IOC_ESCAPE_CYCLES = 2
+ADAPTIVE_FILL_COOLDOWN_MILD = 45
+ADAPTIVE_FILL_COOLDOWN_STRONG = 60
+MERGE_GAS_FALLBACK_USDC = 1.0
 
 
 @dataclass
@@ -225,7 +233,8 @@ def load_cached_markets(path: Path) -> list[MarketConfig]:
 def save_market_cache(context: BotContext) -> None:
     path = context.market_cache_path
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = [market_to_dict(market) for market in markets_for_state_tracking(context)]
+    merged = merge_unique_markets(load_cached_markets(path), markets_for_state_tracking(context))
+    payload = [market_to_dict(market) for market in merged]
     path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
@@ -340,6 +349,16 @@ def prefer_market_metadata(current: MarketConfig, candidate: MarketConfig) -> Ma
         current.end_date = candidate.end_date
     if current.neg_risk is None and candidate.neg_risk is not None:
         current.neg_risk = candidate.neg_risk
+    if not current.condition_id and candidate.condition_id:
+        current.condition_id = candidate.condition_id
+    if current.reward_rate_per_day is None and candidate.reward_rate_per_day is not None:
+        current.reward_rate_per_day = candidate.reward_rate_per_day
+    if current.rewards_min_size is None and candidate.rewards_min_size is not None:
+        current.rewards_min_size = candidate.rewards_min_size
+    if current.rewards_max_spread is None and candidate.rewards_max_spread is not None:
+        current.rewards_max_spread = candidate.rewards_max_spread
+    if current.market_competitiveness is None and candidate.market_competitiveness is not None:
+        current.market_competitiveness = candidate.market_competitiveness
     return current
 
 
@@ -407,6 +426,7 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
     recent_prices = context.client.fetch_market_history(market.yes_token_id)
     signal = build_signal(book.midpoint, book.last_trade_price, recent_prices, market.end_date)
     inventory = context.inventory.get(market.slug)
+    apply_adaptive_fill_cooldown(context, inventory, signal)
     if is_unwind_priority_market(context, market) and inventory.gross_shares > 0.01:
         process_unwind_market(
             context,
@@ -425,11 +445,15 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             "priority position unwind",
             mode="flatten",
             aggressive=False,
+            signal=signal,
         )
+        inventory.last_mark_price = quote_safe_mark(signal)
         return
     inventory_bias = inventory.net_delta
+    drawdown_ratio = current_drawdown_ratio(context, inventory)
+    pricing_config = effective_pricing_config(context, drawdown_ratio)
     quote = build_yes_quote(
-        context.pricing,
+        pricing_config,
         signal,
         inventory_bias,
         book.tick_size,
@@ -437,9 +461,9 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
         best_bid=book.best_bid,
         best_ask=book.best_ask,
     )
-    apply_reward_quote_constraints(market, quote, book)
     quote.size = derive_quote_size(context, market, quote.size)
     mark_prices[market.slug] = quote.fair_value
+    inventory.last_mark_price = quote.fair_value
     fair_value_breach = fair_value_band_breach(quote.fair_value, context.filters)
     if fair_value_breach:
         if inventory.gross_shares > 0.01:
@@ -452,6 +476,7 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
                 fair_value_breach,
                 mode="flatten",
                 aggressive=False,
+                signal=signal,
             )
             return
         context.analytics.log_event(
@@ -463,6 +488,26 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
     portfolio_exposure = total_exposure(context.inventory, mark_prices)
     contribution_map = exposure_by_market(context.inventory, mark_prices)
     largest_contributor = max(contribution_map, key=contribution_map.get, default=None)
+    if drawdown_ratio >= 0.75:
+        if inventory.gross_shares > 0.01:
+            process_unwind_market(
+                context,
+                market,
+                inventory,
+                quote,
+                book,
+                "drawdown unwind-only threshold",
+                mode="flatten",
+                aggressive=False,
+                signal=signal,
+            )
+            return
+        context.analytics.log_event(
+            "risk_skip",
+            {"market": market.slug, "reason": "drawdown unwind-only threshold", "drawdown_ratio": drawdown_ratio},
+        )
+        print(f"[{market.slug}] skipped: drawdown unwind-only threshold ratio={drawdown_ratio:.2f}")
+        return
     allowed, reason = can_quote_market(context.risk, inventory, quote.fair_value, signal.time_to_resolution_days)
     if not allowed:
         if (
@@ -479,10 +524,11 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
                 f"{reason} escalated by portfolio exposure",
                 mode="flatten",
                 aggressive=True,
+                signal=signal,
             )
             return
         if should_trim_position(reason):
-            process_unwind_market(context, market, inventory, quote, book, reason, mode="trim", aggressive=False)
+            process_unwind_market(context, market, inventory, quote, book, reason, mode="trim", aggressive=False, signal=signal)
             return
         if should_flatten_position(reason):
             process_unwind_market(
@@ -494,6 +540,7 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
                 reason,
                 mode="flatten",
                 aggressive=(reason == "drawdown limit breached"),
+                signal=signal,
             )
             return
         context.analytics.log_event("risk_skip", {"market": market.slug, "reason": reason})
@@ -513,6 +560,7 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
                 "portfolio exposure limit breached",
                 mode="flatten",
                 aggressive=False,
+                signal=signal,
             )
             return
         context.analytics.log_event(
@@ -520,6 +568,14 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             {"market": market.slug, "reason": "portfolio exposure limit breached", "exposure": portfolio_exposure},
         )
         print(f"[{market.slug}] skipped: portfolio exposure limit breached exposure={portfolio_exposure:.4f}")
+        return
+    reward_spread_breach = reward_spread_limit_breach(market, quote)
+    if reward_spread_breach is not None:
+        context.analytics.log_event(
+            "risk_skip",
+            {"market": market.slug, "reason": reward_spread_breach, "fair_value": quote.fair_value, "half_spread": quote.half_spread},
+        )
+        print(f"[{market.slug}] skipped: {reward_spread_breach}")
         return
     if not passes_post_only_guard(book, quote.bid, quote.ask):
         adjusted = adjust_quote_to_post_only(book, quote)
@@ -548,7 +604,7 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             )
             print(f"[{market.slug}] skipped: post-only guard blocked marketable quote ({quote.bid:.3f},{quote.ask:.3f})")
             return
-    place_yes_bid, place_no_bid, quote_reason = determine_quote_sides(context, inventory)
+    place_yes_bid, place_no_bid, quote_reason = determine_quote_sides(context, market, inventory, signal, book)
     reward_status = evaluate_reward_eligibility(market, quote, place_both_sides=(place_yes_bid and place_no_bid))
     if not place_yes_bid and not place_no_bid:
         context.analytics.log_event(
@@ -735,6 +791,7 @@ def process_unwind_market(
     reason: str,
     mode: str,
     aggressive: bool,
+    signal: Any,
 ) -> None:
     if reason == "drawdown limit breached":
         context.control.disable("risk:drawdown")
@@ -749,6 +806,7 @@ def process_unwind_market(
     effective_aggressive = mode == "flatten" or aggressive or (
         mode == "trim" and inventory.unwind_cycles_without_fill >= context.unwind_escalation_cycles
     )
+    force_ioc_escape = should_trigger_unwind_ioc_escape(inventory, signal, effective_aggressive)
     order_request = build_unwind_order_request(
         context,
         market,
@@ -757,8 +815,11 @@ def process_unwind_market(
         yes_book,
         mode=mode,
         aggressive=effective_aggressive,
+        signal=signal,
+        force_ioc_escape=force_ioc_escape,
     )
     if order_request is None:
+        maybe_handle_dust_position(context, market, inventory)
         context.analytics.log_event(
             "unwind_skip",
             {
@@ -795,7 +856,8 @@ def process_unwind_market(
             tick_size=order_request["tick_size"],
             dry_run=context.dry_run,
             neg_risk=market.neg_risk,
-            post_only=not effective_aggressive,
+            post_only=not order_request.get("ioc_escape", False) and not effective_aggressive,
+            order_type=order_request.get("order_type", "GTC"),
         )
     except Exception as exc:
         if order_request["side"].upper() == "SELL" and is_crosses_book_error(exc):
@@ -920,7 +982,9 @@ def process_unwind_market(
                 "cooldown_seconds": context.post_unwind_cooldown_seconds,
             },
         )
-    if mode == "trim":
+    if response_is_immediate_execution(response):
+        inventory.unwind_cycles_without_fill = 0
+    elif effective_aggressive or mode == "trim":
         inventory.unwind_cycles_without_fill += 1
     print_order_response(order_request["label"], response)
     print_open_orders(context, market)
@@ -934,10 +998,12 @@ def build_unwind_order_request(
     yes_book: OrderBookSnapshot,
     mode: str,
     aggressive: bool,
+    signal: Any,
+    force_ioc_escape: bool,
 ) -> Optional[dict[str, Any]]:
     tick = max(yes_book.tick_size, 0.01)
     if mode == "flatten":
-        return build_flatten_order_request(context, market, inventory, quote, yes_book, aggressive)
+        return build_flatten_order_request(context, market, inventory, quote, yes_book, aggressive, force_ioc_escape)
     if inventory.no_shares > max(context.risk.max_no_shares_per_market, context.risk.max_net_delta_per_market):
         no_book = get_market_book(context, market.no_token_id)
         if no_book is None:
@@ -952,10 +1018,12 @@ def build_unwind_order_request(
         return {
             "token_id": market.no_token_id,
             "side": "SELL",
-            "price": derive_sell_price(no_book, 1.0 - quote.fair_value, quote.half_spread, aggressive=aggressive),
+            "price": derive_sell_price(no_book, 1.0 - quote.fair_value, quote.half_spread, aggressive=aggressive, ioc_escape=force_ioc_escape),
             "size": size,
             "tick_size": no_book.tick_size,
             "label": "NO trim ask",
+            "order_type": "FAK" if force_ioc_escape else "GTC",
+            "ioc_escape": force_ioc_escape,
         }
     if inventory.yes_shares > max(context.risk.max_yes_shares_per_market, context.risk.max_net_delta_per_market):
         size = bounded_unwind_size(
@@ -968,10 +1036,12 @@ def build_unwind_order_request(
         return {
             "token_id": market.yes_token_id,
             "side": "SELL",
-            "price": derive_sell_price(yes_book, quote.fair_value, quote.half_spread, aggressive=aggressive),
+            "price": derive_sell_price(yes_book, quote.fair_value, quote.half_spread, aggressive=aggressive, ioc_escape=force_ioc_escape),
             "size": size,
             "tick_size": tick,
             "label": "YES trim ask",
+            "order_type": "FAK" if force_ioc_escape else "GTC",
+            "ioc_escape": force_ioc_escape,
         }
     if inventory.net_delta < -context.risk.max_net_delta_per_market and inventory.no_shares > 0:
         no_book = get_market_book(context, market.no_token_id)
@@ -990,10 +1060,12 @@ def build_unwind_order_request(
         return {
             "token_id": market.no_token_id,
             "side": "SELL",
-            "price": derive_sell_price(no_book, 1.0 - quote.fair_value, quote.half_spread, aggressive=aggressive),
+            "price": derive_sell_price(no_book, 1.0 - quote.fair_value, quote.half_spread, aggressive=aggressive, ioc_escape=force_ioc_escape),
             "size": size,
             "tick_size": no_book.tick_size,
             "label": "NO trim ask",
+            "order_type": "FAK" if force_ioc_escape else "GTC",
+            "ioc_escape": force_ioc_escape,
         }
     if inventory.net_delta > context.risk.max_net_delta_per_market and inventory.yes_shares > 0:
         size = bounded_unwind_size(
@@ -1009,10 +1081,12 @@ def build_unwind_order_request(
         return {
             "token_id": market.yes_token_id,
             "side": "SELL",
-            "price": derive_sell_price(yes_book, quote.fair_value, quote.half_spread, aggressive=aggressive),
+            "price": derive_sell_price(yes_book, quote.fair_value, quote.half_spread, aggressive=aggressive, ioc_escape=force_ioc_escape),
             "size": size,
             "tick_size": tick,
             "label": "YES trim ask",
+            "order_type": "FAK" if force_ioc_escape else "GTC",
+            "ioc_escape": force_ioc_escape,
         }
     return None
 
@@ -1024,6 +1098,7 @@ def build_flatten_order_request(
     quote: Any,
     yes_book: OrderBookSnapshot,
     aggressive: bool,
+    force_ioc_escape: bool,
 ) -> Optional[dict[str, Any]]:
     yes_notional = inventory.yes_shares * quote.fair_value
     no_notional = inventory.no_shares * (1.0 - quote.fair_value)
@@ -1041,10 +1116,12 @@ def build_flatten_order_request(
                 return {
                     "token_id": market.no_token_id,
                     "side": "SELL",
-                    "price": derive_sell_price(no_book, 1.0 - quote.fair_value, quote.half_spread, aggressive=aggressive),
+                    "price": derive_sell_price(no_book, 1.0 - quote.fair_value, quote.half_spread, aggressive=aggressive, ioc_escape=force_ioc_escape),
                     "size": size,
                     "tick_size": no_book.tick_size,
                     "label": "NO flatten ask",
+                    "order_type": "FAK" if force_ioc_escape else "GTC",
+                    "ioc_escape": force_ioc_escape,
                 }
 
     if inventory.yes_shares > 0:
@@ -1058,10 +1135,12 @@ def build_flatten_order_request(
         return {
             "token_id": market.yes_token_id,
             "side": "SELL",
-            "price": derive_sell_price(yes_book, quote.fair_value, quote.half_spread, aggressive=aggressive),
+            "price": derive_sell_price(yes_book, quote.fair_value, quote.half_spread, aggressive=aggressive, ioc_escape=force_ioc_escape),
             "size": size,
             "tick_size": max(yes_book.tick_size, 0.01),
             "label": "YES flatten ask",
+            "order_type": "FAK" if force_ioc_escape else "GTC",
+            "ioc_escape": force_ioc_escape,
         }
 
     if inventory.no_shares > 0:
@@ -1078,10 +1157,12 @@ def build_flatten_order_request(
         return {
             "token_id": market.no_token_id,
             "side": "SELL",
-            "price": derive_sell_price(no_book, 1.0 - quote.fair_value, quote.half_spread, aggressive=aggressive),
+            "price": derive_sell_price(no_book, 1.0 - quote.fair_value, quote.half_spread, aggressive=aggressive, ioc_escape=force_ioc_escape),
             "size": size,
             "tick_size": no_book.tick_size,
             "label": "NO flatten ask",
+            "order_type": "FAK" if force_ioc_escape else "GTC",
+            "ioc_escape": force_ioc_escape,
         }
     return None
 
@@ -1091,7 +1172,11 @@ def bounded_unwind_size(requested_size: float, available_size: float, min_order_
     requested = max(float(requested_size), 0.0)
     if available <= 0.0 or requested <= 0.0:
         return None
-    return min(requested, available)
+    size = min(requested, available)
+    residual = max(available - size, 0.0)
+    if available >= EXCHANGE_MIN_ORDER_SIZE and 1.0 < residual < EXCHANGE_MIN_ORDER_SIZE:
+        return available
+    return size
 
 
 def prepare_sell_unwind_order(
@@ -1230,7 +1315,16 @@ def get_market_book(context: BotContext, token_id: str) -> Optional[OrderBookSna
         return None
 
 
-def derive_sell_price(book: OrderBookSnapshot, fair_value: float, half_spread: float, aggressive: bool) -> float:
+def derive_sell_price(
+    book: OrderBookSnapshot,
+    fair_value: float,
+    half_spread: float,
+    aggressive: bool,
+    ioc_escape: bool = False,
+) -> float:
+    if ioc_escape and book.best_bid is not None:
+        escaped = max(book.best_bid - max(book.tick_size, 0.01), 0.01)
+        return clamp_probability(round_to_tick(escaped, book.tick_size, down=True))
     if aggressive and book.best_bid is not None:
         return clamp_probability(round_to_tick(book.best_bid, book.tick_size, down=True))
     target = clamp_probability(fair_value + half_spread)
@@ -1246,6 +1340,9 @@ def refresh_sell_unwind_order(context: BotContext, order_request: dict[str, Any]
     if book is None:
         return
     order_request["tick_size"] = book.tick_size
+    if order_request.get("ioc_escape"):
+        order_request["price"] = derive_sell_price(book, 0.5, 0.0, aggressive=True, ioc_escape=True)
+        return
     if aggressive and book.best_bid is not None:
         order_request["price"] = clamp_probability(round_to_tick(book.best_bid, book.tick_size, down=True))
 
@@ -1618,7 +1715,13 @@ def round_no_bid_price(yes_ask: float, tick_size: float) -> float:
     return round(int(raw / tick) * tick, 4)
 
 
-def determine_quote_sides(context: BotContext, inventory: Any) -> tuple[bool, bool, str]:
+def determine_quote_sides(
+    context: BotContext,
+    market: MarketConfig,
+    inventory: Any,
+    signal: Any,
+    book: OrderBookSnapshot,
+) -> tuple[bool, bool, str]:
     yes_limit = max(
         context.risk.min_order_size,
         context.risk.max_yes_shares_per_market * context.risk.requote_inventory_fraction_limit,
@@ -1628,12 +1731,13 @@ def determine_quote_sides(context: BotContext, inventory: Any) -> tuple[bool, bo
         context.risk.max_no_shares_per_market * context.risk.requote_inventory_fraction_limit,
     )
     now = time.time()
+    effective_cooldown = max(context.fill_cooldown_seconds, inventory.fill_cooldown_seconds_override)
     if (
-        context.fill_cooldown_seconds > 0
+        effective_cooldown > 0
         and inventory.last_fill_ts > 0
-        and now - inventory.last_fill_ts < context.fill_cooldown_seconds
+        and now - inventory.last_fill_ts < effective_cooldown
     ):
-        remaining = int(max(context.fill_cooldown_seconds - (now - inventory.last_fill_ts), 0))
+        remaining = int(max(effective_cooldown - (now - inventory.last_fill_ts), 0))
         if inventory.net_delta > 0.01:
             return False, True, f"post_fill_cooldown_rebalance_yes({remaining}s)"
         if inventory.net_delta < -0.01:
@@ -1642,13 +1746,24 @@ def determine_quote_sides(context: BotContext, inventory: Any) -> tuple[bool, bo
 
     place_yes_bid = inventory.yes_shares < yes_limit
     place_no_bid = inventory.no_shares < no_limit
+    toxic_yes, toxic_no, toxic_reason = toxic_flow_quote_filter(context, market, inventory, signal, book)
+    if toxic_yes:
+        place_yes_bid = False
+    if toxic_no:
+        place_no_bid = False
 
     if place_yes_bid and place_no_bid:
         return True, True, "normal_quote"
     if place_yes_bid and not place_no_bid:
+        if toxic_reason:
+            return True, False, toxic_reason
         return True, False, "inventory_rebalance_only_no_side_full"
     if place_no_bid and not place_yes_bid:
+        if toxic_reason:
+            return False, True, toxic_reason
         return False, True, "inventory_rebalance_only_yes_side_full"
+    if toxic_reason:
+        return False, False, toxic_reason
     return False, False, "inventory_limits_block_both_sides"
 
 
@@ -1725,6 +1840,214 @@ def evaluate_reward_eligibility(market: MarketConfig, quote: Quote, place_both_s
     return {"eligible": True, "reason": "eligible"}
 
 
+def current_drawdown_ratio(context: BotContext, inventory: Any) -> float:
+    limit = max(float(context.risk.max_drawdown_usdc), 0.0)
+    if limit <= 0:
+        return 0.0
+    return max(-float(inventory.realized_pnl), 0.0) / limit
+
+
+def effective_pricing_config(context: BotContext, drawdown_ratio: float) -> PricingConfig:
+    if drawdown_ratio < 0.50:
+        return context.pricing
+    return replace(
+        context.pricing,
+        min_half_spread=min(context.pricing.max_half_spread, context.pricing.min_half_spread * 2.0),
+        size_per_order=max(context.risk.min_order_size, context.pricing.size_per_order / 2.0),
+    )
+
+
+def quote_safe_mark(signal: Any) -> float:
+    if signal.midpoint is not None:
+        return signal.midpoint
+    if signal.last_trade is not None:
+        return signal.last_trade
+    return 0.5
+
+
+def apply_adaptive_fill_cooldown(context: BotContext, inventory: Any, signal: Any) -> None:
+    current_mark = quote_safe_mark(signal)
+    if inventory.last_fill_ts <= 0 or inventory.last_mark_price <= 0:
+        inventory.fill_cooldown_seconds_override = 0
+        return
+    adverse_move = adverse_move_magnitude(inventory, current_mark)
+    vol_unit = max(signal.realized_volatility, 0.01)
+    if adverse_move >= 1.5 * vol_unit:
+        inventory.fill_cooldown_seconds_override = max(context.fill_cooldown_seconds, ADAPTIVE_FILL_COOLDOWN_STRONG)
+        return
+    if adverse_move >= 0.75 * vol_unit:
+        inventory.fill_cooldown_seconds_override = max(context.fill_cooldown_seconds, ADAPTIVE_FILL_COOLDOWN_MILD)
+        return
+    inventory.fill_cooldown_seconds_override = 0
+
+
+def adverse_move_magnitude(inventory: Any, current_mark: float) -> float:
+    if inventory.last_mark_price <= 0:
+        return 0.0
+    move = current_mark - inventory.last_mark_price
+    if inventory.net_delta > 0.01:
+        return max(-move, 0.0)
+    if inventory.net_delta < -0.01:
+        return max(move, 0.0)
+    return 0.0
+
+
+def toxic_flow_quote_filter(
+    context: BotContext,
+    market: MarketConfig,
+    inventory: Any,
+    signal: Any,
+    book: OrderBookSnapshot,
+) -> tuple[bool, bool, str]:
+    skip_yes = False
+    skip_no = False
+    reasons: list[str] = []
+    trades = context.client.get_recent_trades(market.yes_token_id, limit=TOXIC_FLOW_TRADE_WINDOW)
+    buy_count = 0
+    sell_count = 0
+    for trade in trades:
+        side = str(trade.get("side") or trade.get("Side") or "").upper()
+        if side == "BUY":
+            buy_count += 1
+        elif side == "SELL":
+            sell_count += 1
+    total = buy_count + sell_count
+    if total > 0:
+        buy_ratio = buy_count / total
+        sell_ratio = sell_count / total
+        if sell_ratio > TOXIC_FLOW_ONE_WAY_THRESHOLD:
+            skip_yes = True
+            reasons.append(f"toxic_flow_skip_yes_bid({sell_ratio:.0%}_sell)")
+        if buy_ratio > TOXIC_FLOW_ONE_WAY_THRESHOLD:
+            skip_no = True
+            reasons.append(f"toxic_flow_skip_no_bid({buy_ratio:.0%}_buy)")
+    current_mark = quote_safe_mark(signal)
+    if inventory.last_mark_price > 0:
+        move = current_mark - inventory.last_mark_price
+        threshold = max(signal.realized_volatility * TOXIC_FLOW_VOL_MULTIPLIER, max(book.tick_size, 0.01))
+        if move <= -threshold:
+            skip_yes = True
+            reasons.append(f"toxic_mid_down({move:.3f})")
+        if move >= threshold:
+            skip_no = True
+            reasons.append(f"toxic_mid_up({move:.3f})")
+    return skip_yes, skip_no, " ".join(reasons)
+
+
+def should_trigger_unwind_ioc_escape(inventory: Any, signal: Any, aggressive: bool) -> bool:
+    if aggressive and inventory.unwind_cycles_without_fill >= UNWIND_IOC_ESCAPE_CYCLES:
+        return True
+    adverse_move = adverse_move_magnitude(inventory, quote_safe_mark(signal))
+    vol_unit = max(signal.realized_volatility, 0.01)
+    return adverse_move >= UNWIND_IOC_ESCAPE_VOL_MULTIPLIER * vol_unit
+
+
+def response_is_immediate_execution(response: Any) -> bool:
+    if not isinstance(response, dict):
+        return False
+    status = str(response.get("status") or "").lower()
+    return status in {"matched", "filled"}
+
+
+def maybe_handle_dust_position(context: BotContext, market: MarketConfig, inventory: Any) -> None:
+    paired_dust = min(inventory.yes_shares, inventory.no_shares)
+    if 0 < paired_dust < EXCHANGE_MIN_ORDER_SIZE:
+        recoverable_usdc = paired_dust
+        if recoverable_usdc <= MERGE_GAS_FALLBACK_USDC:
+            status = "oof"
+        elif not market.condition_id:
+            status = "merge_missing_condition_id"
+        else:
+            try:
+                response = context.client.merge_position_pair(market.condition_id, paired_dust, dry_run=context.dry_run)
+                inventory.yes_shares = max(inventory.yes_shares - paired_dust, 0.0)
+                inventory.no_shares = max(inventory.no_shares - paired_dust, 0.0)
+                status = str(response.get("status") or "merge_submitted")
+                context.analytics.log_event(
+                    "dust_merge_executed",
+                    {
+                        "market": market.slug,
+                        "condition_id": market.condition_id,
+                        "paired_shares": paired_dust,
+                        "recoverable_usdc": recoverable_usdc,
+                        "response": response,
+                    },
+                )
+                print(
+                    f"[{market.slug}] dust merged: paired={paired_dust:.4f} "
+                    f"recoverable_usdc={recoverable_usdc:.4f} tx={response.get('tx_hash', '-')}"
+                )
+                if not context.dry_run:
+                    run_recovery_reconciliation(context, "dust_merge", market=market.slug, shares=paired_dust)
+                return
+            except Exception as exc:
+                status = "merge_failed"
+                context.analytics.log_event(
+                    "dust_merge_error",
+                    {
+                        "market": market.slug,
+                        "condition_id": market.condition_id,
+                        "paired_shares": paired_dust,
+                        "recoverable_usdc": recoverable_usdc,
+                        "details": str(exc),
+                    },
+                )
+                print(f"[{market.slug}] dust merge failed: {exc}")
+        context.analytics.log_event(
+            "dust_merge_candidate",
+            {
+                "market": market.slug,
+                "yes_shares": inventory.yes_shares,
+                "no_shares": inventory.no_shares,
+                "paired_shares": paired_dust,
+                "recoverable_usdc": recoverable_usdc,
+                "status": status,
+            },
+        )
+        print(
+            f"[{market.slug}] dust handling: paired_dust={paired_dust:.4f} "
+            f"recoverable_usdc={recoverable_usdc:.4f} status={status}"
+        )
+        return
+    if 0 < inventory.yes_shares < EXCHANGE_MIN_ORDER_SIZE or 0 < inventory.no_shares < EXCHANGE_MIN_ORDER_SIZE:
+        context.analytics.log_event(
+            "dust_residual_position",
+            {
+                "market": market.slug,
+                "yes_shares": inventory.yes_shares,
+                "no_shares": inventory.no_shares,
+            },
+        )
+
+
+def is_non_actionable_dust_position(context: BotContext, market: MarketConfig, inventory: Any) -> bool:
+    if inventory.gross_shares <= 0.01:
+        return False
+    max_side = max(inventory.yes_shares, inventory.no_shares)
+    if max_side + 1e-9 >= EXCHANGE_MIN_ORDER_SIZE:
+        return False
+    paired_dust = min(inventory.yes_shares, inventory.no_shares)
+    if paired_dust > 0.0:
+        recoverable_usdc = paired_dust
+        return recoverable_usdc <= MERGE_GAS_FALLBACK_USDC or not market.condition_id
+    return True
+
+
+def inventory_requires_active_unwind(context: BotContext, market: MarketConfig, inventory: Any) -> bool:
+    if inventory.gross_shares <= 0.01:
+        return False
+    return not is_non_actionable_dust_position(context, market, inventory)
+
+
+def reward_spread_limit_breach(market: MarketConfig, quote: Quote) -> Optional[str]:
+    reward_max_spread = normalize_reward_spread_limit(market.rewards_max_spread)
+    if reward_max_spread is None:
+        return None
+    if quote.half_spread - reward_max_spread > 1e-9:
+        return f"reward spread cap breached ({quote.half_spread:.4f} > {reward_max_spread:.4f})"
+    return None
+
+
 def validate_market_config(markets: list[MarketConfig]) -> None:
     if not markets:
         raise RuntimeError("No markets configured in config.yaml")
@@ -1764,9 +2087,18 @@ def initialize_market_selection(context: BotContext) -> None:
 
 def refresh_market_selection(context: BotContext, force: bool = False) -> None:
     prune_reentry_cooldowns(context)
+    context.active_markets = [
+        market
+        for market in context.active_markets
+        if inventory_requires_active_unwind(context, market, context.inventory.get(market.slug))
+        or context.inventory.get(market.slug).gross_shares <= 0.01
+    ]
+    context.active_market = context.active_markets[0] if context.active_markets else None
     if context.force_unwind_only:
         context.positions_to_unwind = [
-            market for market in context.positions_to_unwind if context.inventory.get(market.slug).gross_shares > 0.01
+            market
+            for market in context.positions_to_unwind
+            if inventory_requires_active_unwind(context, market, context.inventory.get(market.slug))
         ]
         context.active_markets = context.positions_to_unwind[: context.max_active_markets]
         context.active_market = context.active_markets[0] if context.active_markets else None
@@ -1774,7 +2106,9 @@ def refresh_market_selection(context: BotContext, force: bool = False) -> None:
     if not context.auto_scan_enabled:
         return
     context.positions_to_unwind = [
-        market for market in context.positions_to_unwind if context.inventory.get(market.slug).gross_shares > 0.01
+        market
+        for market in context.positions_to_unwind
+        if inventory_requires_active_unwind(context, market, context.inventory.get(market.slug))
     ]
     now = time.time()
     must_rescan = (
@@ -1895,6 +2229,12 @@ def select_best_markets(context: BotContext) -> Optional[list[MarketConfig]]:
         if spread_bps < float(context.filters.get("min_spread_bps", 0.0)):
             increment_reason(live_reason_counts, "live_spread_too_small")
             continue
+        min_book_depth_usdc = _to_optional_float(context.filters.get("min_book_depth_usdc"))
+        if min_book_depth_usdc is not None:
+            usable_depth = min(book.bid_depth_usdc, book.ask_depth_usdc)
+            if usable_depth + 1e-9 < min_book_depth_usdc:
+                increment_reason(live_reason_counts, "live_book_depth_too_shallow")
+                continue
         live_reference_price = book.midpoint if book.midpoint is not None else normalized.get("reference_price")
         if fair_value_band_breach(live_reference_price, context.filters) is not None:
             increment_reason(live_reason_counts, "live_fair_value_out_of_band")
@@ -2212,14 +2552,16 @@ def merge_selected_markets(context: BotContext, ranked_candidates: list[MarketCo
     max_markets_per_family = max(int(context.filters.get("max_markets_per_family", 0) or 0), 0)
 
     for market in context.positions_to_unwind:
-        if context.inventory.get(market.slug).gross_shares > 0.01 and market.slug not in selected_slugs:
+        inventory = context.inventory.get(market.slug)
+        if inventory_requires_active_unwind(context, market, inventory) and market.slug not in selected_slugs:
             selected.append(ranked_by_slug.get(market.slug, market))
             selected_slugs.add(market.slug)
             family = market_family_key(market)
             family_counts[family] = family_counts.get(family, 0) + 1
 
     for market in context.active_markets:
-        if context.inventory.get(market.slug).gross_shares > 0.01 and market.slug not in selected_slugs:
+        inventory = context.inventory.get(market.slug)
+        if inventory_requires_active_unwind(context, market, inventory) and market.slug not in selected_slugs:
             selected.append(ranked_by_slug.get(market.slug, market))
             selected_slugs.add(market.slug)
             family = market_family_key(market)
@@ -2229,6 +2571,9 @@ def merge_selected_markets(context: BotContext, ranked_candidates: list[MarketCo
         if len(selected) >= context.max_active_markets:
             break
         if market.slug in selected_slugs:
+            continue
+        inventory = context.inventory.get(market.slug)
+        if inventory.gross_shares > 0.01 and not inventory_requires_active_unwind(context, market, inventory):
             continue
         if market_in_reentry_cooldown(context, market) and context.inventory.get(market.slug).gross_shares <= 0.01:
             continue
@@ -2289,7 +2634,11 @@ def sync_positions_to_unwind(context: BotContext, report: Any) -> None:
 
     positions: list[MarketConfig] = []
     for market in known_by_slug.values():
-        if context.inventory.get(market.slug).gross_shares > 0.01:
+        inventory = context.inventory.get(market.slug)
+        if is_non_actionable_dust_position(context, market, inventory):
+            maybe_handle_dust_position(context, market, inventory)
+            continue
+        if inventory.gross_shares > 0.01:
             positions.append(market)
     positions.sort(key=lambda market: context.inventory.get(market.slug).gross_shares, reverse=True)
     context.positions_to_unwind = positions
@@ -2301,7 +2650,11 @@ def sync_positions_to_unwind_from_inventory(context: BotContext) -> None:
     known_by_slug = {market.slug: market for market in markets_for_state_tracking(context)}
     positions: list[MarketConfig] = []
     for market in known_by_slug.values():
-        if context.inventory.get(market.slug).gross_shares > 0.01:
+        inventory = context.inventory.get(market.slug)
+        if is_non_actionable_dust_position(context, market, inventory):
+            maybe_handle_dust_position(context, market, inventory)
+            continue
+        if inventory.gross_shares > 0.01:
             positions.append(market)
     positions.sort(key=lambda market: context.inventory.get(market.slug).gross_shares, reverse=True)
     context.positions_to_unwind = positions
@@ -2331,6 +2684,55 @@ def discover_markets_for_unknown_positions(context: BotContext, unknown_position
             matched_here = True
         if matched_here and all(existing.slug != market.slug for existing in discovered):
             discovered.append(market)
+
+    reward_cursor: Optional[str] = None
+    reward_page_size = min(max(context.scan_limit, 1), 50)
+    reward_pages = max(context.scan_pages, 8)
+
+    for _ in range(reward_pages):
+        if matched_tokens == target_token_ids:
+            break
+        try:
+            payload = context.client.scan_reward_markets(
+                page_size=reward_page_size,
+                next_cursor=reward_cursor,
+                order_by="rate_per_day",
+                position="DESC",
+            )
+        except Exception as exc:
+            context.analytics.log_event("position_discovery_rewards_error", {"details": str(exc)})
+            break
+        data = payload.get("data") or []
+        if not isinstance(data, list) or not data:
+            break
+        normalized_rewards: list[dict[str, Any]] = []
+        for item in data:
+            normalized = normalize_reward_market(item)
+            if normalized:
+                normalized_rewards.append(normalized)
+        gamma_index = build_gamma_reward_metadata_index(context, normalized_rewards) if normalized_rewards else {}
+        for normalized in normalized_rewards:
+            enrich_reward_market_with_gamma(normalized, gamma_index)
+            yes_token_id = str(normalized.get("yes_token_id") or "").strip()
+            no_token_id = str(normalized.get("no_token_id") or "").strip()
+            if yes_token_id not in target_token_ids and no_token_id not in target_token_ids:
+                continue
+            market = market_config_from_normalized(normalized)
+            inventory = context.inventory.get(market.slug)
+            matched_here = False
+            if yes_token_id in target_token_ids:
+                inventory.yes_shares = max(float(unknown_positions[yes_token_id]), 0.0)
+                matched_tokens.add(yes_token_id)
+                matched_here = True
+            if no_token_id in target_token_ids:
+                inventory.no_shares = max(float(unknown_positions[no_token_id]), 0.0)
+                matched_tokens.add(no_token_id)
+                matched_here = True
+            if matched_here and all(existing.slug != market.slug for existing in discovered):
+                discovered.append(market)
+        reward_cursor = payload.get("next_cursor")
+        if not reward_cursor or reward_cursor == "LTE=":
+            break
 
     scan_pages = max(context.scan_pages, 25)
 

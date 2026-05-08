@@ -5,6 +5,7 @@ Ensures safe restarts and safe coexistence with trades placed from the web UI.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 from .client import PolymarketClient, MarketConfig
@@ -34,10 +35,23 @@ class PositionReconciler:
         report = ReconciliationReport()
 
         try:
-            api_positions = self.client.get_user_positions()
+            position_details = self.client.get_user_positions_detailed()
         except Exception as exc:
             report.error = str(exc)
             return report
+
+        api_positions: dict[str, Any] = {}
+        discovered_markets: dict[str, MarketConfig] = {}
+        for item in position_details:
+            if not isinstance(item, dict):
+                continue
+            asset = str(item.get("asset") or "").strip()
+            normalized_balance = parse_token_amount(item.get("size"))
+            if asset:
+                api_positions[asset] = api_positions.get(asset, 0.0) + normalized_balance
+            market = _market_from_position_item(item)
+            if market:
+                discovered_markets[market.slug] = market
 
         if not api_positions:
             api_positions = {}
@@ -47,6 +61,9 @@ class PositionReconciler:
         for market in markets:
             token_to_market[market.yes_token_id] = (market.slug, "YES")
             token_to_market[market.no_token_id] = (market.slug, "NO")
+        for market in discovered_markets.values():
+            token_to_market.setdefault(market.yes_token_id, (market.slug, "YES"))
+            token_to_market.setdefault(market.no_token_id, (market.slug, "NO"))
 
         # Check each position reported by the API
         for token_id, api_balance in api_positions.items():
@@ -177,3 +194,61 @@ class ReconciliationReport:
             # Log warning but still allow trading
             return True
         return True
+
+
+def _market_from_position_item(item: dict[str, Any]) -> Optional[MarketConfig]:
+    slug = str(item.get("slug") or item.get("eventSlug") or "").strip()
+    asset = str(item.get("asset") or "").strip()
+    opposite_asset = str(item.get("oppositeAsset") or "").strip()
+    outcome = str(item.get("outcome") or "").strip().upper()
+    if not slug or not asset or not opposite_asset or outcome not in {"YES", "NO"}:
+        return None
+    if outcome == "YES":
+        yes_token_id = asset
+        no_token_id = opposite_asset
+    else:
+        yes_token_id = opposite_asset
+        no_token_id = asset
+    title = str(item.get("title") or slug).strip() or slug
+    return MarketConfig(
+        slug=slug,
+        question=title,
+        yes_token_id=yes_token_id,
+        no_token_id=no_token_id,
+        end_date=_parse_position_end_date(item.get("endDate")),
+        neg_risk=_to_optional_bool(item.get("negativeRisk")),
+        condition_id=str(item.get("conditionId") or "").strip() or None,
+    )
+
+
+def _parse_position_end_date(value: Any) -> Optional[datetime]:
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = text.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        try:
+            parsed = datetime.strptime(text, "%Y-%m-%d")
+            return parsed.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _to_optional_bool(value: Any) -> Optional[bool]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    return None

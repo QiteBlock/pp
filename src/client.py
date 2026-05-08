@@ -12,6 +12,8 @@ from typing import Any, Optional
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from web3 import Web3
+from web3.types import TxReceipt
 
 VENDOR_PATH = Path(__file__).resolve().parents[1] / ".vendor"
 if VENDOR_PATH.exists() and str(VENDOR_PATH) not in sys.path:
@@ -19,11 +21,13 @@ if VENDOR_PATH.exists() and str(VENDOR_PATH) not in sys.path:
 
 try:
     from py_clob_client_v2 import ApiCreds, ClobClient, OrderArgs, OrderType, PartialCreateOrderOptions, Side
-    from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams, OpenOrderParams, OrderMarketCancelParams
+    from py_clob_client_v2.clob_types import AssetType, BalanceAllowanceParams, OpenOrderParams, OrderMarketCancelParams, TradeParams
     from py_clob_client_v2.clob_types import OrderArgsV1, OrderArgsV2
+    from py_clob_client_v2.config import get_contract_config
 except ImportError:  # pragma: no cover
     ApiCreds = ClobClient = OrderArgs = OrderType = PartialCreateOrderOptions = Side = None
-    AssetType = BalanceAllowanceParams = OpenOrderParams = OrderMarketCancelParams = OrderArgsV1 = OrderArgsV2 = None
+    AssetType = BalanceAllowanceParams = OpenOrderParams = OrderMarketCancelParams = TradeParams = OrderArgsV1 = OrderArgsV2 = None
+    get_contract_config = None
 
 try:
     from py_clob_client.client import ClobClient as V1ClobClient
@@ -38,7 +42,23 @@ try:
     from py_clob_client.order_builder.constants import SELL as V1_SELL
 except ImportError:  # pragma: no cover
     V1ClobClient = V1ApiCreds = V1AssetType = V1BalanceAllowanceParams = V1OrderArgs = V1OrderType = V1OpenOrderParams = V1PartialCreateOrderOptions = None
-    V1_BUY = V1_SELL = None
+V1_BUY = V1_SELL = None
+
+CTF_ABI = [
+    {
+        "inputs": [
+            {"internalType": "address", "name": "collateralToken", "type": "address"},
+            {"internalType": "bytes32", "name": "parentCollectionId", "type": "bytes32"},
+            {"internalType": "bytes32", "name": "conditionId", "type": "bytes32"},
+            {"internalType": "uint256[]", "name": "partition", "type": "uint256[]"},
+            {"internalType": "uint256", "name": "amount", "type": "uint256"},
+        ],
+        "name": "mergePositions",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    }
+]
 
 
 @dataclass
@@ -65,6 +85,8 @@ class OrderBookSnapshot:
     spread: Optional[float]
     tick_size: float
     last_trade_price: Optional[float]
+    bid_depth_usdc: float = 0.0
+    ask_depth_usdc: float = 0.0
 
 
 class PolymarketClient:
@@ -78,6 +100,7 @@ class PolymarketClient:
         self.gamma_host = config["gamma"]["host"].rstrip("/")
         self.signature_type = config["clob"].get("signature_type", 0)
         self.funder = config["clob"].get("funder")
+        self.rpc_url = config.get("chain", {}).get("rpc_url") or os.getenv("POLYGON_RPC_URL") or "https://polygon-rpc.com"
         self.private_key: Optional[str] = None
         self.api_creds: Any = None
         self.session = requests.Session()
@@ -92,6 +115,7 @@ class PolymarketClient:
         adapter = HTTPAdapter(max_retries=retries)
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
+        self.web3 = Web3(Web3.HTTPProvider(self.rpc_url, request_kwargs={"timeout": 20}))
         self.trading_client = self._build_trading_client(self.clob_config)
 
     def _build_trading_client(self, clob_config: dict[str, Any]) -> Any:
@@ -171,8 +195,10 @@ class PolymarketClient:
         response = self.session.get(f"{self.clob_host}/book", params={"token_id": token_id}, timeout=20)
         response.raise_for_status()
         payload = response.json()
-        best_bid = _best_bid(payload.get("bids", []))
-        best_ask = _best_ask(payload.get("asks", []))
+        bids = payload.get("bids", [])
+        asks = payload.get("asks", [])
+        best_bid = _best_bid(bids)
+        best_ask = _best_ask(asks)
         midpoint = ((best_bid + best_ask) / 2.0) if best_bid is not None and best_ask is not None else None
         spread = (best_ask - best_bid) if best_bid is not None and best_ask is not None else None
         return OrderBookSnapshot(
@@ -183,6 +209,8 @@ class PolymarketClient:
             spread=spread,
             tick_size=float(payload.get("tick_size", 0.01) or 0.01),
             last_trade_price=_to_float(payload.get("last_trade_price")),
+            bid_depth_usdc=_depth_notional(bids),
+            ask_depth_usdc=_depth_notional(asks),
         )
 
     def place_limit_order(
@@ -195,20 +223,29 @@ class PolymarketClient:
         dry_run: bool = True,
         neg_risk: Optional[bool] = None,
         post_only: bool = True,
+        order_type: str = "GTC",
     ) -> dict[str, Any]:
         if dry_run:
-            return {"status": "dry_run", "token_id": token_id, "side": side, "price": price, "size": size}
+            return {
+                "status": "dry_run",
+                "token_id": token_id,
+                "side": side,
+                "price": price,
+                "size": size,
+                "order_type": order_type,
+            }
         self.ensure_api_credentials()
         if self.trading_client is None or OrderArgs is None:
             raise RuntimeError("py_clob_client_v2 is not installed.")
         if self.sdk == "v1":
-            return self.place_v1_limit_order(token_id, side, price, size, tick_size, dry_run, neg_risk, post_only)
+            return self.place_v1_limit_order(token_id, side, price, size, tick_size, dry_run, neg_risk, post_only, order_type)
         order_side = Side.BUY if side.upper() == "BUY" else Side.SELL
         order_args = self.build_order_args(token_id, price, size, order_side)
+        clob_order_type = getattr(OrderType, str(order_type).upper(), OrderType.GTC)
         return self.trading_client.create_and_post_order(
             order_args=order_args,
             options=PartialCreateOrderOptions(tick_size=format_tick_size(tick_size), neg_risk=neg_risk),
-            order_type=OrderType.GTC,
+            order_type=clob_order_type,
             post_only=post_only,
         )
 
@@ -227,19 +264,28 @@ class PolymarketClient:
         dry_run: bool,
         neg_risk: Optional[bool],
         post_only: bool,
+        order_type: str,
     ) -> dict[str, Any]:
         if dry_run:
-            return {"status": "dry_run", "token_id": token_id, "side": side, "price": price, "size": size}
+            return {
+                "status": "dry_run",
+                "token_id": token_id,
+                "side": side,
+                "price": price,
+                "size": size,
+                "order_type": order_type,
+            }
         if self.trading_client is None or V1OrderArgs is None or V1PartialCreateOrderOptions is None:
             raise RuntimeError("py-clob-client is not installed. Run `pip install -r requirements.txt`.")
         order_args = self.build_v1_order_args(token_id, price, size, self.v1_buy_sell(side))
         options = self.v1_order_options(tick_size, neg_risk)
         signed_order = self.trading_client.create_order(order_args, options)
+        v1_order_type = getattr(V1OrderType, str(order_type).upper(), V1OrderType.GTC)
         try:
-            return self.trading_client.post_order(signed_order, V1OrderType.GTC, post_only=post_only)
+            return self.trading_client.post_order(signed_order, v1_order_type, post_only=post_only)
         except TypeError:
             try:
-                return self.trading_client.post_order(signed_order, V1OrderType.GTC)
+                return self.trading_client.post_order(signed_order, v1_order_type)
             except Exception as exc:
                 if self.try_upgrade_from_v1_order_version_mismatch(exc):
                     return self.place_limit_order(
@@ -251,6 +297,7 @@ class PolymarketClient:
                         dry_run=dry_run,
                         neg_risk=neg_risk,
                         post_only=post_only,
+                        order_type=order_type,
                     )
                 raise
         except Exception as exc:
@@ -264,6 +311,7 @@ class PolymarketClient:
                     dry_run=dry_run,
                     neg_risk=neg_risk,
                     post_only=post_only,
+                    order_type=order_type,
                 )
             raise
 
@@ -488,6 +536,19 @@ class PolymarketClient:
         """Fetch user's current positions (balances of each outcome token).
         Returns dict mapping token_id to balance amount.
         """
+        aggregated: dict[str, float] = {}
+        for item in self.get_user_positions_detailed():
+            if not isinstance(item, dict):
+                continue
+            asset = str(item.get("asset") or "").strip()
+            size = _to_float(item.get("size"))
+            if not asset or size is None:
+                continue
+            aggregated[asset] = aggregated.get(asset, 0.0) + size
+        return aggregated
+
+    def get_user_positions_detailed(self) -> list[dict[str, Any]]:
+        """Fetch detailed user positions from Polymarket Data API."""
         user_address = self._resolve_positions_user_address()
         if not user_address:
             raise RuntimeError(
@@ -495,7 +556,7 @@ class PolymarketClient:
                 "Set clob.funder in config.yaml to the wallet shown in Polymarket."
             )
 
-        aggregated: dict[str, float] = {}
+        detailed: list[dict[str, Any]] = []
         offset = 0
         limit = 500
 
@@ -518,17 +579,89 @@ class PolymarketClient:
             for item in payload:
                 if not isinstance(item, dict):
                     continue
-                asset = str(item.get("asset") or "").strip()
-                size = _to_float(item.get("size"))
-                if not asset or size is None:
-                    continue
-                aggregated[asset] = aggregated.get(asset, 0.0) + size
+                detailed.append(item)
 
             if len(payload) < limit:
                 break
             offset += limit
 
-        return aggregated
+        return detailed
+
+    def get_recent_trades(self, asset_id: str, limit: int = 25) -> list[dict[str, Any]]:
+        if not asset_id:
+            return []
+        try:
+            if self.trading_client is not None and TradeParams is not None and hasattr(self.trading_client, "get_trades"):
+                params = TradeParams(asset_id=asset_id)
+                trades = self.trading_client.get_trades(params=params, only_first_page=True)
+                if isinstance(trades, list):
+                    return trades[: max(int(limit), 0)]
+        except Exception:
+            pass
+        try:
+            response = self.session.get(
+                f"{self.clob_host}/data/trades",
+                params={"asset_id": asset_id},
+                timeout=20,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            data = payload.get("data") if isinstance(payload, dict) else payload
+            if isinstance(data, list):
+                return data[: max(int(limit), 0)]
+        except Exception:
+            return []
+        return []
+
+    def merge_position_pair(self, condition_id: str, amount_shares: float, dry_run: bool = True) -> dict[str, Any]:
+        if dry_run:
+            return {"status": "dry_run", "condition_id": condition_id, "amount_shares": amount_shares}
+        if not self.private_key:
+            raise RuntimeError("POLY_PRIVATE_KEY is required for onchain merge")
+        if get_contract_config is None:
+            raise RuntimeError("py_clob_client_v2 contract config unavailable")
+        if not self.web3.is_connected():
+            raise RuntimeError(f"Polygon RPC unavailable: {self.rpc_url}")
+        contract_config = get_contract_config(self.chain_id)
+        account = self.web3.eth.account.from_key(self.private_key)
+        contract = self.web3.eth.contract(
+            address=Web3.to_checksum_address(contract_config.conditional_tokens),
+            abi=CTF_ABI,
+        )
+        amount_base_units = int(round(max(float(amount_shares), 0.0) * 1_000_000))
+        if amount_base_units <= 0:
+            raise RuntimeError("Merge amount must be positive")
+        condition_bytes = Web3.to_bytes(hexstr=condition_id)
+        parent_collection_id = b"\x00" * 32
+        gas_price = self.web3.eth.gas_price
+        nonce = self.web3.eth.get_transaction_count(account.address, "pending")
+        tx_func = contract.functions.mergePositions(
+            Web3.to_checksum_address(contract_config.collateral),
+            parent_collection_id,
+            condition_bytes,
+            [1, 2],
+            amount_base_units,
+        )
+        gas_estimate = tx_func.estimate_gas({"from": account.address})
+        tx = tx_func.build_transaction(
+            {
+                "from": account.address,
+                "chainId": self.chain_id,
+                "nonce": nonce,
+                "gas": int(gas_estimate * 1.2),
+                "gasPrice": gas_price,
+            }
+        )
+        signed = self.web3.eth.account.sign_transaction(tx, private_key=self.private_key)
+        tx_hash = self.web3.eth.send_raw_transaction(signed.raw_transaction)
+        receipt: TxReceipt = self.web3.eth.wait_for_transaction_receipt(tx_hash, timeout=180)
+        return {
+            "status": "confirmed" if int(receipt.status) == 1 else "reverted",
+            "tx_hash": receipt.transactionHash.hex(),
+            "gas_used": int(receipt.gasUsed),
+            "amount_shares": amount_shares,
+            "condition_id": condition_id,
+        }
 
     def _resolve_positions_user_address(self) -> Optional[str]:
         if self.funder:
@@ -747,6 +880,21 @@ def _best_ask(levels: list[dict[str, Any]]) -> Optional[float]:
     prices = [_to_float(level.get("price")) for level in levels]
     valid_prices = [price for price in prices if price is not None]
     return min(valid_prices) if valid_prices else None
+
+
+def _depth_notional(levels: list[dict[str, Any]], max_levels: int = 5) -> float:
+    total = 0.0
+    if not isinstance(levels, list):
+        return total
+    for level in levels[: max(max_levels, 0)]:
+        if not isinstance(level, dict):
+            continue
+        price = _to_float(level.get("price"))
+        size = _to_float(level.get("size"))
+        if price is None or size is None:
+            continue
+        total += max(price, 0.0) * max(size, 0.0)
+    return total
 
 
 def load_dotenv(dotenv_path: str = ".env") -> None:

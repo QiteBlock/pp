@@ -13,6 +13,8 @@ class MarketInventory:
     realized_pnl: float = 0.0
     unwind_cycles_without_fill: int = 0
     last_fill_ts: float = 0.0
+    last_mark_price: float = 0.0
+    fill_cooldown_seconds_override: int = 0
 
     @property
     def net_delta(self) -> float:
@@ -54,4 +56,5 @@ class InventoryBook:
             inventory.no_shares = max(new_balance, 0.0)
             inventory.realized_pnl -= signed_size * price
         inventory.unwind_cycles_without_fill = 0
+        inventory.fill_cooldown_seconds_override = 0
         return inventory

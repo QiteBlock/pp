@@ -49,9 +49,9 @@ pricing:
   quote_improvement_ticks: 1
 
 risk:
-  max_yes_shares_per_market: 20
-  max_no_shares_per_market: 20
-  max_net_delta_per_market: 20
+  max_yes_shares_per_market: 60
+  max_no_shares_per_market: 60
+  max_net_delta_per_market: 40
   max_total_exposure_usdc: 120
   max_drawdown_usdc: 40
   min_days_to_resolution: 2
@@ -62,12 +62,13 @@ filters:
   prefer_rewards: true
   rewards_only: true
   min_reward_rate_per_day: 5
-  max_competitiveness: 2.0
+  max_competitiveness: 3.0
   max_markets_per_family: 1
   min_volume_24h: 250
   max_volume_24h: 5000000
+  min_book_depth_usdc: 250
   min_spread_bps: 20
-  min_fair_value: 0.05
+  min_fair_value: 0.03
   max_fair_value: 0.95
   categories: []
   excluded_categories:
@@ -96,5 +97,9 @@ filters:
     - temperature
     - weather
     - mrbeast
+    - bankruptcy
+    - blockade
+    - strait of hormuz
+    - lifted
 
 markets: []

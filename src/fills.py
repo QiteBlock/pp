@@ -319,6 +319,9 @@ class FillPoller:
             }
         token_id = fill.get("token_id") or fill.get("tokenId") or fill.get("asset_id")
         side = self._normalize_fill_side(fill)
+        trader_side = str(fill.get("trader_side") or fill.get("traderSide") or "").upper()
+        if trader_side == "MAKER":
+            side = invert_trade_side(side)
         size = _to_float(fill.get("size") or fill.get("Size") or fill.get("amount"))
         outcome = str(fill.get("outcome") or "").upper()
         return {
@@ -341,7 +344,18 @@ class FillPoller:
                 maker_address = str(order.get("maker_address") or order.get("makerAddress") or "").lower()
                 if maker_address == our_maker:
                     return order
-        return maker_orders[0] if maker_orders else None
+        token_id = str(fill.get("token_id") or fill.get("tokenId") or fill.get("asset_id") or "")
+        if token_id:
+            matching_token_orders = [
+                order
+                for order in maker_orders
+                if str(order.get("asset_id") or order.get("assetId") or "") == token_id
+            ]
+            if len(matching_token_orders) == 1:
+                return matching_token_orders[0]
+        if len(maker_orders) == 1:
+            return maker_orders[0]
+        return None
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -352,3 +366,12 @@ def _to_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def invert_trade_side(side: str) -> str:
+    normalized = str(side or "").upper()
+    if normalized == "BUY":
+        return "SELL"
+    if normalized == "SELL":
+        return "BUY"
+    return normalized
