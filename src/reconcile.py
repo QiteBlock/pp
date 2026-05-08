@@ -59,11 +59,11 @@ class PositionReconciler:
         # Build token ID to market mapping
         token_to_market = {}
         for market in markets:
-            token_to_market[market.yes_token_id] = (market.slug, "YES")
-            token_to_market[market.no_token_id] = (market.slug, "NO")
+            token_to_market[market.yes_token_id] = (market.slug, "YES", market)
+            token_to_market[market.no_token_id] = (market.slug, "NO", market)
         for market in discovered_markets.values():
-            token_to_market.setdefault(market.yes_token_id, (market.slug, "YES"))
-            token_to_market.setdefault(market.no_token_id, (market.slug, "NO"))
+            token_to_market.setdefault(market.yes_token_id, (market.slug, "YES", market))
+            token_to_market.setdefault(market.no_token_id, (market.slug, "NO", market))
 
         # Check each position reported by the API
         for token_id, api_balance in api_positions.items():
@@ -75,7 +75,7 @@ class PositionReconciler:
                 report.unknown_positions[token_id] = normalized_balance
                 continue
 
-            market_slug, outcome = token_to_market[token_id]
+            market_slug, outcome, market = token_to_market[token_id]
             inventory = self.inventory.get(market_slug)
 
             # Get current inventory for this outcome
@@ -96,9 +96,37 @@ class PositionReconciler:
                 # Update inventory to match API
                 if outcome == "YES":
                     adjustment = balance_diff
+                    if balance_diff < -0.01:
+                        pnl_adjustment = (-balance_diff) * estimate_outcome_mark_price(inventory, market, outcome)
+                        inventory.realized_pnl += pnl_adjustment
+                        report.pnl_adjustments.append(
+                            {
+                                "market": market_slug,
+                                "outcome": outcome,
+                                "token_id": token_id,
+                                "shares_reduced": -balance_diff,
+                                "mark_price": estimate_outcome_mark_price(inventory, market, outcome),
+                                "pnl_adjustment": pnl_adjustment,
+                                "reason": "reconcile_share_reduction",
+                            }
+                        )
                     inventory.yes_shares = normalized_balance
                 else:
                     adjustment = balance_diff
+                    if balance_diff < -0.01:
+                        pnl_adjustment = (-balance_diff) * estimate_outcome_mark_price(inventory, market, outcome)
+                        inventory.realized_pnl += pnl_adjustment
+                        report.pnl_adjustments.append(
+                            {
+                                "market": market_slug,
+                                "outcome": outcome,
+                                "token_id": token_id,
+                                "shares_reduced": -balance_diff,
+                                "mark_price": estimate_outcome_mark_price(inventory, market, outcome),
+                                "pnl_adjustment": pnl_adjustment,
+                                "reason": "reconcile_share_reduction",
+                            }
+                        )
                     inventory.no_shares = normalized_balance
 
                 report.adjustments.append({
@@ -113,6 +141,19 @@ class PositionReconciler:
         for market in markets:
             inventory = self.inventory.get(market.slug)
             if market.yes_token_id not in api_positions and inventory.yes_shares > 0.01:
+                pnl_adjustment = inventory.yes_shares * estimate_outcome_mark_price(inventory, market, "YES")
+                inventory.realized_pnl += pnl_adjustment
+                report.pnl_adjustments.append(
+                    {
+                        "market": market.slug,
+                        "outcome": "YES",
+                        "token_id": market.yes_token_id,
+                        "shares_reduced": inventory.yes_shares,
+                        "mark_price": estimate_outcome_mark_price(inventory, market, "YES"),
+                        "pnl_adjustment": pnl_adjustment,
+                        "reason": "orphaned_share_zero",
+                    }
+                )
                 report.orphaned_positions.append({
                     "market": market.slug,
                     "outcome": "YES",
@@ -128,6 +169,19 @@ class PositionReconciler:
                 })
                 inventory.yes_shares = 0.0
             if market.no_token_id not in api_positions and inventory.no_shares > 0.01:
+                pnl_adjustment = inventory.no_shares * estimate_outcome_mark_price(inventory, market, "NO")
+                inventory.realized_pnl += pnl_adjustment
+                report.pnl_adjustments.append(
+                    {
+                        "market": market.slug,
+                        "outcome": "NO",
+                        "token_id": market.no_token_id,
+                        "shares_reduced": inventory.no_shares,
+                        "mark_price": estimate_outcome_mark_price(inventory, market, "NO"),
+                        "pnl_adjustment": pnl_adjustment,
+                        "reason": "orphaned_share_zero",
+                    }
+                )
                 report.orphaned_positions.append({
                     "market": market.slug,
                     "outcome": "NO",
@@ -168,6 +222,7 @@ class ReconciliationReport:
         self.error: Optional[str] = None
         self.discrepancies: list[dict[str, Any]] = []
         self.adjustments: list[dict[str, Any]] = []
+        self.pnl_adjustments: list[dict[str, Any]] = []
         self.unknown_positions: dict[str, float] = {}  # token_id -> balance of positions not in our config
         self.orphaned_positions: list[dict[str, Any]] = []  # positions in inventory but not in API
 
@@ -219,6 +274,14 @@ def _market_from_position_item(item: dict[str, Any]) -> Optional[MarketConfig]:
         neg_risk=_to_optional_bool(item.get("negativeRisk")),
         condition_id=str(item.get("conditionId") or "").strip() or None,
     )
+
+
+def estimate_outcome_mark_price(inventory: Any, market: MarketConfig, outcome: str) -> float:
+    base_mark = float(inventory.last_mark_price) if float(getattr(inventory, "last_mark_price", 0.0)) > 0 else 0.5
+    base_mark = min(max(base_mark, 0.01), 0.99)
+    if outcome.upper() == "YES":
+        return base_mark
+    return min(max(1.0 - base_mark, 0.01), 0.99)
 
 
 def _parse_position_end_date(value: Any) -> Optional[datetime]:

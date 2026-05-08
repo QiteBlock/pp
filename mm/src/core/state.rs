@@ -529,10 +529,16 @@ impl MarketState {
                 if let Some((best_bid, bid_qty)) = symbol_state.bids.iter().next_back() {
                     symbol_state.best_bid = Some(*best_bid);
                     symbol_state.bbo_bid_size = Some(*bid_qty);
+                } else {
+                    symbol_state.best_bid = None;
+                    symbol_state.bbo_bid_size = None;
                 }
                 if let Some((best_ask, ask_qty)) = symbol_state.asks.iter().next() {
                     symbol_state.best_ask = Some(*best_ask);
                     symbol_state.bbo_ask_size = Some(*ask_qty);
+                } else {
+                    symbol_state.best_ask = None;
+                    symbol_state.bbo_ask_size = None;
                 }
                 symbol_state.last_updated = Some(timestamp);
                 symbol_state.last_updated_at = Some(Instant::now());
@@ -566,10 +572,16 @@ impl MarketState {
                 if let Some((best_bid, bid_qty)) = symbol_state.bids.iter().next_back() {
                     symbol_state.best_bid = Some(*best_bid);
                     symbol_state.bbo_bid_size = Some(*bid_qty);
+                } else {
+                    symbol_state.best_bid = None;
+                    symbol_state.bbo_bid_size = None;
                 }
                 if let Some((best_ask, ask_qty)) = symbol_state.asks.iter().next() {
                     symbol_state.best_ask = Some(*best_ask);
                     symbol_state.bbo_ask_size = Some(*ask_qty);
+                } else {
+                    symbol_state.best_ask = None;
+                    symbol_state.bbo_ask_size = None;
                 }
                 symbol_state.last_updated = Some(timestamp);
                 symbol_state.last_updated_at = Some(Instant::now());

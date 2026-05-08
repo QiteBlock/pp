@@ -591,24 +591,19 @@ class PolymarketClient:
         if not asset_id:
             return []
         try:
-            if self.trading_client is not None and TradeParams is not None and hasattr(self.trading_client, "get_trades"):
-                params = TradeParams(asset_id=asset_id)
-                trades = self.trading_client.get_trades(params=params, only_first_page=True)
-                if isinstance(trades, list):
-                    return trades[: max(int(limit), 0)]
-        except Exception:
-            pass
-        try:
             response = self.session.get(
-                f"{self.clob_host}/data/trades",
-                params={"asset_id": asset_id},
-                timeout=20,
+                f"{self.data_api_host}/trades",
+                params={"market": asset_id, "limit": max(int(limit), 0)},
+                timeout=10,
             )
             response.raise_for_status()
             payload = response.json()
-            data = payload.get("data") if isinstance(payload, dict) else payload
-            if isinstance(data, list):
-                return data[: max(int(limit), 0)]
+            if isinstance(payload, list):
+                return payload[: max(int(limit), 0)]
+            if isinstance(payload, dict):
+                data = payload.get("data") or []
+                if isinstance(data, list):
+                    return data[: max(int(limit), 0)]
         except Exception:
             return []
         return []
@@ -631,6 +626,11 @@ class PolymarketClient:
         amount_base_units = int(round(max(float(amount_shares), 0.0) * 1_000_000))
         if amount_base_units <= 0:
             raise RuntimeError("Merge amount must be positive")
+        if amount_base_units > 10**12:
+            raise RuntimeError(
+                f"Merge amount sanity check failed: {amount_base_units} base units "
+                f"for {amount_shares} shares is unexpectedly large"
+            )
         condition_bytes = Web3.to_bytes(hexstr=condition_id)
         parent_collection_id = b"\x00" * 32
         gas_price = self.web3.eth.gas_price

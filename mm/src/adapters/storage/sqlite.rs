@@ -588,6 +588,8 @@ impl FillStore {
                 snapshot.bbo_ask_size.map(|v| v.to_string()),
                 snapshot.price_index.map(|v| v.to_string()),
                 snapshot.raw_volatility.map(|v| v.to_string()),
+                // strategy_snapshots.volatility stores the effective spread addon
+                // after floor/BBO/cross-flow adjustments, not the raw EWMA sigma.
                 snapshot.volatility.map(|v| v.to_string()),
                 snapshot.inventory_lean_bps.map(|v| v.to_string()),
                 snapshot.volume_imbalance.map(|v| v.to_string()),

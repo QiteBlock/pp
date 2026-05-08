@@ -155,8 +155,10 @@ impl FactorEngine {
         };
         let symbol_state = self.symbol_state.entry(pair.symbol.clone()).or_default();
         let alpha = parsed.factors.volatility_ewma_alpha;
+        let previous_mid = symbol_state.last_mid;
+        let previous_mid_timestamp = symbol_state.last_mid_timestamp;
 
-        if let Some(prev_mid) = symbol_state.last_mid {
+        if let Some(prev_mid) = previous_mid {
             if prev_mid > Decimal::ZERO && mid > Decimal::ZERO {
                 let log_return = (mid / prev_mid).ln();
                 let mean_prev = symbol_state.ewma_mean.unwrap_or(log_return);
@@ -176,6 +178,15 @@ impl FactorEngine {
 
         symbol_state.last_mid = Some(mid);
         symbol_state.last_mid_timestamp = Some(now);
+        let fast_sweep_move = previous_mid
+            .zip(previous_mid_timestamp)
+            .filter(|(prev_mid, prev_ts)| {
+                *prev_mid > Decimal::ZERO
+                    && now.signed_duration_since(*prev_ts) <= Duration::seconds(1)
+            })
+            .map(|(prev_mid, _)| ((mid - prev_mid).abs() / prev_mid) * Decimal::from(10_000u64))
+            .filter(|move_bps| *move_bps > Decimal::from(30u64))
+            .is_some();
 
         let volatility = symbol_state.ewma_variance.sqrt().unwrap_or(Decimal::ZERO);
         let volume_window = Duration::seconds(config.factors.volume_window_secs);
@@ -350,7 +361,7 @@ impl FactorEngine {
         // Issue 7: raw flow fallback — 2 consecutive cycles of |raw_flow| > 0.7
         // forces TrendingToxic even if the EWMA-smoothed flow hasn't caught up.
         let force_toxic = symbol_state.consecutive_high_raw_flow >= 2;
-        let target_regime = if force_toxic {
+        let target_regime = if fast_sweep_move || force_toxic {
             MarketRegime::TrendingToxic
         } else {
             candidate_regime(
@@ -362,10 +373,11 @@ impl FactorEngine {
             )
         };
         let min_dwell = Duration::seconds(parsed.factors.regime_min_dwell_secs as i64);
-        let can_change = symbol_state
-            .regime_entered_at
-            .map(|t| now - t >= min_dwell)
-            .unwrap_or(true);
+        let can_change = fast_sweep_move
+            || symbol_state
+                .regime_entered_at
+                .map(|t| now - t >= min_dwell)
+                .unwrap_or(true);
         if can_change && target_regime != symbol_state.regime {
             symbol_state.regime = target_regime;
             symbol_state.regime_entered_at = Some(now);
@@ -394,10 +406,16 @@ impl FactorEngine {
         // Continuous intensity: flow magnitude drives toxic intensity, vol drives volatile intensity.
         let flow_intensity = flow_abs.min(Decimal::ONE);
         let vol_intensity = (volatility / Decimal::new(2, 3)).min(Decimal::ONE);
-        let raw_intensity = flow_intensity.max(vol_intensity);
+        let raw_intensity = if fast_sweep_move {
+            Decimal::ONE
+        } else {
+            flow_intensity.max(vol_intensity)
+        };
         // EWMA-smooth the intensity to prevent jitter.
         let regime_alpha = parsed.factors.regime_intensity_alpha;
-        symbol_state.regime_intensity = if symbol_state.regime_intensity.is_zero() {
+        symbol_state.regime_intensity = if fast_sweep_move {
+            Decimal::ONE
+        } else if symbol_state.regime_intensity.is_zero() {
             raw_intensity
         } else {
             regime_alpha * raw_intensity

@@ -31,6 +31,7 @@ UNWIND_IOC_ESCAPE_CYCLES = 2
 ADAPTIVE_FILL_COOLDOWN_MILD = 45
 ADAPTIVE_FILL_COOLDOWN_STRONG = 60
 MERGE_GAS_FALLBACK_USDC = 1.0
+STUCK_UNWIND_MAX_CYCLES = 200
 
 
 @dataclass
@@ -68,6 +69,7 @@ class BotContext:
     reentry_cooldown_path: Path
     post_unwind_cooldown_seconds: int
     reentry_cooldowns: dict[str, float]
+    released_markets: set[str]
     filters: dict[str, Any]
 
 
@@ -96,6 +98,8 @@ def run_market_maker(config_path: str) -> None:
                 fills_processed = context.fill_poller.poll_fills(token_mapping)
                 if fills_processed > 0:
                     print(f"Processed {fills_processed} new fill(s)")
+                context.analytics.process_pending_followups(context.client)
+                context.analytics.emit_periodic_summaries()
                 sync_positions_to_unwind_from_inventory(context)
                 if context.reconciliation_interval_loops > 0 and loop_count % context.reconciliation_interval_loops == 0:
                     reconciliation_report = perform_reconciliation(
@@ -134,6 +138,13 @@ def run_market_maker(config_path: str) -> None:
                     "primary_market": context.active_market.slug if context.active_market else None,
                 },
             )
+            if loop_count % 25 == 0:
+                for market in markets_to_quote:
+                    context.analytics.emit_market_pnl_snapshot(
+                        market.slug,
+                        context.inventory.get(market.slug),
+                        mark_prices.get(market.slug),
+                    )
             time.sleep(context.loop_interval_seconds)
     except Exception as exc:
         if "context" in locals() and context.telegram.is_enabled():
@@ -194,6 +205,7 @@ def load_context(config_path: str) -> BotContext:
         reentry_cooldown_path=reentry_cooldown_path,
         post_unwind_cooldown_seconds=max(int(runtime.get("post_unwind_cooldown_seconds", 1800)), 0),
         reentry_cooldowns=load_reentry_cooldowns(reentry_cooldown_path),
+        released_markets=set(),
         filters=config.get("filters", {}),
     )
     hydrate_discovered_position_markets(context)
@@ -401,6 +413,8 @@ def perform_reconciliation(context: BotContext, trigger: str, **details: Any) ->
     }
     payload.update(details)
     context.analytics.log_event("reconciliation", payload)
+    for pnl_adjustment in getattr(report, "pnl_adjustments", []):
+        context.analytics.log_event("reconcile_pnl_adjustment", pnl_adjustment)
     return report
 
 
@@ -412,6 +426,9 @@ def run_recovery_reconciliation(context: BotContext, trigger: str, **details: An
 
 
 def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[str, float]) -> None:
+    if market.slug in context.released_markets:
+        return
+    context.analytics.note_market_active(market.slug)
     try:
         book = context.client.get_orderbook(market.yes_token_id)
     except Exception as exc:
@@ -483,6 +500,7 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             "risk_skip",
             {"market": market.slug, "reason": fair_value_breach, "fair_value": quote.fair_value},
         )
+        context.analytics.note_skip_reason(market.slug, fair_value_breach)
         print(f"[{market.slug}] skipped: {fair_value_breach} fair={quote.fair_value:.3f}")
         return
     portfolio_exposure = total_exposure(context.inventory, mark_prices)
@@ -506,6 +524,7 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             "risk_skip",
             {"market": market.slug, "reason": "drawdown unwind-only threshold", "drawdown_ratio": drawdown_ratio},
         )
+        context.analytics.note_skip_reason(market.slug, "drawdown unwind-only threshold")
         print(f"[{market.slug}] skipped: drawdown unwind-only threshold ratio={drawdown_ratio:.2f}")
         return
     allowed, reason = can_quote_market(context.risk, inventory, quote.fair_value, signal.time_to_resolution_days)
@@ -544,6 +563,7 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             )
             return
         context.analytics.log_event("risk_skip", {"market": market.slug, "reason": reason})
+        context.analytics.note_skip_reason(market.slug, reason)
         print(
             f"[{market.slug}] skipped: {reason} "
             f"yes={inventory.yes_shares:.4f} no={inventory.no_shares:.4f} delta={inventory.net_delta:.4f}"
@@ -567,6 +587,7 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             "risk_skip",
             {"market": market.slug, "reason": "portfolio exposure limit breached", "exposure": portfolio_exposure},
         )
+        context.analytics.note_skip_reason(market.slug, "portfolio exposure limit breached")
         print(f"[{market.slug}] skipped: portfolio exposure limit breached exposure={portfolio_exposure:.4f}")
         return
     reward_spread_breach = reward_spread_limit_breach(market, quote)
@@ -575,6 +596,7 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             "risk_skip",
             {"market": market.slug, "reason": reward_spread_breach, "fair_value": quote.fair_value, "half_spread": quote.half_spread},
         )
+        context.analytics.note_skip_reason(market.slug, reward_spread_breach)
         print(f"[{market.slug}] skipped: {reward_spread_breach}")
         return
     if not passes_post_only_guard(book, quote.bid, quote.ask):
@@ -602,6 +624,7 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
                     "quote_ask": quote.ask,
                 },
             )
+            context.analytics.note_skip_reason(market.slug, "post_only_guard")
             print(f"[{market.slug}] skipped: post-only guard blocked marketable quote ({quote.bid:.3f},{quote.ask:.3f})")
             return
     place_yes_bid, place_no_bid, quote_reason = determine_quote_sides(context, market, inventory, signal, book)
@@ -617,6 +640,7 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
                 "last_fill_ts": inventory.last_fill_ts,
             },
         )
+        context.analytics.note_skip_reason(market.slug, quote_reason)
         print(f"[{market.slug}] skipped: {quote_reason}")
         return
 
@@ -651,6 +675,7 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
                 "risk_skip",
                 {"market": market.slug, "reason": "cancel_failed_before_requote"},
             )
+            context.analytics.note_skip_reason(market.slug, "cancel_failed_before_requote")
             print(f"[{market.slug}] skipped: cancel failed before requote")
             return
 
@@ -741,6 +766,32 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
 
     if bid_response is None and ask_response is None:
         return
+    if bid_response is not None:
+        record_order_placement_event(
+            context,
+            bid_response,
+            market=market,
+            side="BUY",
+            outcome="YES",
+            price=quote.bid,
+            size=quote.size,
+            reward_eligible=reward_status["eligible"],
+            reward_rate_per_day=market.reward_rate_per_day,
+            fair_value=quote.fair_value,
+        )
+    if ask_response is not None:
+        record_order_placement_event(
+            context,
+            ask_response,
+            market=market,
+            side="BUY",
+            outcome="NO",
+            price=no_bid_price,
+            size=quote.size,
+            reward_eligible=reward_status["eligible"],
+            reward_rate_per_day=market.reward_rate_per_day,
+            fair_value=quote.fair_value,
+        )
     context.analytics.log_event(
         "quote_cycle",
         {
@@ -842,6 +893,7 @@ def process_unwind_market(
                 "delta": inventory.net_delta,
             },
         )
+        context.analytics.note_skip_reason(market.slug, f"unwind:{reason}")
         print(
             f"[{market.slug}] skipped: unable to build unwind order "
             f"yes={inventory.yes_shares:.4f} no={inventory.no_shares:.4f} delta={inventory.net_delta:.4f}"
@@ -861,13 +913,18 @@ def process_unwind_market(
                     "label": order_request["label"],
                 },
             )
+            context.analytics.note_skip_reason(market.slug, "cancel_failed_before_unwind")
             print(f"[{market.slug}] skipped: cancel failed before {order_request['label']}")
             return
         refresh_sell_unwind_order(context, order_request, aggressive=effective_aggressive)
 
     if not context.dry_run and order_request["side"].upper() == "SELL":
         if not prepare_sell_unwind_order(context, market, inventory, order_request):
-            maybe_handle_dust_position(context, market, inventory)
+            recovered = maybe_handle_dust_position(context, market, inventory)
+            if not recovered:
+                inventory.unwind_failed_cycles += 1
+                if inventory.unwind_failed_cycles >= STUCK_UNWIND_MAX_CYCLES:
+                    release_stuck_unwind_market(context, market, inventory)
             return
 
     try:
@@ -976,6 +1033,20 @@ def process_unwind_market(
             "response": response,
         },
     )
+    if response_is_success(response):
+        inventory.last_mark_price = quote_safe_mark(signal)
+        record_order_placement_event(
+            context,
+            response,
+            market=market,
+            side=order_request["side"],
+            outcome="YES" if order_request["token_id"] == market.yes_token_id else "NO",
+            price=order_request["price"],
+            size=order_request["size"],
+            reward_eligible=False,
+            reward_rate_per_day=market.reward_rate_per_day,
+            fair_value=quote.fair_value,
+        )
     log_rejected_order_response(
         context,
         market,
@@ -1580,8 +1651,28 @@ def cancel_market_orders_for_requote(
     try:
         if yes_orders:
             context.client.cancel_market_orders(market.yes_token_id, dry_run=False)
+            for order in yes_orders:
+                context.analytics.record_order_cancel(
+                    str(order.get("id") or order.get("orderId") or ""),
+                    market.slug,
+                    side=str(order.get("side") or "BUY"),
+                    outcome="YES",
+                    price=_to_optional_float(order.get("price")),
+                    size=_to_optional_float(order.get("original_size") or order.get("size") or order.get("remaining_size")),
+                )
+                context.analytics.note_cancel(market.slug)
         if no_orders:
             context.client.cancel_market_orders(market.no_token_id, dry_run=False)
+            for order in no_orders:
+                context.analytics.record_order_cancel(
+                    str(order.get("id") or order.get("orderId") or ""),
+                    market.slug,
+                    side=str(order.get("side") or "BUY"),
+                    outcome="NO",
+                    price=_to_optional_float(order.get("price")),
+                    size=_to_optional_float(order.get("original_size") or order.get("size") or order.get("remaining_size")),
+                )
+                context.analytics.note_cancel(market.slug)
         context.analytics.log_event(
             "cancel_market_requote",
             {
@@ -1928,6 +2019,8 @@ def toxic_flow_quote_filter(
     skip_no = False
     reasons: list[str] = []
     trades = context.client.get_recent_trades(market.yes_token_id, limit=TOXIC_FLOW_TRADE_WINDOW)
+    if not trades and inventory.last_mark_price > 0:
+        context.analytics.log_event("toxic_flow_no_trades", {"market": market.slug})
     buy_count = 0
     sell_count = 0
     for trade in trades:
@@ -1956,6 +2049,15 @@ def toxic_flow_quote_filter(
         if move >= threshold:
             skip_no = True
             reasons.append(f"toxic_mid_up({move:.3f})")
+    context.analytics.emit_quote_cycle_flow(
+        market.slug,
+        recent_buy_count=buy_count,
+        recent_sell_count=sell_count,
+        buy_ratio=(buy_count / total) if total > 0 else None,
+        mid_move_last_cycle=(current_mark - inventory.last_mark_price) if inventory.last_mark_price > 0 else 0.0,
+        would_skip_yes=skip_yes,
+        would_skip_no=skip_no,
+    )
     return skip_yes, skip_no, " ".join(reasons)
 
 
@@ -1974,7 +2076,27 @@ def response_is_immediate_execution(response: Any) -> bool:
     return status in {"matched", "filled"}
 
 
-def maybe_handle_dust_position(context: BotContext, market: MarketConfig, inventory: Any) -> None:
+def maybe_handle_dust_position(context: BotContext, market: MarketConfig, inventory: Any) -> bool:
+    if is_non_actionable_dust_position(context, market, inventory):
+        if market.slug not in context.released_markets:
+            context.released_markets.add(market.slug)
+            context.analytics.log_event(
+                "dust_position_released",
+                {
+                    "market": market.slug,
+                    "yes_shares": inventory.yes_shares,
+                    "no_shares": inventory.no_shares,
+                    "recoverable_yes_usdc": inventory.yes_shares * estimate_outcome_recovery_price(inventory, "YES"),
+                    "recoverable_no_usdc": inventory.no_shares * estimate_outcome_recovery_price(inventory, "NO"),
+                    "reason": "non_actionable_dust",
+                },
+            )
+            print(
+                f"[{market.slug}] released non-actionable dust "
+                f"yes={inventory.yes_shares:.4f} no={inventory.no_shares:.4f}"
+            )
+        return True
+
     paired_dust = min(inventory.yes_shares, inventory.no_shares)
     if 0 < paired_dust < EXCHANGE_MIN_ORDER_SIZE:
         recoverable_usdc = paired_dust
@@ -1987,6 +2109,7 @@ def maybe_handle_dust_position(context: BotContext, market: MarketConfig, invent
                 response = context.client.merge_position_pair(market.condition_id, paired_dust, dry_run=context.dry_run)
                 inventory.yes_shares = max(inventory.yes_shares - paired_dust, 0.0)
                 inventory.no_shares = max(inventory.no_shares - paired_dust, 0.0)
+                inventory.realized_pnl += paired_dust
                 status = str(response.get("status") or "merge_submitted")
                 context.analytics.log_event(
                     "dust_merge_executed",
@@ -2002,9 +2125,16 @@ def maybe_handle_dust_position(context: BotContext, market: MarketConfig, invent
                     f"[{market.slug}] dust merged: paired={paired_dust:.4f} "
                     f"recoverable_usdc={recoverable_usdc:.4f} tx={response.get('tx_hash', '-')}"
                 )
+                context.analytics.emit_merge_pnl_impact(
+                    market.slug,
+                    paired_dust,
+                    usdc_received=paired_dust,
+                    gas_used=_to_optional_float(response.get("gas_used")),
+                )
                 if not context.dry_run:
                     run_recovery_reconciliation(context, "dust_merge", market=market.slug, shares=paired_dust)
-                return
+                inventory.unwind_failed_cycles = 0
+                return True
             except Exception as exc:
                 status = "merge_failed"
                 context.analytics.log_event(
@@ -2033,7 +2163,7 @@ def maybe_handle_dust_position(context: BotContext, market: MarketConfig, invent
             f"[{market.slug}] dust handling: paired_dust={paired_dust:.4f} "
             f"recoverable_usdc={recoverable_usdc:.4f} status={status}"
         )
-        return
+        return False
     if 0 < inventory.yes_shares < EXCHANGE_MIN_ORDER_SIZE or 0 < inventory.no_shares < EXCHANGE_MIN_ORDER_SIZE:
         context.analytics.log_event(
             "dust_residual_position",
@@ -2043,6 +2173,31 @@ def maybe_handle_dust_position(context: BotContext, market: MarketConfig, invent
                 "no_shares": inventory.no_shares,
             },
         )
+        return False
+    return False
+
+
+def release_stuck_unwind_market(context: BotContext, market: MarketConfig, inventory: Any) -> None:
+    context.released_markets.add(market.slug)
+    inventory.unwind_failed_cycles = 0
+    context.analytics.log_event(
+        "stuck_unwind_release",
+        {
+            "market": market.slug,
+            "yes_shares": inventory.yes_shares,
+            "no_shares": inventory.no_shares,
+            "realized_loss": inventory.realized_pnl,
+        },
+    )
+    if context.telegram.is_enabled():
+        context.telegram.send_message(
+            f"Stuck unwind released: {market.slug}\n"
+            f"yes={inventory.yes_shares:.4f} no={inventory.no_shares:.4f}"
+        )
+    print(
+        f"[{market.slug}] released from stuck unwind "
+        f"yes={inventory.yes_shares:.4f} no={inventory.no_shares:.4f}"
+    )
 
 
 def attempt_merge_before_flatten(context: BotContext, market: MarketConfig, inventory: Any, reason: str) -> Optional[str]:
@@ -2071,6 +2226,7 @@ def attempt_merge_before_flatten(context: BotContext, market: MarketConfig, inve
         return None
     inventory.yes_shares = max(inventory.yes_shares - paired_shares, 0.0)
     inventory.no_shares = max(inventory.no_shares - paired_shares, 0.0)
+    inventory.realized_pnl += paired_shares
     context.analytics.log_event(
         "flatten_pair_merge",
         {
@@ -2084,11 +2240,48 @@ def attempt_merge_before_flatten(context: BotContext, market: MarketConfig, inve
         f"[{market.slug}] merged paired YES/NO before flatten "
         f"paired={paired_shares:.4f} status={response.get('status', 'submitted')}"
     )
+    context.analytics.emit_merge_pnl_impact(
+        market.slug,
+        paired_shares,
+        usdc_received=paired_shares,
+        gas_used=_to_optional_float(response.get("gas_used")),
+    )
     if not context.dry_run:
         run_recovery_reconciliation(context, "flatten_pair_merge", market=market.slug, shares=paired_shares)
     if inventory.gross_shares <= 0.01:
         return "merged_all"
     return "merged_partial"
+
+
+def record_order_placement_event(
+    context: BotContext,
+    response: Any,
+    *,
+    market: MarketConfig,
+    side: str,
+    outcome: str,
+    price: float,
+    size: float,
+    reward_eligible: bool,
+    reward_rate_per_day: Optional[float],
+    fair_value: Optional[float],
+) -> None:
+    order_id, status, _ = extract_order_response_metadata(response)
+    if not order_id:
+        return
+    if status and status.strip().lower() in {"rejected", "error"}:
+        return
+    context.analytics.record_order_placement(
+        order_id=order_id,
+        market=market.slug,
+        side=side,
+        outcome=outcome,
+        price=price,
+        size=size,
+        reward_eligible=reward_eligible,
+        reward_rate_per_day=reward_rate_per_day,
+        fair_value=fair_value,
+    )
 
 
 def round_sell_at_best_bid(best_bid: float, tick_size: float) -> float:
@@ -2106,11 +2299,24 @@ def is_non_actionable_dust_position(context: BotContext, market: MarketConfig, i
     max_side = max(inventory.yes_shares, inventory.no_shares)
     if max_side + 1e-9 >= EXCHANGE_MIN_ORDER_SIZE:
         return False
+    yes_mark = estimate_outcome_recovery_price(inventory, "YES")
+    no_mark = estimate_outcome_recovery_price(inventory, "NO")
+    unpaired_recovery = max(inventory.yes_shares * yes_mark, inventory.no_shares * no_mark)
     paired_dust = min(inventory.yes_shares, inventory.no_shares)
     if paired_dust > 0.0:
         recoverable_usdc = paired_dust
-        return recoverable_usdc <= MERGE_GAS_FALLBACK_USDC or not market.condition_id
-    return True
+        if recoverable_usdc > MERGE_GAS_FALLBACK_USDC and market.condition_id:
+            return False
+        return unpaired_recovery <= MERGE_GAS_FALLBACK_USDC
+    return unpaired_recovery <= MERGE_GAS_FALLBACK_USDC
+
+
+def estimate_outcome_recovery_price(inventory: Any, outcome: str) -> float:
+    base_mark = float(inventory.last_mark_price) if float(getattr(inventory, "last_mark_price", 0.0)) > 0 else 0.5
+    base_mark = min(max(base_mark, 0.01), 0.99)
+    if outcome.upper() == "YES":
+        return base_mark
+    return min(max(1.0 - base_mark, 0.01), 0.99)
 
 
 def inventory_requires_active_unwind(context: BotContext, market: MarketConfig, inventory: Any) -> bool:
@@ -2215,6 +2421,13 @@ def refresh_market_selection(context: BotContext, force: bool = False) -> None:
             "market_switch",
             {"previous_markets": previous_slugs, "new_markets": new_slugs},
         )
+        for previous_slug in previous_slugs:
+            previous_inventory = context.inventory.get(previous_slug)
+            context.analytics.emit_market_pnl_snapshot(
+                previous_slug,
+                previous_inventory,
+                previous_inventory.last_mark_price,
+            )
         print("Selected markets:")
         for market in selected:
             print(f"  {market.slug} | {market.question}")
@@ -2222,10 +2435,12 @@ def refresh_market_selection(context: BotContext, force: bool = False) -> None:
 
 def get_markets_to_quote(context: BotContext) -> list[MarketConfig]:
     if context.force_unwind_only:
-        return list(context.positions_to_unwind[: context.max_active_markets])
+        return [market for market in context.positions_to_unwind if market.slug not in context.released_markets][
+            : context.max_active_markets
+        ]
     if context.auto_scan_enabled:
-        return list(context.active_markets)
-    return context.markets
+        return [market for market in context.active_markets if market.slug not in context.released_markets]
+    return [market for market in context.markets if market.slug not in context.released_markets]
 
 
 def preflight_live_auth(context: BotContext) -> None:
@@ -2632,6 +2847,8 @@ def merge_selected_markets(context: BotContext, ranked_candidates: list[MarketCo
     max_markets_per_family = max(int(context.filters.get("max_markets_per_family", 0) or 0), 0)
 
     for market in context.positions_to_unwind:
+        if market.slug in context.released_markets:
+            continue
         inventory = context.inventory.get(market.slug)
         if inventory_requires_active_unwind(context, market, inventory) and market.slug not in selected_slugs:
             selected.append(ranked_by_slug.get(market.slug, market))
@@ -2640,6 +2857,8 @@ def merge_selected_markets(context: BotContext, ranked_candidates: list[MarketCo
             family_counts[family] = family_counts.get(family, 0) + 1
 
     for market in context.active_markets:
+        if market.slug in context.released_markets:
+            continue
         inventory = context.inventory.get(market.slug)
         if inventory_requires_active_unwind(context, market, inventory) and market.slug not in selected_slugs:
             selected.append(ranked_by_slug.get(market.slug, market))
@@ -2651,6 +2870,8 @@ def merge_selected_markets(context: BotContext, ranked_candidates: list[MarketCo
         if len(selected) >= context.max_active_markets:
             break
         if market.slug in selected_slugs:
+            continue
+        if market.slug in context.released_markets:
             continue
         inventory = context.inventory.get(market.slug)
         if inventory.gross_shares > 0.01 and not inventory_requires_active_unwind(context, market, inventory):
@@ -2714,6 +2935,8 @@ def sync_positions_to_unwind(context: BotContext, report: Any) -> None:
 
     positions: list[MarketConfig] = []
     for market in known_by_slug.values():
+        if market.slug in context.released_markets:
+            continue
         inventory = context.inventory.get(market.slug)
         if is_non_actionable_dust_position(context, market, inventory):
             maybe_handle_dust_position(context, market, inventory)
@@ -2730,6 +2953,8 @@ def sync_positions_to_unwind_from_inventory(context: BotContext) -> None:
     known_by_slug = {market.slug: market for market in markets_for_state_tracking(context)}
     positions: list[MarketConfig] = []
     for market in known_by_slug.values():
+        if market.slug in context.released_markets:
+            continue
         inventory = context.inventory.get(market.slug)
         if is_non_actionable_dust_position(context, market, inventory):
             maybe_handle_dust_position(context, market, inventory)

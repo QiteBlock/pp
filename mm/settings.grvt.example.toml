@@ -27,7 +27,6 @@ retry_initial_backoff_ms = 250
 retry_max_backoff_ms = 2000
 websocket_reconnect_backoff_ms = 1000
 
-
 [model]
 born_inf_bps = "2"
 born_sup_bps = "6"
@@ -39,21 +38,21 @@ min_step_price = "0.001"
 min_step_volume = "0.01"
 min_trade_amount = "5"
 position_size_skew_weight = "0.6"
-position_spread_multiplier = "2.0"
+position_spread_multiplier = "1.2"
 position_dead_zone = "0.001"
 price_sensitivity_threshold = "0.003"
 price_sensitivity_scaling_factor = "0.75"
 volume_sensitivity_threshold = "0.10"
 volatility_cut_threshold = "0.010"
 index_forward_buffer_bps = "0"
-max_spread_bps = "20"
+max_spread_bps = "8"
 prevent_spread_crossing = true
 cancel_orders_crossing_mid = true
-as_gamma = "0.1"
+as_gamma = "0.05"
 as_kappa = "3000.0"
 as_time_horizon = "0.5"
 inventory_lean_bps = "14.0"
-as_vol_cap = "0.001"
+as_vol_cap = "0.0003"
 # ── Auto-tuning ────────────────────────────────────────────────────────────────
 # Online kappa: replace fixed as_kappa with empirical fill-probability estimate
 # after kappa_min_cycles observations (~200 cycles = ~100 s at 500 ms interval).
@@ -68,9 +67,9 @@ fill_rate_competitive_bps = "1.5"
 funding_lean_weight = "0.5"
 # Post-fill widen: after a fill, widen the opposite side for 10 s by 1.3×.
 post_fill_widen_secs = "5"
-post_fill_widen_multiplier = "1.5"
+post_fill_widen_multiplier = "1.1"
 # VPIN widen: at VPIN > 0.65 spread widens toward 1.4× linearly.
-vpin_widen_multiplier = "1.4"
+vpin_widen_multiplier = "1.05"
 
 [risk]
 max_abs_position_usd = "500"
@@ -85,10 +84,10 @@ max_correlated_position_usd = "500"
 emergency_unwind_threshold = "0.8"
 emergency_unwind_cycles = 10
 stale_position_timeout_secs = 900
-stale_position_bid_hold_secs = 180
-stale_position_ask_hold_secs = 60
-stale_position_close_slippage_cap_bps = "30"
-stale_position_close_chunk_base = "0"
+stale_position_bid_hold_secs = 600
+stale_position_ask_hold_secs = 600
+stale_position_close_slippage_cap_bps = "15"
+stale_position_close_chunk_base = "0.5"
 
 [factors]
 volume_window_secs = 30
@@ -106,7 +105,7 @@ inventory_risk_constant = "300"
 inventory_skew_convexity = "1.0"
 regime_min_dwell_secs = 10
 cross_symbol_vol_weight = "0.0"
-volatility_floor = "0.0003"
+volatility_floor = "0.00005"
 ob_imbalance_weight = "1.5"
 ob_imbalance_depth = 10
 bbo_spread_cap_bps = "20"
@@ -116,9 +115,9 @@ toxic_regime_block_new_positions_intensity = "0.7"
 # Microprice: BBO size-weighted mid from GRVT v1.mini.d bq/aq fields.
 microprice_weight = "1.0"
 # VPIN: 5-HYPE buckets, 20-bucket rolling window, widen above 0.65.
-vpin_bucket_size = "50.0"
+vpin_bucket_size = "500.0"
 vpin_n_buckets = 20
-vpin_widen_threshold = "0.65"
+vpin_widen_threshold = "0.95"
 
 [storage]
 enabled = true
@@ -136,3 +135,23 @@ post_only = true
 service_on = true
 side_filter = "both"
 binance_symbol = "hypeusdt"
+
+[[pairs]]
+symbol = "BTC/USDT-P"
+enabled = false
+max_position_base = "0.006"
+price_source = "mid"
+post_only = true
+service_on = true
+side_filter = "both"
+binance_symbol = "btcusdt"
+
+[[pairs]]
+symbol = "XAU/USDT-P"
+enabled = false
+max_position_base = "0.1"
+price_source = "mid"
+post_only = true
+service_on = true
+side_filter = "both"
+binance_symbol = "xauusdt"

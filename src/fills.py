@@ -258,11 +258,35 @@ class FillPoller:
         outcome = normalized.get("outcome") or default_outcome
         timestamp = self._extract_timestamp(fill)
         ts_str = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc).isoformat() if timestamp else datetime.now(timezone.utc).isoformat()
+        fill_ts_epoch = (timestamp / 1000.0) if timestamp else datetime.now(timezone.utc).timestamp()
+        inventory = self.inventory.get(market_slug)
+
+        # If reconciliation or prior sells already flattened this outcome,
+        # a later historical sell fill should not re-open a negative balance path.
+        current_balance = inventory.yes_shares if outcome == "YES" else inventory.no_shares
+        if side == "SELL" and current_balance <= 0.01 and size - current_balance > 0.01:
+            self.analytics.log_event(
+                "fill_apply_stale_skip",
+                {
+                    "market": market_slug,
+                    "fill_id": self._fill_identity(fill),
+                    "order_id": normalized.get("order_id"),
+                    "token_id": token_id,
+                    "outcome": outcome,
+                    "side": side,
+                    "size": size,
+                    "price": price,
+                    "current_balance": current_balance,
+                    "raw_side": fill.get("side") or fill.get("Side"),
+                    "trader_side": fill.get("trader_side") or fill.get("traderSide"),
+                },
+            )
+            return True
 
         try:
             # Apply to inventory
             inventory = self.inventory.apply_fill(market_slug, outcome, side, size, price)
-            inventory.last_fill_ts = (timestamp / 1000.0) if timestamp else datetime.now(timezone.utc).timestamp()
+            inventory.last_fill_ts = fill_ts_epoch
 
             # Log fill
             record = FillRecord(
@@ -278,6 +302,8 @@ class FillPoller:
                 "fill_applied",
                 {
                     "market": market_slug,
+                    "fill_id": self._fill_identity(fill),
+                    "order_id": normalized.get("order_id"),
                     "token_id": token_id,
                     "outcome": outcome,
                     "side": side,
@@ -288,6 +314,17 @@ class FillPoller:
                     "normalized_token_id": token_id,
                     "normalized_outcome": outcome,
                 },
+            )
+            self.analytics.record_fill_observability(
+                fill_id=self._fill_identity(fill) or f"{market_slug}|{token_id}|{ts_str}",
+                market=market_slug,
+                token_id=token_id,
+                outcome=outcome,
+                side=side,
+                size=size,
+                price=price,
+                fill_ts=fill_ts_epoch,
+                order_id=normalized.get("order_id"),
             )
             if self.fill_handler is not None:
                 try:
@@ -316,11 +353,15 @@ class FillPoller:
                 "side": side,
                 "size": size,
                 "outcome": outcome,
+                "order_id": maker_order.get("order_id") or maker_order.get("orderId"),
             }
         token_id = fill.get("token_id") or fill.get("tokenId") or fill.get("asset_id")
         side = self._normalize_fill_side(fill)
         trader_side = str(fill.get("trader_side") or fill.get("traderSide") or "").upper()
         if trader_side == "MAKER":
+            maker_orders = fill.get("maker_orders") or fill.get("makerOrders") or []
+            if isinstance(maker_orders, list) and len(maker_orders) > 1:
+                return None
             side = invert_trade_side(side)
         size = _to_float(fill.get("size") or fill.get("Size") or fill.get("amount"))
         outcome = str(fill.get("outcome") or "").upper()
@@ -329,6 +370,7 @@ class FillPoller:
             "side": side,
             "size": size,
             "outcome": outcome,
+            "order_id": fill.get("orderId") or fill.get("order_id") or fill.get("id"),
         }
 
     def _extract_own_maker_order(self, fill: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -338,6 +380,18 @@ class FillPoller:
         maker_orders = fill.get("maker_orders") or fill.get("makerOrders") or []
         if not isinstance(maker_orders, list):
             return None
+        top_level_order_id = str(
+            fill.get("maker_order_id")
+            or fill.get("makerOrderId")
+            or fill.get("orderId")
+            or fill.get("order_id")
+            or ""
+        )
+        if top_level_order_id:
+            for order in maker_orders:
+                candidate_order_id = str(order.get("order_id") or order.get("orderId") or "")
+                if candidate_order_id and candidate_order_id == top_level_order_id:
+                    return order
         our_maker = str(self.client.funder or "").lower()
         if our_maker:
             for order in maker_orders:

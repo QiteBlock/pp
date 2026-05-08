@@ -1833,9 +1833,6 @@ where
                 let incremental_chunk_cap = total_abs_quantity * Decimal::new(5, 1);
                 let instrument_chunk_cap = instrument.min_order_size * Decimal::TWO;
                 let mut chunk_target = total_abs_quantity.min(incremental_chunk_cap);
-                if stale_close_chunk_base > Decimal::ZERO {
-                    chunk_target = chunk_target.min(stale_close_chunk_base);
-                }
                 if instrument_chunk_cap > Decimal::ZERO {
                     chunk_target = chunk_target.min(instrument_chunk_cap);
                 }
@@ -1845,8 +1842,14 @@ where
                     min_trade_amount,
                     self.parsed.model.min_step_volume,
                 );
+                let chunk_base_quantity = if stale_close_chunk_base > Decimal::ZERO {
+                    stale_close_chunk_base * total_abs_quantity
+                } else {
+                    Decimal::ZERO
+                };
+                let chunk_floor_quantity = chunk_base_quantity.max(min_notional_quantity);
                 let desired_close_quantity = chunk_target
-                    .max(min_notional_quantity)
+                    .max(chunk_floor_quantity)
                     .min(total_abs_quantity);
                 let quantity = quantize_order_quantity_for_checks(
                     desired_close_quantity,
@@ -3329,7 +3332,15 @@ fn min_quote_quantity_for_price(
     if min_trade_amount > Decimal::ZERO && reference_price > Decimal::ZERO {
         quantity_floor = quantity_floor.max(min_trade_amount / reference_price);
     }
-    quantize_order_quantity_for_checks(quantity_floor, instrument, min_step_volume)
+    let decimal_step = Decimal::new(1, instrument.underlying_decimals.min(28));
+    let step = instrument
+        .min_order_size
+        .max(decimal_step)
+        .max(min_step_volume);
+    if step <= Decimal::ZERO {
+        return quantity_floor;
+    }
+    ((quantity_floor / step).ceil() * step).normalize()
 }
 
 fn clip_to_bbo(
@@ -3418,15 +3429,102 @@ fn bbo_gap_bps(order: &crate::domain::OpenOrder, state: &BotState) -> Option<Dec
     Some(((reference - order_price).abs() / reference) * Decimal::from(10_000u64))
 }
 
+fn own_inside_order_for_side<'a>(
+    current_orders: &'a HashMap<String, crate::domain::OpenOrder>,
+    symbol: &str,
+    side: Side,
+) -> Option<&'a crate::domain::OpenOrder> {
+    let side_orders: Vec<_> = current_orders
+        .values()
+        .filter(|order| order.symbol == symbol && order.side == side && order.price.is_some())
+        .collect();
+    if side_orders.is_empty() {
+        return None;
+    }
+
+    let level0_orders: Vec<_> = side_orders
+        .iter()
+        .copied()
+        .filter(|order| order.level_index == Some(0))
+        .collect();
+    let eligible_orders = if level0_orders.is_empty() {
+        side_orders
+    } else {
+        level0_orders
+    };
+
+    match side {
+        Side::Bid => eligible_orders
+            .into_iter()
+            .max_by(|left, right| left.price.cmp(&right.price)),
+        Side::Ask => eligible_orders
+            .into_iter()
+            .min_by(|left, right| left.price.cmp(&right.price)),
+    }
+}
+
+fn own_inside_spread_bps(
+    current_orders: &HashMap<String, crate::domain::OpenOrder>,
+    state: &BotState,
+    symbol: &str,
+) -> Option<Decimal> {
+    let bid = own_inside_order_for_side(current_orders, symbol, Side::Bid)?.price?;
+    let ask = own_inside_order_for_side(current_orders, symbol, Side::Ask)?.price?;
+    if ask <= bid {
+        return None;
+    }
+
+    let mid = state
+        .market
+        .symbols
+        .get(symbol)
+        .and_then(|market| market.mid_price())
+        .unwrap_or((bid + ask) / Decimal::from(2u64));
+    if mid <= Decimal::ZERO {
+        return None;
+    }
+
+    Some(((ask - bid) / mid) * Decimal::from(10_000u64))
+}
+
+fn adverse_bbo_gap_threshold_bps(inside_spread_bps: Option<Decimal>) -> Decimal {
+    let liquid_market_floor_bps = Decimal::from(8u64);
+    let own_spread_multiple = Decimal::new(5, 1);
+    inside_spread_bps
+        .map(|spread_bps| (spread_bps * own_spread_multiple).max(liquid_market_floor_bps))
+        .unwrap_or(liquid_market_floor_bps)
+}
+
+fn adverse_bbo_requote_threshold_bps(
+    current_orders: &HashMap<String, crate::domain::OpenOrder>,
+    state: &BotState,
+    symbol: &str,
+) -> Decimal {
+    adverse_bbo_gap_threshold_bps(own_inside_spread_bps(current_orders, state, symbol))
+}
+
 fn should_cancel_on_adverse_bbo_move(
     current_orders: &HashMap<String, crate::domain::OpenOrder>,
     state: &BotState,
 ) -> bool {
-    current_orders.values().any(|order| {
-        bbo_gap_bps(order, state)
-            .map(|gap| gap > Decimal::from(2u64))
-            .unwrap_or(false)
-    })
+    current_orders
+        .values()
+        .filter(|order| {
+            own_inside_order_for_side(current_orders, &order.symbol, order.side)
+                .map(|inside_order| {
+                    inside_order.order_id == order.order_id
+                        && inside_order.level_index == order.level_index
+                        && inside_order.price == order.price
+                })
+                .unwrap_or(false)
+        })
+        .any(|order| {
+            let threshold_bps =
+                adverse_bbo_requote_threshold_bps(current_orders, state, &order.symbol);
+            bbo_gap_bps(order, state)
+                .map(|gap| gap > threshold_bps)
+                .unwrap_or(false)
+        })
 }
 
 fn filter_orders_against_current_bbo(
@@ -3434,6 +3532,64 @@ fn filter_orders_against_current_bbo(
     state: &BotState,
     orders: &[OrderRequest],
 ) -> Vec<OrderRequest> {
+    fn inside_order_for_side<'a>(
+        orders: &'a [OrderRequest],
+        symbol: &str,
+        side: Side,
+    ) -> Option<&'a OrderRequest> {
+        let side_orders: Vec<_> = orders
+            .iter()
+            .filter(|order| order.symbol == symbol && order.side == side && order.price.is_some())
+            .collect();
+        if side_orders.is_empty() {
+            return None;
+        }
+
+        let level0_orders: Vec<_> = side_orders
+            .iter()
+            .copied()
+            .filter(|order| order.level_index == 0)
+            .collect();
+        let eligible_orders = if level0_orders.is_empty() {
+            side_orders
+        } else {
+            level0_orders
+        };
+
+        match side {
+            Side::Bid => eligible_orders
+                .into_iter()
+                .max_by(|left, right| left.price.cmp(&right.price)),
+            Side::Ask => eligible_orders
+                .into_iter()
+                .min_by(|left, right| left.price.cmp(&right.price)),
+        }
+    }
+
+    fn inside_spread_bps(
+        orders: &[OrderRequest],
+        state: &BotState,
+        symbol: &str,
+    ) -> Option<Decimal> {
+        let bid = inside_order_for_side(orders, symbol, Side::Bid)?.price?;
+        let ask = inside_order_for_side(orders, symbol, Side::Ask)?.price?;
+        if ask <= bid {
+            return None;
+        }
+
+        let mid = state
+            .market
+            .symbols
+            .get(symbol)
+            .and_then(|market| market.mid_price())
+            .unwrap_or((bid + ask) / Decimal::from(2u64));
+        if mid <= Decimal::ZERO {
+            return None;
+        }
+
+        Some(((ask - bid) / mid) * Decimal::from(10_000u64))
+    }
+
     orders
         .iter()
         .filter_map(|order| {
@@ -3464,7 +3620,11 @@ fn filter_orders_against_current_bbo(
             if order.level_index == 0 && order.post_only {
                 if let Some(reference) = same_side_bbo {
                     if reference > Decimal::ZERO {
-                        let max_gap_bps = parsed.model.born_inf_bps + Decimal::from(2u64);
+                        let fallback_gap_bps = parsed.model.born_inf_bps.max(Decimal::from(8u64));
+                        let max_gap_bps = adverse_bbo_gap_threshold_bps(
+                            inside_spread_bps(orders, state, &order.symbol)
+                                .or(Some(fallback_gap_bps)),
+                        );
                         let gap_bps =
                             ((reference - price).abs() / reference) * Decimal::from(10_000u64);
                         if gap_bps > max_gap_bps {
