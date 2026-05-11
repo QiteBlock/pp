@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Any, Optional
 import json
 import re
-import re
 
 import yaml
 
@@ -32,6 +31,7 @@ ADAPTIVE_FILL_COOLDOWN_MILD = 45
 ADAPTIVE_FILL_COOLDOWN_STRONG = 60
 MERGE_GAS_FALLBACK_USDC = 1.0
 STUCK_UNWIND_MAX_CYCLES = 200
+BALANCE_RE = re.compile(r"balance:\s*(\d+),\s*sum of matched orders:\s*(\d+),\s*order amount[^:]*:\s*(\d+)")
 
 
 @dataclass
@@ -1381,6 +1381,7 @@ def recover_from_sell_balance_rejection(
     mode: str,
     details: str,
 ) -> None:
+    placeable = _parse_placeable_from_balance_error(details)
     live_balance = get_live_conditional_balance(context, order_request["token_id"])
     if live_balance is not None:
         sync_inventory_balance(market, inventory, order_request["token_id"], live_balance)
@@ -1392,13 +1393,85 @@ def recover_from_sell_balance_rejection(
             "mode": mode,
             "order_request": order_request,
             "live_balance": live_balance,
+            "placeable_after_matched": placeable,
             "details": details,
         },
     )
     print(
         f"[{market.slug}] {order_request['label']} rejected for insufficient balance/allowance; "
-        f"live_balance={live_balance if live_balance is not None else 'unknown'}"
+        f"live_balance={live_balance if live_balance is not None else 'unknown'} "
+        f"placeable={placeable if placeable is not None else 'unknown'}"
     )
+    if placeable is None or placeable + 1e-9 < EXCHANGE_MIN_ORDER_SIZE:
+        return
+    retry_request = dict(order_request)
+    retry_request["size"] = placeable
+    try:
+        retry_response = context.client.place_limit_order(
+            token_id=retry_request["token_id"],
+            side=retry_request["side"],
+            price=retry_request["price"],
+            size=retry_request["size"],
+            tick_size=retry_request["tick_size"],
+            dry_run=context.dry_run,
+            neg_risk=market.neg_risk,
+            post_only=not retry_request.get("ioc_escape", False),
+            order_type=retry_request.get("order_type", "GTC"),
+        )
+        context.analytics.log_event(
+            "unwind_balance_retry",
+            {
+                "market": market.slug,
+                "size": placeable,
+                "order_request": retry_request,
+                "response": retry_response,
+            },
+        )
+        print(f"[{market.slug}] {order_request['label']} retried with placeable size={placeable:.4f}")
+        if response_is_success(retry_response):
+            record_order_placement_event(
+                context,
+                retry_response,
+                market=market,
+                side=retry_request["side"],
+                outcome="YES" if retry_request["token_id"] == market.yes_token_id else "NO",
+                price=retry_request["price"],
+                size=retry_request["size"],
+                reward_eligible=False,
+                reward_rate_per_day=market.reward_rate_per_day,
+                fair_value=None,
+            )
+        log_rejected_order_response(
+            context,
+            market,
+            f"{retry_request['label']} retry",
+            retry_response,
+            kind="unwind",
+            mode=mode,
+            reason=f"{reason}:balance_retry",
+        )
+    except Exception as retry_exc:
+        context.analytics.log_event(
+            "unwind_balance_retry_failed",
+            {
+                "market": market.slug,
+                "size": placeable,
+                "details": str(retry_exc),
+            },
+        )
+
+
+def _parse_placeable_from_balance_error(details: str) -> Optional[float]:
+    match = BALANCE_RE.search(details or "")
+    if not match:
+        return None
+    try:
+        balance_units = int(match.group(1))
+        matched_units = int(match.group(2))
+        placeable_units = max(balance_units - matched_units, 0)
+        return placeable_units / 1_000_000.0
+    except Exception:
+        return None
 
 
 def get_market_book(context: BotContext, token_id: str) -> Optional[OrderBookSnapshot]:
@@ -2019,12 +2092,23 @@ def toxic_flow_quote_filter(
     skip_no = False
     reasons: list[str] = []
     trades = context.client.get_recent_trades(market.yes_token_id, limit=TOXIC_FLOW_TRADE_WINDOW)
+    if trades:
+        first_trade = trades[0] if isinstance(trades[0], dict) else {}
+        context.analytics.log_event(
+            "toxic_flow_trade_sample",
+            {
+                "market": market.slug,
+                "count": len(trades),
+                "first_keys": list(first_trade.keys()) if isinstance(first_trade, dict) else [],
+                "first_side": first_trade.get("side") if isinstance(first_trade, dict) else None,
+            },
+        )
     if not trades and inventory.last_mark_price > 0:
         context.analytics.log_event("toxic_flow_no_trades", {"market": market.slug})
     buy_count = 0
     sell_count = 0
     for trade in trades:
-        side = str(trade.get("side") or trade.get("Side") or "").upper()
+        side = normalize_trade_flow_side(trade)
         if side == "BUY":
             buy_count += 1
         elif side == "SELL":
@@ -2039,6 +2123,16 @@ def toxic_flow_quote_filter(
         if buy_ratio > TOXIC_FLOW_ONE_WAY_THRESHOLD:
             skip_no = True
             reasons.append(f"toxic_flow_skip_no_bid({buy_ratio:.0%}_buy)")
+    elif book.bid_depth_usdc > 0 and book.ask_depth_usdc > 0:
+        total_depth = book.bid_depth_usdc + book.ask_depth_usdc
+        if total_depth > 0:
+            imbalance = (book.bid_depth_usdc - book.ask_depth_usdc) / total_depth
+            if imbalance < -0.60:
+                skip_yes = True
+                reasons.append(f"toxic_book_imbalance_asks({imbalance:.2f})")
+            elif imbalance > 0.60:
+                skip_no = True
+                reasons.append(f"toxic_book_imbalance_bids({imbalance:.2f})")
     current_mark = quote_safe_mark(signal)
     if inventory.last_mark_price > 0:
         move = current_mark - inventory.last_mark_price
@@ -2059,6 +2153,15 @@ def toxic_flow_quote_filter(
         would_skip_no=skip_no,
     )
     return skip_yes, skip_no, " ".join(reasons)
+
+
+def normalize_trade_flow_side(trade: dict[str, Any]) -> str:
+    raw_side = str(trade.get("side") or trade.get("Side") or "").upper()
+    if raw_side in {"BUY", "TAKER_BUY", "BUYER", "BID"}:
+        return "BUY"
+    if raw_side in {"SELL", "TAKER_SELL", "SELLER", "ASK"}:
+        return "SELL"
+    return raw_side
 
 
 def should_trigger_unwind_ioc_escape(inventory: Any, signal: Any, aggressive: bool) -> bool:

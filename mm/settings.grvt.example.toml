@@ -130,28 +130,10 @@ hyperliquid_taker_fee_rate = "0.000432"
 symbol = "HYPE/USDT-P"
 enabled = true
 max_position_base = "10"
+unwind_only_enter_ratio = "0.75"
+unwind_only_exit_ratio = "0.60"
 price_source = "mid"
 post_only = true
 service_on = true
 side_filter = "both"
 binance_symbol = "hypeusdt"
-
-[[pairs]]
-symbol = "BTC/USDT-P"
-enabled = false
-max_position_base = "0.006"
-price_source = "mid"
-post_only = true
-service_on = true
-side_filter = "both"
-binance_symbol = "btcusdt"
-
-[[pairs]]
-symbol = "XAU/USDT-P"
-enabled = false
-max_position_base = "0.1"
-price_source = "mid"
-post_only = true
-service_on = true
-side_filter = "both"
-binance_symbol = "xauusdt"

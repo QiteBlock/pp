@@ -89,6 +89,22 @@ impl AppConfig {
                     pair.symbol
                 );
             }
+            if pair.unwind_only_enter_ratio <= Decimal::ZERO
+                || pair.unwind_only_enter_ratio > Decimal::ONE
+            {
+                bail!(
+                    "pair {} unwind_only_enter_ratio must be within (0, 1]",
+                    pair.symbol
+                );
+            }
+            if pair.unwind_only_exit_ratio < Decimal::ZERO
+                || pair.unwind_only_exit_ratio >= pair.unwind_only_enter_ratio
+            {
+                bail!(
+                    "pair {} unwind_only_exit_ratio must be within [0, enter_ratio)",
+                    pair.symbol
+                );
+            }
         }
         Ok(())
     }
@@ -370,6 +386,14 @@ impl AppConfig {
                             &format!("pairs.{}.max_position_base", pair.symbol),
                             &pair.max_position_base,
                         )?,
+                        unwind_only_enter_ratio: parse_decimal(
+                            &format!("pairs.{}.unwind_only_enter_ratio", pair.symbol),
+                            &pair.unwind_only_enter_ratio,
+                        )?,
+                        unwind_only_exit_ratio: parse_decimal(
+                            &format!("pairs.{}.unwind_only_exit_ratio", pair.symbol),
+                            &pair.unwind_only_exit_ratio,
+                        )?,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -541,6 +565,8 @@ pub struct ParsedHedgingConfig {
 pub struct ParsedPairConfig {
     pub symbol: String,
     pub max_position_base: Decimal,
+    pub unwind_only_enter_ratio: Decimal,
+    pub unwind_only_exit_ratio: Decimal,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -738,6 +764,14 @@ fn default_fill_rate_window_secs() -> String {
 
 fn default_fill_rate_skew_threshold() -> String {
     "3.0".to_string()
+}
+
+fn default_unwind_only_enter_ratio() -> String {
+    "0.75".to_string()
+}
+
+fn default_unwind_only_exit_ratio() -> String {
+    "0.60".to_string()
 }
 
 fn default_one_string() -> String {
@@ -990,6 +1024,10 @@ pub struct PairConfig {
     pub symbol: String,
     pub enabled: bool,
     pub max_position_base: String,
+    #[serde(default = "default_unwind_only_enter_ratio")]
+    pub unwind_only_enter_ratio: String,
+    #[serde(default = "default_unwind_only_exit_ratio")]
+    pub unwind_only_exit_ratio: String,
     pub price_source: PriceSource,
     pub post_only: bool,
     pub service_on: bool,

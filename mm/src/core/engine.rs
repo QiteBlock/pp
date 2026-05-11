@@ -108,6 +108,12 @@ struct PlacementTiming {
     place_response_ts: DateTime<Utc>,
 }
 
+#[derive(Default)]
+struct AutoPauseState {
+    paused_since: Option<Instant>,
+    last_adverse_markout_at: Option<Instant>,
+}
+
 impl<E> MarketMakingEngine<E>
 where
     E: ExchangeClient + CleanupExchange + 'static,
@@ -191,22 +197,30 @@ where
         &self,
         fill_tracker: &FillTracker,
         completed_markouts: Vec<MarkoutEvent>,
+        auto_pause_state: &mut AutoPauseState,
     ) -> Result<()> {
-        let auto_pause_threshold_bps = Decimal::from(-5i32);
+        let auto_pause_threshold_bps = Decimal::from(-15i32);
+        let markout_outlier_limit_bps = Decimal::from(200i32);
         for event in completed_markouts {
             let symbol = event.symbol.clone();
             let side = event.side;
             self.persist_markout_event(event)?;
-            if !self.control.is_paused() {
-                if let Some(avg_markout_30s_bps) =
-                    fill_tracker.trailing_markout_30s_avg_bps(&symbol, side, 50)
-                {
-                    if avg_markout_30s_bps < auto_pause_threshold_bps {
+            if let Some(avg_markout_30s_bps) =
+                fill_tracker.trailing_markout_30s_avg_bps(&symbol, side, 50)
+            {
+                let clamped_markout_bps = avg_markout_30s_bps
+                    .max(-markout_outlier_limit_bps)
+                    .min(markout_outlier_limit_bps);
+                if clamped_markout_bps < auto_pause_threshold_bps {
+                    auto_pause_state.last_adverse_markout_at = Some(Instant::now());
+                    if !self.control.is_paused() {
                         self.control.pause();
+                        auto_pause_state.paused_since = Some(Instant::now());
                         warn!(
                             symbol = %symbol,
                             side = ?side,
-                            trailing_30s_markout_bps = %avg_markout_30s_bps,
+                            trailing_30s_markout_bps = %clamped_markout_bps,
+                            raw_trailing_30s_markout_bps = %avg_markout_30s_bps,
                             threshold_bps = %auto_pause_threshold_bps,
                             "auto-paused runtime after adverse trailing 30s markout"
                         );
@@ -633,6 +647,8 @@ where
         let mut next_funding_sync_start = self.initial_funding_sync_start()?;
         let mut hedge_simulator =
             HedgeSimulator::new(self.parsed.hedging.hyperliquid_taker_fee_rate);
+        let mut auto_pause_state = AutoPauseState::default();
+        let auto_resume_after = Duration::from_secs(300);
 
         loop {
             tokio::select! {
@@ -654,6 +670,7 @@ where
                         &mut live_quote_metadata,
                         &mut pending_cancel_order_ids,
                         &mut hedge_simulator,
+                        &mut auto_pause_state,
                     ).await? {
                         if !fs.is_simulated {
                             last_generation_at = None;
@@ -700,6 +717,7 @@ where
                             &mut live_quote_metadata,
                             &mut pending_cancel_order_ids,
                             &mut hedge_simulator,
+                            &mut auto_pause_state,
                         ).await? {
                             if !fs.is_simulated {
                                 last_generation_at = None;
@@ -852,7 +870,27 @@ where
                     last_breaker_message = None;
                     let paused = self.control.is_paused();
                     if paused {
-                        continue;
+                        let paused_secs = auto_pause_state
+                            .paused_since
+                            .map(|t| t.elapsed().as_secs())
+                            .unwrap_or(0);
+                        let should_resume = auto_pause_state
+                            .last_adverse_markout_at
+                            .map(|t| t.elapsed() >= auto_resume_after)
+                            .unwrap_or(false);
+                        if should_resume {
+                            self.control.resume();
+                            auto_pause_state.paused_since = None;
+                            auto_pause_state.last_adverse_markout_at = None;
+                            last_generation_at = None;
+                            warn!(
+                                paused_secs,
+                                quiet_secs = auto_resume_after.as_secs(),
+                                "auto-resumed runtime after quiet markout cooldown"
+                            );
+                        } else {
+                            continue;
+                        }
                     }
 
                     let degraded = health.is_degraded();
@@ -1185,7 +1223,11 @@ where
                                 now,
                                 self.config.runtime.dry_run,
                             );
-                            self.handle_completed_markouts(&fill_tracker, completed_markouts)?;
+                            self.handle_completed_markouts(
+                                &fill_tracker,
+                                completed_markouts,
+                                &mut auto_pause_state,
+                            )?;
                             self.maybe_persist_mid_price_sample(
                                 &state,
                                 &pair.symbol,
@@ -1311,7 +1353,11 @@ where
                             timestamp,
                             self.config.runtime.dry_run,
                         );
-                        self.handle_completed_markouts(&fill_tracker, completed_markouts)?;
+                        self.handle_completed_markouts(
+                            &fill_tracker,
+                            completed_markouts,
+                            &mut auto_pause_state,
+                        )?;
                     }
                     fill_tracker.decay(Utc::now());
                     if self.config.runtime.dry_run {
@@ -1350,6 +1396,7 @@ where
                                         &mut cumulative_traded_volume,
                                         &mut live_quote_metadata,
                                         &mut hedge_simulator,
+                                        &mut auto_pause_state,
                                     ).await?;
                                     // Post-fill widen for simulated fills.
                                     let widen_secs = self.parsed.model.post_fill_widen_secs;
@@ -1408,6 +1455,7 @@ where
         live_quote_metadata: &mut HashMap<(String, Side, usize), LiveQuoteMetadata>,
         pending_cancel_order_ids: &mut HashMap<String, Instant>,
         hedge_simulator: &mut HedgeSimulator,
+        auto_pause_state: &mut AutoPauseState,
     ) -> Result<Option<FillStats>> {
         match event {
             PrivateEvent::Fill(fill) => {
@@ -1420,6 +1468,7 @@ where
                         cumulative_traded_volume,
                         live_quote_metadata,
                         hedge_simulator,
+                        auto_pause_state,
                     )
                     .await?;
                 minute_stats.accumulate_fill(fs.clone());
@@ -1464,6 +1513,7 @@ where
         cumulative_traded_volume: &mut Decimal,
         live_quote_metadata: &mut HashMap<(String, Side, usize), LiveQuoteMetadata>,
         hedge_simulator: &mut HedgeSimulator,
+        auto_pause_state: &mut AutoPauseState,
     ) -> Result<FillStats> {
         let (level_index, spread_earned_bps) = infer_fill_analytics(state, &fill);
         let total_fees_before = state.pnl.total_fees;
@@ -1536,7 +1586,11 @@ where
                     fill.timestamp,
                     self.config.runtime.dry_run,
                 );
-                self.handle_completed_markouts(fill_tracker, completed_markouts)?;
+                self.handle_completed_markouts(
+                    fill_tracker,
+                    completed_markouts,
+                    auto_pause_state,
+                )?;
             }
         }
         if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
@@ -1741,8 +1795,6 @@ where
         let n_trade_threshold = self.config.factors.n_trade_quote_threshold;
         let hard_toxic_stop_secs = 300u64;
         let min_level_multiplier = Decimal::new(5, 1);
-        let unwind_only_enter_ratio = Decimal::new(15, 2);
-        let unwind_only_exit_ratio = Decimal::new(3, 2);
         let hard_vpin_skip_threshold = Decimal::new(95, 2);
         let passive_stale_close_spread_bps = Decimal::from(30u64);
         let legacy_position_hold_timeout =
@@ -1851,12 +1903,32 @@ where
                 let desired_close_quantity = chunk_target
                     .max(chunk_floor_quantity)
                     .min(total_abs_quantity);
-                let quantity = quantize_order_quantity_for_checks(
+                let step = instrument
+                    .min_order_size
+                    .max(Decimal::new(1, instrument.underlying_decimals.min(28)))
+                    .max(self.parsed.model.min_step_volume);
+                let mut quantity = quantize_order_quantity_for_checks(
                     desired_close_quantity,
                     instrument,
                     self.parsed.model.min_step_volume,
                 );
-                let chunk_notional = quantity * reference_price;
+                let mut chunk_notional = quantity * reference_price;
+                if quantity > Decimal::ZERO
+                    && chunk_notional < min_trade_amount
+                    && step > Decimal::ZERO
+                {
+                    let bumped_quantity = (quantity + step).min(total_abs_quantity);
+                    let bumped_quantity = quantize_order_quantity_for_checks(
+                        bumped_quantity,
+                        instrument,
+                        self.parsed.model.min_step_volume,
+                    );
+                    let bumped_notional = bumped_quantity * reference_price;
+                    if bumped_quantity > quantity && bumped_notional >= min_trade_amount {
+                        quantity = bumped_quantity;
+                        chunk_notional = bumped_notional;
+                    }
+                }
                 if quantity <= Decimal::ZERO || chunk_notional < min_trade_amount {
                     warn!(
                         symbol = %pair.symbol,
@@ -2346,8 +2418,10 @@ where
                 state.unwind_active.remove(&pair.symbol);
             } else {
                 let abs_position = current_position.abs();
-                let enter_threshold = parsed_pair.max_position_base * unwind_only_enter_ratio;
-                let exit_threshold = parsed_pair.max_position_base * unwind_only_exit_ratio;
+                let enter_threshold =
+                    parsed_pair.max_position_base * parsed_pair.unwind_only_enter_ratio;
+                let exit_threshold =
+                    parsed_pair.max_position_base * parsed_pair.unwind_only_exit_ratio;
                 if state.unwind_active.contains(&pair.symbol) {
                     if abs_position <= exit_threshold {
                         state.unwind_active.remove(&pair.symbol);
@@ -2355,7 +2429,7 @@ where
                             symbol = %pair.symbol,
                             position = %current_position,
                             exit_threshold = %exit_threshold,
-                            exit_ratio = %unwind_only_exit_ratio,
+                            exit_ratio = %parsed_pair.unwind_only_exit_ratio,
                             "inventory unwind hysteresis released; resuming normal quoting"
                         );
                     }
@@ -2366,8 +2440,8 @@ where
                         position = %current_position,
                         max_position_base = %parsed_pair.max_position_base,
                         enter_threshold = %enter_threshold,
-                        enter_ratio = %unwind_only_enter_ratio,
-                        exit_ratio = %unwind_only_exit_ratio,
+                        enter_ratio = %parsed_pair.unwind_only_enter_ratio,
+                        exit_ratio = %parsed_pair.unwind_only_exit_ratio,
                         "inventory exceeded unwind-only trigger; committing to unwind-only until reduced below exit threshold"
                     );
                 }

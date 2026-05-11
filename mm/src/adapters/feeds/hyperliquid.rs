@@ -12,7 +12,8 @@ use tracing::warn;
 use crate::domain::{ExternalVenue, MarketEvent};
 
 const HYPERLIQUID_WS_URL: &str = "wss://api.hyperliquid.xyz/ws";
-const RECONNECT_DELAY_SECS: u64 = 2;
+const INITIAL_RECONNECT_DELAY_SECS: u64 = 2;
+const MAX_RECONNECT_DELAY_SECS: u64 = 60;
 
 pub async fn stream_hyperliquid_bbo(
     symbol_map: HashMap<String, String>,
@@ -28,10 +29,12 @@ pub async fn stream_hyperliquid_bbo(
         .map(|(internal_symbol, hl_coin)| (hl_coin.clone(), internal_symbol.clone()))
         .collect();
     let subscriptions: Vec<String> = symbol_map.values().cloned().collect();
+    let mut reconnect_delay_secs = INITIAL_RECONNECT_DELAY_SECS;
 
     loop {
         match connect_async(HYPERLIQUID_WS_URL).await {
             Ok((mut ws_stream, _)) => {
+                let mut stream_became_healthy = false;
                 let mut subscribe_failed = false;
                 for coin in &subscriptions {
                     let subscribe = json!({
@@ -49,13 +52,19 @@ pub async fn stream_hyperliquid_bbo(
                     }
                 }
                 if subscribe_failed {
-                    tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+                    tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
+                    reconnect_delay_secs =
+                        (reconnect_delay_secs.saturating_mul(2)).min(MAX_RECONNECT_DELAY_SECS);
                     continue;
                 }
 
                 loop {
                     match ws_stream.next().await {
                         Some(Ok(WsMessage::Text(text))) => {
+                            if !stream_became_healthy {
+                                reconnect_delay_secs = INITIAL_RECONNECT_DELAY_SECS;
+                                stream_became_healthy = true;
+                            }
                             if let Some(event) = parse_hyperliquid_bbo(&text, &reverse_map) {
                                 let _ = sender.try_send(event);
                             }
@@ -82,10 +91,16 @@ pub async fn stream_hyperliquid_bbo(
                     }
                 }
             }
-            Err(err) => warn!(err = %err, "hyperliquid websocket connect failed; retrying"),
+            Err(err) => warn!(
+                err = %err,
+                reconnect_delay_secs,
+                "hyperliquid websocket connect failed; retrying with backoff"
+            ),
         }
 
-        tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)).await;
+        tokio::time::sleep(Duration::from_secs(reconnect_delay_secs)).await;
+        reconnect_delay_secs =
+            (reconnect_delay_secs.saturating_mul(2)).min(MAX_RECONNECT_DELAY_SECS);
     }
 }
 
