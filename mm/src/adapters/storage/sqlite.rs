@@ -40,6 +40,14 @@ impl FillStore {
 
         let connection = Connection::open(db_path)
             .with_context(|| format!("failed to open fill store at {}", db_path.display()))?;
+        connection
+            .execute_batch(
+                "PRAGMA journal_mode = WAL;
+                 PRAGMA busy_timeout = 5000;
+                 PRAGMA synchronous = NORMAL;
+                 PRAGMA temp_store = MEMORY;",
+            )
+            .context("failed to set SQLite pragmas")?;
         connection.execute_batch(
             "CREATE TABLE IF NOT EXISTS fills (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
