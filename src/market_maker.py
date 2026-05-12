@@ -70,6 +70,9 @@ class BotContext:
     post_unwind_cooldown_seconds: int
     reentry_cooldowns: dict[str, float]
     released_markets: set[str]
+    exchange_pause_until: float
+    exchange_pause_reason: Optional[str]
+    unresolved_position_logged_at: dict[str, float]
     filters: dict[str, Any]
 
 
@@ -111,6 +114,13 @@ def run_market_maker(config_path: str) -> None:
 
             if not context.control.trading_enabled:
                 print("Trading paused by Telegram control.")
+                time.sleep(context.loop_interval_seconds)
+                continue
+            if context.exchange_pause_until > time.time():
+                print(
+                    "Trading paused by exchange state."
+                    f" reason={context.exchange_pause_reason or 'unknown'}"
+                )
                 time.sleep(context.loop_interval_seconds)
                 continue
 
@@ -206,6 +216,9 @@ def load_context(config_path: str) -> BotContext:
         post_unwind_cooldown_seconds=max(int(runtime.get("post_unwind_cooldown_seconds", 1800)), 0),
         reentry_cooldowns=load_reentry_cooldowns(reentry_cooldown_path),
         released_markets=set(),
+        exchange_pause_until=0.0,
+        exchange_pause_reason=None,
+        unresolved_position_logged_at={},
         filters=config.get("filters", {}),
     )
     hydrate_discovered_position_markets(context)
@@ -720,6 +733,10 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
                     "Polymarket rejected live order placement due to regional trading restrictions. "
                     "The bot has stopped before placing further orders. Use dry_run=true unless you are in an eligible region."
                 ) from exc
+            if is_cancel_only_error(exc):
+                pause_for_cancel_only(context, market.slug, exc)
+                print(f"[{market.slug}] YES bid skipped: exchange in cancel-only mode")
+                return
             context.analytics.log_event(
                 "quote_error",
                 {
@@ -750,6 +767,10 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
                     "Polymarket rejected live order placement due to regional trading restrictions. "
                     "The bot has stopped before placing further orders. Use dry_run=true unless you are in an eligible region."
                 ) from exc
+            if is_cancel_only_error(exc):
+                pause_for_cancel_only(context, market.slug, exc)
+                print(f"[{market.slug}] NO bid skipped: exchange in cancel-only mode")
+                return
             context.analytics.log_event(
                 "quote_error",
                 {
@@ -778,6 +799,7 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             reward_eligible=reward_status["eligible"],
             reward_rate_per_day=market.reward_rate_per_day,
             fair_value=quote.fair_value,
+            placement_mark=book.midpoint if book.midpoint is not None else quote.fair_value,
         )
     if ask_response is not None:
         record_order_placement_event(
@@ -791,6 +813,7 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             reward_eligible=reward_status["eligible"],
             reward_rate_per_day=market.reward_rate_per_day,
             fair_value=quote.fair_value,
+            placement_mark=book.midpoint if book.midpoint is not None else quote.fair_value,
         )
     context.analytics.log_event(
         "quote_cycle",
@@ -850,6 +873,22 @@ def process_unwind_market(
     aggressive: bool,
     signal: Any,
 ) -> None:
+    if inventory.balance_retry_pending:
+        if inventory.balance_retry_deadline > time.time():
+            context.analytics.log_event(
+                "unwind_skip",
+                {
+                    "market": market.slug,
+                    "reason": "balance_retry_pending",
+                    "mode": mode,
+                    "aggressive": aggressive,
+                    "retry_deadline": inventory.balance_retry_deadline,
+                },
+            )
+            context.analytics.note_skip_reason(market.slug, "balance_retry_pending")
+            return
+        inventory.balance_retry_pending = False
+        inventory.balance_retry_deadline = 0.0
     if reason == "drawdown limit breached":
         context.control.disable("risk:drawdown")
         context.analytics.log_event("drawdown_kill_switch", {"market": market.slug, "reason": reason})
@@ -920,6 +959,9 @@ def process_unwind_market(
 
     if not context.dry_run and order_request["side"].upper() == "SELL":
         if not prepare_sell_unwind_order(context, market, inventory, order_request):
+            if inventory.balance_retry_pending and inventory.balance_retry_deadline > time.time():
+                context.analytics.note_skip_reason(market.slug, "balance_retry_pending")
+                return
             recovered = maybe_handle_dust_position(context, market, inventory)
             if not recovered:
                 inventory.unwind_failed_cycles += 1
@@ -997,6 +1039,10 @@ def process_unwind_market(
                 "details": str(exc),
             },
         )
+        if is_cancel_only_error(exc):
+            pause_for_cancel_only(context, market.slug, exc)
+            print(f"[{market.slug}] unwind skipped: exchange in cancel-only mode")
+            return
         if order_request["side"].upper() == "SELL" and is_insufficient_balance_error(exc):
             recover_from_sell_balance_rejection(context, market, inventory, order_request, reason, mode, str(exc))
             run_recovery_reconciliation(
@@ -1046,6 +1092,7 @@ def process_unwind_market(
             reward_eligible=False,
             reward_rate_per_day=market.reward_rate_per_day,
             fair_value=quote.fair_value,
+            placement_mark=quote_safe_mark(signal),
         )
     log_rejected_order_response(
         context,
@@ -1403,7 +1450,11 @@ def recover_from_sell_balance_rejection(
         f"placeable={placeable if placeable is not None else 'unknown'}"
     )
     if placeable is None or placeable + 1e-9 < EXCHANGE_MIN_ORDER_SIZE:
+        inventory.balance_retry_pending = True
+        inventory.balance_retry_deadline = time.time() + 30.0
         return
+    inventory.balance_retry_pending = False
+    inventory.balance_retry_deadline = 0.0
     retry_request = dict(order_request)
     retry_request["size"] = placeable
     try:
@@ -1440,6 +1491,7 @@ def recover_from_sell_balance_rejection(
                 reward_eligible=False,
                 reward_rate_per_day=market.reward_rate_per_day,
                 fair_value=None,
+                placement_mark=None,
             )
         log_rejected_order_response(
             context,
@@ -1892,6 +1944,29 @@ def is_trading_restricted_error(exc: Exception) -> bool:
 def is_insufficient_balance_error(exc: Exception) -> bool:
     message = str(exc).lower()
     return "not enough balance / allowance" in message or "balance is not enough" in message
+
+
+def is_cancel_only_error(exc: Exception) -> bool:
+    return "cancel-only" in str(exc).lower()
+
+
+def pause_for_cancel_only(context: BotContext, market_slug: str, exc: Exception) -> None:
+    context.exchange_pause_until = max(context.exchange_pause_until, time.time() + 300.0)
+    context.exchange_pause_reason = "polymarket:cancel_only"
+    context.analytics.log_event(
+        "exchange_cancel_only_pause",
+        {
+            "market": market_slug,
+            "pause_until": context.exchange_pause_until,
+            "details": str(exc),
+        },
+    )
+    if context.telegram.is_enabled():
+        context.telegram.send_message(
+            "Exchange entered cancel-only mode\n"
+            f"market={market_slug}\n"
+            "trading paused for 5 minutes"
+        )
 
 
 def is_crosses_book_error(exc: Exception) -> bool:
@@ -2368,6 +2443,7 @@ def record_order_placement_event(
     reward_eligible: bool,
     reward_rate_per_day: Optional[float],
     fair_value: Optional[float],
+    placement_mark: Optional[float] = None,
 ) -> None:
     order_id, status, _ = extract_order_response_metadata(response)
     if not order_id:
@@ -2384,6 +2460,7 @@ def record_order_placement_event(
         reward_eligible=reward_eligible,
         reward_rate_per_day=reward_rate_per_day,
         fair_value=fair_value,
+        placement_mark=placement_mark,
     )
 
 
@@ -3181,7 +3258,15 @@ def discover_markets_for_unknown_positions(context: BotContext, unknown_position
 
     unresolved = sorted(target_token_ids - matched_tokens)
     if unresolved:
-        context.analytics.log_event("position_discovery_unresolved", {"token_ids": unresolved})
+        now = time.time()
+        newly_logged: list[str] = []
+        for token_id in unresolved:
+            last_logged_at = context.unresolved_position_logged_at.get(token_id, 0.0)
+            if now - last_logged_at >= 3600.0:
+                context.unresolved_position_logged_at[token_id] = now
+                newly_logged.append(token_id)
+        if newly_logged:
+            context.analytics.log_event("position_discovery_unresolved", {"token_ids": newly_logged})
     if discovered:
         save_market_cache_entries(context, discovered)
     return discovered

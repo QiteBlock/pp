@@ -243,6 +243,16 @@ class FillPoller:
             return False
         token_id = normalized["token_id"]
         if not token_id or token_id not in market_slug_mapping:
+            self.analytics.log_event(
+                "fill_skipped_unknown_market",
+                {
+                    "fill_id": self._fill_identity(fill),
+                    "order_id": normalized.get("order_id"),
+                    "token_id": token_id,
+                    "raw_side": fill.get("side") or fill.get("Side"),
+                    "trader_side": fill.get("trader_side") or fill.get("traderSide"),
+                },
+            )
             return False
 
         side = normalized["side"]

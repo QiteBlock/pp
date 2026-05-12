@@ -90,6 +90,7 @@ class AnalyticsWriter:
         reward_eligible: bool,
         reward_rate_per_day: Optional[float],
         fair_value: Optional[float],
+        placement_mark: Optional[float] = None,
     ) -> None:
         if not order_id:
             return
@@ -103,6 +104,7 @@ class AnalyticsWriter:
             "reward_eligible": reward_eligible,
             "reward_rate_per_day": reward_rate_per_day,
             "fair_value": fair_value,
+            "placement_mark": placement_mark,
             "place_ts": time.time(),
             "fill_ts": None,
             "cancel_ts": None,
@@ -130,11 +132,14 @@ class AnalyticsWriter:
                 "size": size,
                 "place_ts": None,
             }
-        cancel_ts = time.time()
-        state["cancel_ts"] = cancel_ts
+        if state.get("cancel_ts"):
+            cancel_ts = float(state["cancel_ts"])
+        else:
+            cancel_ts = time.time()
+            state["cancel_ts"] = cancel_ts
         time_on_book_ms = None
         if state.get("place_ts"):
-            time_on_book_ms = int((cancel_ts - float(state["place_ts"])) * 1000)
+            time_on_book_ms = max(int((cancel_ts - float(state["place_ts"])) * 1000), 0)
         self.log_event(
             "quote_lifecycle",
             {
@@ -190,7 +195,7 @@ class AnalyticsWriter:
                 state["fill_ts"] = fill_ts
                 time_on_book_ms = None
                 if state.get("place_ts"):
-                    time_on_book_ms = int((fill_ts - float(state["place_ts"])) * 1000)
+                    time_on_book_ms = max(int((fill_ts - float(state["place_ts"])) * 1000), 0)
                 self.log_event(
                     "quote_lifecycle",
                     {
@@ -210,8 +215,11 @@ class AnalyticsWriter:
                 if state.get("reward_eligible"):
                     fair_value = _to_optional_float(state.get("fair_value"))
                     mid_dist_to_fair = abs(price - fair_value) if fair_value is not None else None
-                    est_reward_per_fill = None
                     reward_rate = _to_optional_float(state.get("reward_rate_per_day"))
+                    time_on_book_sec = max(fill_ts - float(state.get("place_ts") or fill_ts), 0.0)
+                    est_reward_per_fill = None
+                    if reward_rate is not None:
+                        est_reward_per_fill = reward_rate * (time_on_book_sec / 86400.0) * (float(size) / 100.0)
                     self.reward_fill_records.append(
                         {
                             "ts": fill_ts,
@@ -351,6 +359,7 @@ class AnalyticsWriter:
 
     def emit_periodic_summaries(self) -> None:
         now = time.time()
+        self._gc_order_states(now)
         if now - self._last_skip_summary_ts >= 300:
             for market, reasons in list(self.skip_reason_counts.items()):
                 if reasons:
@@ -458,6 +467,7 @@ class AnalyticsWriter:
                     "sell_ts": _iso_from_epoch(fill_ts),
                     "gross_pnl": gross_pnl,
                     "gross_bps": gross_bps,
+                    "is_lottery": bool(gross_bps is not None and abs(gross_bps) > 5000.0),
                 },
             )
             buy_lot["size"] = float(buy_lot["size"]) - matched
@@ -475,6 +485,8 @@ class AnalyticsWriter:
     def _mark_at_fill(self, order_id: Optional[str], fill_price: float) -> float:
         if order_id:
             state = self.order_states.get(order_id)
+            if state and _to_optional_float(state.get("placement_mark")) is not None:
+                return float(state["placement_mark"])
             if state and _to_optional_float(state.get("fair_value")) is not None:
                 return float(state["fair_value"])
         return fill_price
@@ -491,6 +503,16 @@ class AnalyticsWriter:
         while timestamps and timestamps[0] < cutoff:
             timestamps.popleft()
         return len(timestamps)
+
+    def _gc_order_states(self, now: float) -> None:
+        cutoff = now - 3600.0
+        stale_ids = [
+            order_id
+            for order_id, state in self.order_states.items()
+            if float(state.get("place_ts") or 0.0) <= cutoff
+        ]
+        for order_id in stale_ids:
+            self.order_states.pop(order_id, None)
 
 
 def _iso_from_epoch(value: Any) -> Optional[str]:
