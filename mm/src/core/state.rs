@@ -375,8 +375,10 @@ impl BotState {
         {
             position.opened_at = Some(fill.timestamp);
         }
-        let estimated_fee = (fill.price * fill.quantity).abs() * self.maker_fee_rate;
-        self.pnl.total_fees += estimated_fee;
+        let applied_fee = fill
+            .fee_paid
+            .unwrap_or_else(|| (fill.price * fill.quantity).abs() * self.maker_fee_rate);
+        self.pnl.total_fees += applied_fee;
         self.fills.push_back(fill);
         while self.fills.len() > MAX_FILL_HISTORY {
             self.fills.pop_front();
@@ -467,21 +469,30 @@ impl MarketState {
                 ask_size,
                 timestamp,
             } => {
-                let symbol_state = self.symbols.entry(symbol).or_default();
-                symbol_state.prev_mid = symbol_state.mid_price();
-                symbol_state.best_bid = Some(bid);
-                symbol_state.best_ask = Some(ask);
-                if bid_size.is_some() {
-                    symbol_state.bbo_bid_size = bid_size;
+                let symbol_state = self.symbols.entry(symbol.clone()).or_default();
+                if bid > Decimal::ZERO && ask > Decimal::ZERO && bid <= ask {
+                    symbol_state.prev_mid = symbol_state.mid_price();
+                    symbol_state.best_bid = Some(bid);
+                    symbol_state.best_ask = Some(ask);
+                    if bid_size.is_some() {
+                        symbol_state.bbo_bid_size = bid_size;
+                    }
+                    if ask_size.is_some() {
+                        symbol_state.bbo_ask_size = ask_size;
+                    }
+                    symbol_state.last_updated = Some(timestamp);
+                    symbol_state.last_updated_at = Some(Instant::now());
+                    symbol_state.last_bbo_update_at = Some(Instant::now());
+                    self.last_updated = Some(timestamp);
+                    self.last_updated_at = Some(Instant::now());
+                } else {
+                    warn!(
+                        symbol = %symbol,
+                        bid = %bid,
+                        ask = %ask,
+                        "ignored inverted/zero BestBidAsk update from venue feed"
+                    );
                 }
-                if ask_size.is_some() {
-                    symbol_state.bbo_ask_size = ask_size;
-                }
-                symbol_state.last_updated = Some(timestamp);
-                symbol_state.last_updated_at = Some(Instant::now());
-                symbol_state.last_bbo_update_at = Some(Instant::now());
-                self.last_updated = Some(timestamp);
-                self.last_updated_at = Some(Instant::now());
             }
             MarketEvent::FundingRate {
                 symbol,
