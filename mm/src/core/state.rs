@@ -204,14 +204,15 @@ impl BotState {
             }
 
             remaining_trade_quantity -= fill_quantity;
+            let fill_price = matched.price.unwrap_or(price);
             fills.push(Fill {
                 order_id: matched.order_id.clone(),
                 nonce: Some(matched.nonce),
                 symbol: matched.symbol.clone(),
                 side: matched.side,
-                price: matched.price.unwrap_or(price),
+                price: fill_price,
                 quantity: fill_quantity,
-                fee_paid: None,
+                fee_paid: Some((fill_price * fill_quantity).abs() * self.maker_fee_rate),
                 funding_paid: None,
                 timestamp,
             });
@@ -375,9 +376,7 @@ impl BotState {
         {
             position.opened_at = Some(fill.timestamp);
         }
-        let applied_fee = fill
-            .fee_paid
-            .unwrap_or_else(|| (fill.price * fill.quantity).abs() * self.maker_fee_rate);
+        let applied_fee = fill.fee_paid.unwrap_or(Decimal::ZERO);
         self.pnl.total_fees += applied_fee;
         self.fills.push_back(fill);
         while self.fills.len() > MAX_FILL_HISTORY {
@@ -537,6 +536,7 @@ impl MarketState {
                 symbol_state.asks = asks;
                 prune_book_depth(&mut symbol_state.bids, self.max_orderbook_depth, true);
                 prune_book_depth(&mut symbol_state.asks, self.max_orderbook_depth, false);
+                prune_crossed_levels(&mut symbol_state.bids, &mut symbol_state.asks);
                 if let Some((best_bid, bid_qty)) = symbol_state.bids.iter().next_back() {
                     symbol_state.best_bid = Some(*best_bid);
                     symbol_state.bbo_bid_size = Some(*bid_qty);
@@ -580,6 +580,7 @@ impl MarketState {
                 }
                 prune_book_depth(&mut symbol_state.bids, self.max_orderbook_depth, true);
                 prune_book_depth(&mut symbol_state.asks, self.max_orderbook_depth, false);
+                prune_crossed_levels(&mut symbol_state.bids, &mut symbol_state.asks);
                 if let Some((best_bid, bid_qty)) = symbol_state.bids.iter().next_back() {
                     symbol_state.best_bid = Some(*best_bid);
                     symbol_state.bbo_bid_size = Some(*bid_qty);
@@ -702,6 +703,15 @@ impl SymbolMarketState {
         }
         Some((ask - bid) / mid * Decimal::from(10_000u64))
     }
+
+    pub fn mid_drift_bps(&self, _window: Duration) -> Option<Decimal> {
+        let now_mid = self.mid_price()?;
+        let prev_mid = self.prev_mid?;
+        if prev_mid <= Decimal::ZERO {
+            return None;
+        }
+        Some((now_mid - prev_mid) / prev_mid * Decimal::from(10_000u64))
+    }
 }
 
 pub fn prune_book_depth(book: &mut BTreeMap<Decimal, Decimal>, max_depth: usize, descending: bool) {
@@ -726,6 +736,31 @@ pub fn prune_book_depth(book: &mut BTreeMap<Decimal, Decimal>, max_depth: usize,
     book.clear();
     for (price, quantity) in retained {
         book.insert(price, quantity);
+    }
+}
+
+fn prune_crossed_levels(
+    bids: &mut BTreeMap<Decimal, Decimal>,
+    asks: &mut BTreeMap<Decimal, Decimal>,
+) {
+    let (Some((&top_bid, _)), Some((&top_ask, _))) =
+        (bids.iter().next_back(), asks.iter().next())
+    else {
+        return;
+    };
+
+    if top_bid < top_ask {
+        return;
+    }
+
+    let crossed_asks: Vec<Decimal> = asks.range(..=top_bid).map(|(price, _)| *price).collect();
+    for price in crossed_asks {
+        asks.remove(&price);
+    }
+
+    let crossed_bids: Vec<Decimal> = bids.range(top_ask..).map(|(price, _)| *price).collect();
+    for price in crossed_bids {
+        bids.remove(&price);
     }
 }
 

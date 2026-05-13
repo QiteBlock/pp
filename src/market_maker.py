@@ -2266,6 +2266,51 @@ def response_is_immediate_execution(response: Any) -> bool:
 
 
 def maybe_handle_dust_position(context: BotContext, market: MarketConfig, inventory: Any) -> bool:
+    yes_unpaired = 0 < inventory.yes_shares < EXCHANGE_MIN_ORDER_SIZE and inventory.no_shares < 1e-6
+    no_unpaired = 0 < inventory.no_shares < EXCHANGE_MIN_ORDER_SIZE and inventory.yes_shares < 1e-6
+    if yes_unpaired or no_unpaired:
+        inventory.unpaired_dust_cycles = getattr(inventory, "unpaired_dust_cycles", 0) + 1
+        if inventory.unpaired_dust_cycles >= 20:
+            unpaired_size = inventory.yes_shares if yes_unpaired else inventory.no_shares
+            unpaired_side = "YES" if yes_unpaired else "NO"
+            mark_estimate = estimate_outcome_recovery_price(inventory, unpaired_side)
+            try:
+                book = get_market_book(context, market.yes_token_id)
+                if book and book.midpoint:
+                    mark_estimate = book.midpoint if yes_unpaired else (1.0 - book.midpoint)
+            except Exception:
+                pass
+            realized_loss = unpaired_size * mark_estimate
+            inventory.realized_pnl -= realized_loss
+            if yes_unpaired:
+                inventory.yes_shares = 0.0
+            else:
+                inventory.no_shares = 0.0
+            inventory.unpaired_dust_cycles = 0
+            context.released_markets.add(market.slug)
+            context.analytics.log_event(
+                "dust_writeoff_unpaired",
+                {
+                    "market": market.slug,
+                    "side": unpaired_side,
+                    "size": unpaired_size,
+                    "mark_estimate": mark_estimate,
+                    "realized_loss": realized_loss,
+                },
+            )
+            print(
+                f"[{market.slug}] unpaired dust written off: "
+                f"{unpaired_side}={unpaired_size:.4f} loss={realized_loss:.4f}"
+            )
+            if context.telegram.is_enabled():
+                context.telegram.send_message(
+                    f"Dust write-off: {market.slug}\n"
+                    f"side={unpaired_side} size={unpaired_size:.4f} loss=${realized_loss:.4f}"
+                )
+            return True
+        return False
+    inventory.unpaired_dust_cycles = 0
+
     if is_non_actionable_dust_position(context, market, inventory):
         if market.slug not in context.released_markets:
             context.released_markets.add(market.slug)
@@ -2295,6 +2340,30 @@ def maybe_handle_dust_position(context: BotContext, market: MarketConfig, invent
             status = "merge_missing_condition_id"
         else:
             try:
+                yes_bal = get_live_conditional_balance(context, market.yes_token_id)
+                no_bal = get_live_conditional_balance(context, market.no_token_id)
+                if yes_bal is not None:
+                    sync_inventory_balance(market, inventory, market.yes_token_id, yes_bal)
+                if no_bal is not None:
+                    sync_inventory_balance(market, inventory, market.no_token_id, no_bal)
+                paired_dust = min(paired_dust, inventory.yes_shares, inventory.no_shares)
+                if yes_bal is not None and no_bal is not None:
+                    paired_dust = min(paired_dust, yes_bal, no_bal)
+                if paired_dust <= 0.01:
+                    status = "merge_zero_after_balance_sync"
+                    context.analytics.log_event(
+                        "dust_merge_candidate",
+                        {
+                            "market": market.slug,
+                            "yes_shares": inventory.yes_shares,
+                            "no_shares": inventory.no_shares,
+                            "paired_shares": paired_dust,
+                            "recoverable_usdc": paired_dust,
+                            "status": status,
+                        },
+                    )
+                    return False
+                recoverable_usdc = paired_dust
                 response = context.client.merge_position_pair(market.condition_id, paired_dust, dry_run=context.dry_run)
                 inventory.yes_shares = max(inventory.yes_shares - paired_dust, 0.0)
                 inventory.no_shares = max(inventory.no_shares - paired_dust, 0.0)
@@ -2353,50 +2422,6 @@ def maybe_handle_dust_position(context: BotContext, market: MarketConfig, invent
             f"recoverable_usdc={recoverable_usdc:.4f} status={status}"
         )
         return False
-    yes_unpaired = 0 < inventory.yes_shares < EXCHANGE_MIN_ORDER_SIZE and inventory.no_shares < 1e-6
-    no_unpaired = 0 < inventory.no_shares < EXCHANGE_MIN_ORDER_SIZE and inventory.yes_shares < 1e-6
-    if yes_unpaired or no_unpaired:
-        inventory.unpaired_dust_cycles = getattr(inventory, "unpaired_dust_cycles", 0) + 1
-        if inventory.unpaired_dust_cycles >= 20:
-            unpaired_size = inventory.yes_shares if yes_unpaired else inventory.no_shares
-            unpaired_side = "YES" if yes_unpaired else "NO"
-            mark_estimate = estimate_outcome_recovery_price(inventory, unpaired_side)
-            try:
-                book = get_market_book(context, market.yes_token_id)
-                if book and book.midpoint:
-                    mark_estimate = book.midpoint if yes_unpaired else (1.0 - book.midpoint)
-            except Exception:
-                pass
-            realized_loss = unpaired_size * mark_estimate
-            inventory.realized_pnl -= realized_loss
-            if yes_unpaired:
-                inventory.yes_shares = 0.0
-            else:
-                inventory.no_shares = 0.0
-            inventory.unpaired_dust_cycles = 0
-            context.released_markets.add(market.slug)
-            context.analytics.log_event(
-                "dust_writeoff_unpaired",
-                {
-                    "market": market.slug,
-                    "side": unpaired_side,
-                    "size": unpaired_size,
-                    "mark_estimate": mark_estimate,
-                    "realized_loss": realized_loss,
-                },
-            )
-            print(
-                f"[{market.slug}] unpaired dust written off: "
-                f"{unpaired_side}={unpaired_size:.4f} loss={realized_loss:.4f}"
-            )
-            if context.telegram.is_enabled():
-                context.telegram.send_message(
-                    f"Dust write-off: {market.slug}\n"
-                    f"side={unpaired_side} size={unpaired_size:.4f} loss=${realized_loss:.4f}"
-                )
-            return True
-        return False
-    inventory.unpaired_dust_cycles = 0
     if 0 < inventory.yes_shares < EXCHANGE_MIN_ORDER_SIZE or 0 < inventory.no_shares < EXCHANGE_MIN_ORDER_SIZE:
         context.analytics.log_event(
             "dust_residual_position",
@@ -2436,6 +2461,17 @@ def release_stuck_unwind_market(context: BotContext, market: MarketConfig, inven
 def attempt_merge_before_flatten(context: BotContext, market: MarketConfig, inventory: Any, reason: str) -> Optional[str]:
     paired_shares = min(inventory.yes_shares, inventory.no_shares)
     if paired_shares <= 0.01:
+        return None
+    yes_bal = get_live_conditional_balance(context, market.yes_token_id)
+    no_bal = get_live_conditional_balance(context, market.no_token_id)
+    if yes_bal is not None:
+        sync_inventory_balance(market, inventory, market.yes_token_id, yes_bal)
+    if no_bal is not None:
+        sync_inventory_balance(market, inventory, market.no_token_id, no_bal)
+    paired_shares = min(paired_shares, inventory.yes_shares, inventory.no_shares)
+    if yes_bal is not None and no_bal is not None:
+        paired_shares = min(paired_shares, yes_bal, no_bal)
+    if paired_shares < EXCHANGE_MIN_ORDER_SIZE:
         return None
     if not market.condition_id:
         context.analytics.log_event(

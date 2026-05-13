@@ -41,6 +41,7 @@ class AnalyticsWriter:
         self._last_skip_summary_ts = 0.0
         self._last_churn_summary_ts = 0.0
         self._last_reward_snapshot_ts = 0.0
+        self._last_state_gc_ts = 0.0
 
     def _ensure_fill_header(self) -> None:
         if self.fills_csv.exists():
@@ -167,7 +168,6 @@ class AnalyticsWriter:
                 "fate": "canceled",
             },
         )
-        self.order_states.pop(order_id, None)
 
     def record_fill_observability(
         self,
@@ -352,7 +352,9 @@ class AnalyticsWriter:
 
     def emit_periodic_summaries(self) -> None:
         now = time.time()
-        self._gc_order_states(now)
+        if now - self._last_state_gc_ts >= 300.0:
+            self._gc_order_states(now)
+            self._last_state_gc_ts = now
         if now - self._last_skip_summary_ts >= 300:
             for market, reasons in list(self.skip_reason_counts.items()):
                 if reasons:
@@ -521,6 +523,8 @@ class AnalyticsWriter:
                 return float(state["placement_mark"])
             if state and _to_optional_float(state.get("fair_value")) is not None:
                 return float(state["fair_value"])
+            if state and _to_optional_float(state.get("price")) is not None:
+                return float(state["price"])
         return fill_price
 
     def _mark_pnl(self, entry: dict[str, Any], mark: float) -> float:
@@ -541,10 +545,27 @@ class AnalyticsWriter:
         stale_ids = [
             order_id
             for order_id, state in self.order_states.items()
-            if float(state.get("place_ts") or 0.0) <= cutoff
+            if self._state_reference_ts(state) <= cutoff
         ]
         for order_id in stale_ids:
             self.order_states.pop(order_id, None)
+        if stale_ids:
+            self.log_event(
+                "order_states_gc",
+                {
+                    "removed": len(stale_ids),
+                    "remaining": len(self.order_states),
+                    "cutoff_ts": cutoff,
+                },
+            )
+
+    def _state_reference_ts(self, state: dict[str, Any]) -> float:
+        timestamps = [
+            _to_optional_float(state.get("place_ts")) or 0.0,
+            _to_optional_float(state.get("fill_ts")) or 0.0,
+            _to_optional_float(state.get("cancel_ts")) or 0.0,
+        ]
+        return max(timestamps)
 
 
 def _iso_from_epoch(value: Any) -> Optional[str]:

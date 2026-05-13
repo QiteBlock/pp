@@ -81,6 +81,7 @@ impl FillStore {
                 is_simulated INTEGER NOT NULL,
                 decision TEXT NOT NULL,
                 skip_reason TEXT,
+                gate_reason TEXT,
                 current_position TEXT NOT NULL,
                 position_price TEXT NOT NULL,
                 position_notional TEXT NOT NULL,
@@ -332,6 +333,7 @@ impl FillStore {
         ensure_column(&connection, "fills", "pre_fill_mid_drift_bps", "TEXT")?;
         ensure_column(&connection, "fills", "fee_paid", "TEXT")?;
         ensure_column(&connection, "fills", "funding_paid", "TEXT")?;
+        ensure_column(&connection, "strategy_snapshots", "gate_reason", "TEXT")?;
         ensure_column(&connection, "quote_placements", "cancel_start_ts", "TEXT")?;
         ensure_column(&connection, "quote_placements", "cancel_done_ts", "TEXT")?;
         ensure_column(&connection, "quote_placements", "ready_to_place_ts", "TEXT")?;
@@ -542,7 +544,7 @@ impl FillStore {
             .map_err(|_| anyhow::anyhow!("fill store mutex poisoned"))?;
         connection.execute(
             "INSERT INTO strategy_snapshots (
-                ts, symbol, is_simulated, decision, skip_reason,
+                ts, symbol, is_simulated, decision, skip_reason, gate_reason,
                 current_position, position_price, position_notional,
                 has_position, unwind_only, stale_maker_unwind, emergency_unwind, degraded,
                 best_bid, best_ask, mid_price, mark_price, spot_price,
@@ -557,20 +559,20 @@ impl FillStore {
                 total_bid_qty, total_ask_qty, top_bid, top_ask,
                 account_equity, total_pnl
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5,
-                ?6, ?7, ?8,
-                ?9, ?10, ?11, ?12, ?13,
-                ?14, ?15, ?16, ?17, ?18,
-                ?19, ?20, ?21,
-                ?22, ?23, ?24, ?25,
-                ?26, ?27, ?28, ?29,
-                ?30, ?31, ?32, ?33,
-                ?34, ?35, ?36, ?37, ?38,
-                ?39, ?40, ?41,
-                ?42, ?43, ?44,
-                ?45, ?46, ?47, ?48,
-                ?49, ?50, ?51, ?52,
-                ?53, ?54
+                ?1, ?2, ?3, ?4, ?5, ?6,
+                ?7, ?8, ?9,
+                ?10, ?11, ?12, ?13, ?14,
+                ?15, ?16, ?17, ?18, ?19,
+                ?20, ?21, ?22,
+                ?23, ?24, ?25, ?26,
+                ?27, ?28, ?29, ?30,
+                ?31, ?32, ?33, ?34,
+                ?35, ?36, ?37, ?38, ?39,
+                ?40, ?41, ?42,
+                ?43, ?44, ?45,
+                ?46, ?47, ?48, ?49,
+                ?50, ?51, ?52, ?53,
+                ?54, ?55
             )",
             params![
                 snapshot.ts.to_rfc3339(),
@@ -578,6 +580,7 @@ impl FillStore {
                 if snapshot.is_simulated { 1 } else { 0 },
                 snapshot.decision,
                 snapshot.skip_reason,
+                snapshot.gate_reason,
                 snapshot.current_position.to_string(),
                 snapshot.position_price.to_string(),
                 snapshot.position_notional.to_string(),

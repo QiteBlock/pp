@@ -243,6 +243,10 @@ pub fn generate_quotes(
     let max_skew = Decimal::new(3, 0);
     let bid_size_skew = (Decimal::ONE - size_skew).clamp(Decimal::new(2, 1), max_skew);
     let ask_size_skew = (Decimal::ONE + size_skew).clamp(Decimal::new(2, 1), max_skew);
+    let skip_bids_for_down_drift = factors
+        .mid_drift_30s_bps
+        .map(|drift_bps| drift_bps < -Decimal::from(8u64))
+        .unwrap_or(false);
 
     let mut quotes = Vec::with_capacity(model.n_points * 2);
     let side_notional_cap = max_quote_notional.map(|cap| cap * Decimal::from(2u64));
@@ -326,7 +330,9 @@ pub fn generate_quotes(
             }
         }
 
-        if matches!(pair.side_filter, SideFilter::Both | SideFilter::BidOnly) {
+        if !skip_bids_for_down_drift
+            && matches!(pair.side_filter, SideFilter::Both | SideFilter::BidOnly)
+        {
             bid_running_total_notional += bid_size * bid_price;
             quotes.push(QuoteIntent {
                 symbol: pair.symbol.clone(),

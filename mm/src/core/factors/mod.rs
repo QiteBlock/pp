@@ -82,6 +82,7 @@ struct SymbolFactorState {
     ewma_variance: Decimal,
     last_mid: Option<Decimal>,
     last_mid_timestamp: Option<DateTime<Utc>>,
+    mid_history: VecDeque<(DateTime<Utc>, Decimal)>,
     vol_history: VecDeque<Decimal>,
     smoothed_flow: Decimal,
     regime: MarketRegime,
@@ -111,6 +112,7 @@ impl Default for SymbolFactorState {
             ewma_variance: Decimal::ZERO,
             last_mid: None,
             last_mid_timestamp: None,
+            mid_history: VecDeque::new(),
             vol_history: VecDeque::new(),
             smoothed_flow: Decimal::ZERO,
             regime: MarketRegime::Quiet,
@@ -178,6 +180,17 @@ impl FactorEngine {
 
         symbol_state.last_mid = Some(mid);
         symbol_state.last_mid_timestamp = Some(now);
+        symbol_state.mid_history.push_back((now, mid));
+        let mid_history_cutoff = now - Duration::seconds(45);
+        while symbol_state
+            .mid_history
+            .front()
+            .map(|(timestamp, _)| *timestamp < mid_history_cutoff)
+            .unwrap_or(false)
+        {
+            symbol_state.mid_history.pop_front();
+        }
+        maybe_shrink_vecdeque(&mut symbol_state.mid_history, "factor_mid_history");
         let fast_sweep_move = previous_mid
             .zip(previous_mid_timestamp)
             .filter(|(prev_mid, prev_ts)| {
@@ -187,6 +200,13 @@ impl FactorEngine {
             .map(|(prev_mid, _)| ((mid - prev_mid).abs() / prev_mid) * Decimal::from(10_000u64))
             .filter(|move_bps| *move_bps > Decimal::from(30u64))
             .is_some();
+        let drift_30s_cutoff = now - Duration::seconds(30);
+        let mid_drift_30s_bps = symbol_state
+            .mid_history
+            .iter()
+            .rev()
+            .find(|(timestamp, past_mid)| *timestamp <= drift_30s_cutoff && *past_mid > Decimal::ZERO)
+            .map(|(_, past_mid)| ((mid - *past_mid) / *past_mid) * Decimal::from(10_000u64));
 
         let volatility = symbol_state.ewma_variance.sqrt().unwrap_or(Decimal::ZERO);
         let volume_window = Duration::seconds(config.factors.volume_window_secs);
@@ -565,6 +585,7 @@ impl FactorEngine {
             ob_imbalance,
             consecutive_flow_spike,
             microprice,
+            mid_drift_30s_bps,
             fill_rate_skew,
             vpin,
             funding_lean,

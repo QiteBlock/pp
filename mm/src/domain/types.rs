@@ -234,6 +234,9 @@ pub struct FactorSnapshot {
     /// BBO size-weighted mid (microprice). Falls back to raw mid when BBO sizes are unavailable.
     /// Used as the primary fair-value estimate in distribution.
     pub microprice: Decimal,
+    /// Signed mid-price drift over the trailing 30 seconds, in bps.
+    /// Negative means downward drift; positive means upward drift.
+    pub mid_drift_30s_bps: Option<Decimal>,
     /// Signed fill-rate skew [-1, 1]: positive = bid fills faster, negative = ask fills faster.
     /// Derived from a rolling window of bid vs ask fill counts.
     pub fill_rate_skew: Decimal,
@@ -272,6 +275,7 @@ impl Default for FactorSnapshot {
             ob_imbalance: Decimal::ZERO,
             consecutive_flow_spike: 0,
             microprice: Decimal::ZERO,
+            mid_drift_30s_bps: None,
             fill_rate_skew: Decimal::ZERO,
             vpin: Decimal::ZERO,
             funding_lean: Decimal::ZERO,
@@ -291,6 +295,7 @@ pub struct StrategySnapshot {
     pub is_simulated: bool,
     pub decision: String,
     pub skip_reason: Option<String>,
+    pub gate_reason: Option<String>,
     pub current_position: Decimal,
     pub position_price: Decimal,
     pub position_notional: Decimal,

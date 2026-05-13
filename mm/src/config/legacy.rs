@@ -4,6 +4,8 @@ use anyhow::{bail, Context, Result};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use crate::core::quoting::strategy_mode::StrategyMode;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AppConfig {
     pub venue: VenueConfig,
@@ -104,6 +106,24 @@ impl AppConfig {
                     "pair {} unwind_only_exit_ratio must be within [0, enter_ratio)",
                     pair.symbol
                 );
+            }
+            if pair.ioc_trigger_ratio < Decimal::ZERO || pair.ioc_trigger_ratio > Decimal::ONE {
+                bail!(
+                    "pair {} ioc_trigger_ratio must be within [0, 1]",
+                    pair.symbol
+                );
+            }
+            if pair.flat_dust_threshold < Decimal::ZERO {
+                bail!("pair {} flat_dust_threshold must be non-negative", pair.symbol);
+            }
+            if pair.sniper_drift_threshold_bps < Decimal::ZERO {
+                bail!(
+                    "pair {} sniper_drift_threshold_bps must be non-negative",
+                    pair.symbol
+                );
+            }
+            if matches!(pair.strategy_mode, StrategyMode::Sniper) && pair.sniper_window_secs == 0 {
+                bail!("pair {} sniper_window_secs must be > 0 in sniper mode", pair.symbol);
             }
         }
         Ok(())
@@ -394,6 +414,28 @@ impl AppConfig {
                             &format!("pairs.{}.unwind_only_exit_ratio", pair.symbol),
                             &pair.unwind_only_exit_ratio,
                         )?,
+                        ioc_trigger_ratio: parse_decimal(
+                            &format!("pairs.{}.ioc_trigger_ratio", pair.symbol),
+                            &pair.ioc_trigger_ratio,
+                        )?,
+                        strategy_mode: pair
+                            .strategy_mode
+                            .parse::<StrategyMode>()
+                            .with_context(|| {
+                                format!(
+                                    "invalid strategy_mode for pairs.{}: {}",
+                                    pair.symbol, pair.strategy_mode
+                                )
+                            })?,
+                        sniper_drift_threshold_bps: parse_decimal(
+                            &format!("pairs.{}.sniper_drift_threshold_bps", pair.symbol),
+                            &pair.sniper_drift_threshold_bps,
+                        )?,
+                        sniper_window_secs: pair.sniper_window_secs,
+                        flat_dust_threshold: parse_decimal(
+                            &format!("pairs.{}.flat_dust_threshold", pair.symbol),
+                            &pair.flat_dust_threshold,
+                        )?,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -567,6 +609,11 @@ pub struct ParsedPairConfig {
     pub max_position_base: Decimal,
     pub unwind_only_enter_ratio: Decimal,
     pub unwind_only_exit_ratio: Decimal,
+    pub ioc_trigger_ratio: Decimal,
+    pub strategy_mode: StrategyMode,
+    pub sniper_drift_threshold_bps: Decimal,
+    pub sniper_window_secs: u64,
+    pub flat_dust_threshold: Decimal,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -772,6 +819,22 @@ fn default_unwind_only_enter_ratio() -> String {
 
 fn default_unwind_only_exit_ratio() -> String {
     "0.60".to_string()
+}
+
+fn default_ioc_trigger_ratio() -> String {
+    "0.5".to_string()
+}
+
+fn default_strategy_mode() -> String {
+    "mm".to_string()
+}
+
+fn default_sniper_drift_threshold_bps() -> String {
+    "10".to_string()
+}
+
+fn default_sniper_window_secs() -> u64 {
+    5
 }
 
 fn default_one_string() -> String {
@@ -1028,6 +1091,16 @@ pub struct PairConfig {
     pub unwind_only_enter_ratio: String,
     #[serde(default = "default_unwind_only_exit_ratio")]
     pub unwind_only_exit_ratio: String,
+    #[serde(default = "default_ioc_trigger_ratio")]
+    pub ioc_trigger_ratio: String,
+    #[serde(default = "default_strategy_mode")]
+    pub strategy_mode: String,
+    #[serde(default = "default_sniper_drift_threshold_bps")]
+    pub sniper_drift_threshold_bps: String,
+    #[serde(default = "default_sniper_window_secs")]
+    pub sniper_window_secs: u64,
+    #[serde(default = "default_zero_string")]
+    pub flat_dust_threshold: String,
     pub price_source: PriceSource,
     pub post_only: bool,
     pub service_on: bool,

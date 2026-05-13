@@ -90,11 +90,11 @@ emergency_skew_max = "1.50"
 max_correlated_position_usd = "500"
 emergency_unwind_threshold = "0.8"
 emergency_unwind_cycles = 5
-stale_position_timeout_secs = 1800
+stale_position_timeout_secs = 3600
 stale_position_bid_hold_secs = 1800
 stale_position_ask_hold_secs = 1800
-stale_position_close_slippage_cap_bps = "40"
-stale_position_close_chunk_base = "0.5"
+stale_position_close_slippage_cap_bps = "10"
+stale_position_close_chunk_base = "0.2"
 
 [factors]
 volume_window_secs = 30

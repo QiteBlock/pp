@@ -21,7 +21,7 @@ telegram:
   notify_market_switch: true
 
 runtime:
-  loop_interval_seconds: 3
+  loop_interval_seconds: 5
   dry_run: false
   cancel_before_requote: false
   log_dir: "data"
@@ -38,15 +38,15 @@ runtime:
   rescan_interval_seconds: 300
 
 pricing:
-  min_half_spread: 0.001
-  max_half_spread: 0.006
-  inventory_skew_per_share: 0.0012
+  min_half_spread: 0.02
+  max_half_spread: 0.035
+  inventory_skew_per_share: 0.0
   resolution_risk_multiplier: 0.03
   volatility_multiplier: 0.25
-  book_spread_multiplier: 0.55
+  book_spread_multiplier: 0.0
   probability_edge_multiplier: 0.003
   size_per_order: 20.0
-  quote_improvement_ticks: 1
+  quote_improvement_ticks: 0
 
 risk:
   max_yes_shares_per_market: 60

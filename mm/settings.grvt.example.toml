@@ -83,11 +83,11 @@ emergency_skew_max = "1.50"
 max_correlated_position_usd = "500"
 emergency_unwind_threshold = "0.8"
 emergency_unwind_cycles = 10
-stale_position_timeout_secs = 900
-stale_position_bid_hold_secs = 600
-stale_position_ask_hold_secs = 600
-stale_position_close_slippage_cap_bps = "15"
-stale_position_close_chunk_base = "0.5"
+stale_position_timeout_secs = 36
+stale_position_bid_hold_secs = 1800
+stale_position_ask_hold_secs = 1800
+stale_position_close_slippage_cap_bps = "10"
+stale_position_close_chunk_base = "0.2"
 
 [factors]
 volume_window_secs = 30
@@ -106,7 +106,7 @@ inventory_skew_convexity = "1.0"
 regime_min_dwell_secs = 10
 cross_symbol_vol_weight = "0.0"
 volatility_floor = "0.00005"
-ob_imbalance_weight = "1.5"
+ob_imbalance_weight = "0.5"
 ob_imbalance_depth = 10
 bbo_spread_cap_bps = "20"
 flow_spike_pause_threshold = "0.95"

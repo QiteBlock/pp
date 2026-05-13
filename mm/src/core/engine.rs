@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use anyhow::{Context, Result};
@@ -29,6 +29,7 @@ use crate::{
         health::HealthTracker,
         hedging::HedgeSimulator,
         quoting::avellaneda_stoikov::generate_quotes,
+        quoting::strategy_mode::{evaluate_gate, SniperConfig, SniperState},
         risk::{proportional_vol_widening, run_security_checks, CircuitBreaker},
         runtime_control::RuntimeControl,
         state::BotState,
@@ -49,6 +50,7 @@ pub struct MarketMakingEngine<E> {
     notifier: TelegramNotifier,
     fill_store: Arc<Option<FillStore>>,
     control: Arc<RuntimeControl>,
+    sniper_states: Mutex<HashMap<String, SniperState>>,
 }
 
 #[derive(Default)]
@@ -554,6 +556,7 @@ where
             notifier,
             fill_store,
             control,
+            sniper_states: Mutex::new(HashMap::new()),
         }
     }
 
@@ -1516,7 +1519,6 @@ where
         auto_pause_state: &mut AutoPauseState,
     ) -> Result<FillStats> {
         let (level_index, spread_earned_bps) = infer_fill_analytics(state, &fill);
-        let total_fees_before = state.pnl.total_fees;
         let mut fill_telemetry =
             build_fill_storage_telemetry(state, &fill, level_index, live_quote_metadata);
         fill_tracker.record_fill(
@@ -1532,11 +1534,6 @@ where
             fill_tracker.level_volume_multiplier(&fill.symbol, fill.side, level_index);
 
         state.apply_private_event(PrivateEvent::Fill(fill.clone()));
-        if let Some(details) = fill_telemetry.as_mut() {
-            if details.fee_paid.is_none() {
-                details.fee_paid = Some(state.pnl.total_fees - total_fees_before);
-            }
-        }
         let primary_position = state.positions.get(&fill.symbol);
         if symbol_tracks_hyperliquid(&self.config, &fill.symbol) {
             let market = state.market.symbols.get(&fill.symbol);
@@ -1790,13 +1787,17 @@ where
         post_fill_widen: &HashMap<(String, Side), Instant>,
     ) -> Result<Vec<OrderRequest>> {
         let mut orders = Vec::new();
+        let mut sniper_states = self
+            .sniper_states
+            .lock()
+            .map_err(|_| anyhow::anyhow!("sniper state mutex poisoned"))?;
         let vol_cut = self.parsed.model.volatility_cut_threshold;
         let min_trade_amount = self.parsed.model.min_trade_amount;
         let n_trade_threshold = self.config.factors.n_trade_quote_threshold;
         let hard_toxic_stop_secs = 300u64;
         let min_level_multiplier = Decimal::new(5, 1);
         let hard_vpin_skip_threshold = Decimal::new(95, 2);
-        let passive_stale_close_spread_bps = Decimal::from(30u64);
+        let passive_stale_close_spread_bps = Decimal::from(5u64);
         let legacy_position_hold_timeout =
             ChronoDuration::seconds(self.parsed.risk.stale_position_timeout_secs as i64);
         let bid_position_hold_timeout = if self.parsed.risk.stale_position_bid_hold_secs > 0 {
@@ -1950,6 +1951,10 @@ where
                     Side::Bid
                 };
                 let market = state.market.symbols.get(&pair.symbol);
+                let parsed_pair = self
+                    .parsed
+                    .pair(&pair.symbol)
+                    .expect("pair parsed");
                 let close_reference_price = market
                     .and_then(|market| {
                         market
@@ -1961,9 +1966,13 @@ where
                     })
                     .unwrap_or(reference_price);
                 let bbo_spread_bps = market.and_then(|market| market.bbo_spread_bps());
-                let use_passive_stale_close = bbo_spread_bps
+                let ioc_size_threshold =
+                    parsed_pair.max_position_base * parsed_pair.ioc_trigger_ratio;
+                let position_below_ioc_threshold = position.quantity.abs() < ioc_size_threshold;
+                let use_passive_stale_close = (bbo_spread_bps
                     .map(|spread_bps| spread_bps > passive_stale_close_spread_bps)
                     .unwrap_or(false)
+                    || position_below_ioc_threshold)
                     && market.and_then(|market| market.mid_price()).is_some();
                 let (limit_price, time_in_force, strategy_decision) = if use_passive_stale_close {
                     (
@@ -1988,8 +1997,8 @@ where
                             instrument.tick_size,
                             side,
                         ),
-                        TimeInForce::ImmediateOrCancel,
-                        "stale_ioc_close",
+                        TimeInForce::GoodTillTime,
+                        "stale_passive_close_aggressive",
                     )
                 };
                 warn!(
@@ -2024,6 +2033,7 @@ where
                     &pair.symbol,
                     self.config.runtime.dry_run,
                     strategy_decision,
+                    None,
                     None,
                     position.quantity,
                     reference_price,
@@ -2068,6 +2078,7 @@ where
                     self.config.runtime.dry_run,
                     "skip",
                     Some("factor_unavailable"),
+                    None,
                     current_position,
                     position_price,
                     has_position,
@@ -2123,6 +2134,7 @@ where
                     self.config.runtime.dry_run,
                     "skip",
                     Some("missing_instrument_metadata"),
+                    None,
                     current_position,
                     position_price,
                     current_position != Decimal::ZERO,
@@ -2204,6 +2216,7 @@ where
                         self.config.runtime.dry_run,
                         "skip",
                         Some("recent_trade_threshold"),
+                        None,
                         current_position,
                         position_price,
                         has_position,
@@ -2246,6 +2259,7 @@ where
                         self.config.runtime.dry_run,
                         "skip",
                         Some("persistent_trending_toxic"),
+                        None,
                         current_position,
                         position_price,
                         has_position,
@@ -2290,6 +2304,7 @@ where
                         self.config.runtime.dry_run,
                         "skip",
                         Some("sustained_fully_toxic"),
+                        None,
                         current_position,
                         position_price,
                         has_position,
@@ -2330,6 +2345,7 @@ where
                         self.config.runtime.dry_run,
                         "skip",
                         Some("volatility_cut"),
+                        None,
                         current_position,
                         position_price,
                         has_position,
@@ -2476,6 +2492,7 @@ where
                         self.config.runtime.dry_run,
                         "skip",
                         Some("vpin_hard_stop"),
+                        None,
                         current_position,
                         position_price,
                         has_position,
@@ -2517,6 +2534,29 @@ where
                 pos_ratio,
             );
             let generated_quote_count = quotes.len();
+            let drift_bps = market.and_then(|market| market.mid_drift_bps(Duration::from_secs(5)));
+            let gate = {
+                let sniper_state = sniper_states.entry(pair.symbol.clone()).or_default();
+                evaluate_gate(
+                    parsed_pair.strategy_mode,
+                    current_position,
+                    parsed_pair.flat_dust_threshold,
+                    SniperConfig {
+                        drift_threshold_bps: parsed_pair.sniper_drift_threshold_bps,
+                        window: Duration::from_secs(parsed_pair.sniper_window_secs),
+                    },
+                    drift_bps,
+                    sniper_state,
+                    Instant::now().into(),
+                )
+            };
+            let quotes: Vec<_> = quotes
+                .into_iter()
+                .filter(|quote| match quote.side {
+                    Side::Bid => gate.bid_enabled,
+                    Side::Ask => gate.ask_enabled,
+                })
+                .collect();
 
             // Online kappa: record whether a level-0 fill happened this cycle.
             // A level-0 fill means the tracker saw a fill at level_index=0 for this symbol.
@@ -2997,6 +3037,7 @@ where
                 self.config.runtime.dry_run,
                 decision,
                 None,
+                Some(gate.reason.as_str()),
                 current_position,
                 position_price,
                 has_position,
@@ -3097,6 +3138,7 @@ fn build_strategy_snapshot(
     is_simulated: bool,
     decision: &str,
     skip_reason: Option<&str>,
+    gate_reason: Option<&str>,
     current_position: Decimal,
     position_price: Decimal,
     has_position: bool,
@@ -3147,6 +3189,7 @@ fn build_strategy_snapshot(
         is_simulated,
         decision: decision.to_string(),
         skip_reason: skip_reason.map(str::to_string),
+        gate_reason: gate_reason.map(str::to_string),
         current_position,
         position_price,
         position_notional,
