@@ -13,6 +13,7 @@ class MarketInventory:
     realized_pnl: float = 0.0
     unwind_cycles_without_fill: int = 0
     unwind_failed_cycles: int = 0
+    unpaired_dust_cycles: int = 0
     balance_retry_pending: bool = False
     balance_retry_deadline: float = 0.0
     last_fill_ts: float = 0.0
@@ -60,6 +61,7 @@ class InventoryBook:
             inventory.realized_pnl -= signed_size * price
         inventory.unwind_cycles_without_fill = 0
         inventory.unwind_failed_cycles = 0
+        inventory.unpaired_dust_cycles = 0
         inventory.balance_retry_pending = False
         inventory.balance_retry_deadline = 0.0
         inventory.fill_cooldown_seconds_override = 0

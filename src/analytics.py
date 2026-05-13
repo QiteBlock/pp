@@ -90,6 +90,7 @@ class AnalyticsWriter:
         reward_eligible: bool,
         reward_rate_per_day: Optional[float],
         fair_value: Optional[float],
+        rewards_max_spread: Optional[float] = None,
         placement_mark: Optional[float] = None,
     ) -> None:
         if not order_id:
@@ -104,6 +105,7 @@ class AnalyticsWriter:
             "reward_eligible": reward_eligible,
             "reward_rate_per_day": reward_rate_per_day,
             "fair_value": fair_value,
+            "rewards_max_spread": rewards_max_spread,
             "placement_mark": placement_mark,
             "place_ts": time.time(),
             "fill_ts": None,
@@ -140,6 +142,15 @@ class AnalyticsWriter:
         time_on_book_ms = None
         if state.get("place_ts"):
             time_on_book_ms = max(int((cancel_ts - float(state["place_ts"])) * 1000), 0)
+        reward_estimate = self._build_reward_estimate_record(
+            state=state,
+            event_ts=cancel_ts,
+            executed_size=_to_optional_float(state.get("size")),
+            event_type="cancel",
+        )
+        if reward_estimate is not None:
+            self.reward_fill_records.append(reward_estimate)
+            self.log_event("reward_estimate_on_cancel", reward_estimate)
         self.log_event(
             "quote_lifecycle",
             {
@@ -213,33 +224,15 @@ class AnalyticsWriter:
                     },
                 )
                 if state.get("reward_eligible"):
-                    fair_value = _to_optional_float(state.get("fair_value"))
-                    mid_dist_to_fair = abs(price - fair_value) if fair_value is not None else None
-                    reward_rate = _to_optional_float(state.get("reward_rate_per_day"))
-                    time_on_book_sec = max(fill_ts - float(state.get("place_ts") or fill_ts), 0.0)
-                    est_reward_per_fill = None
-                    if reward_rate is not None:
-                        est_reward_per_fill = reward_rate * (time_on_book_sec / 86400.0) * (float(size) / 100.0)
-                    self.reward_fill_records.append(
-                        {
-                            "ts": fill_ts,
-                            "market": market,
-                            "size": size,
-                            "reward_rate_per_day": reward_rate,
-                            "mid_dist_to_fair": mid_dist_to_fair,
-                            "est_reward_per_fill": est_reward_per_fill,
-                        }
+                    reward_estimate = self._build_reward_estimate_record(
+                        state=state,
+                        event_ts=fill_ts,
+                        executed_size=size,
+                        event_type="fill",
                     )
-                    self.log_event(
-                        "reward_eligible_fill",
-                        {
-                            "market": market,
-                            "size": size,
-                            "reward_rate_per_day": reward_rate,
-                            "mid_dist_to_fair": mid_dist_to_fair,
-                            "est_reward_per_fill": est_reward_per_fill,
-                        },
-                    )
+                    if reward_estimate is not None:
+                        self.reward_fill_records.append(reward_estimate)
+                        self.log_event("reward_eligible_fill", reward_estimate)
 
         self._record_round_trip(market, outcome, side, size, price, fill_ts)
 
@@ -386,17 +379,56 @@ class AnalyticsWriter:
             cutoff = now - 86400
             records = [item for item in self.reward_fill_records if float(item.get("ts") or 0.0) >= cutoff]
             rewards_earned_24h = sum(float(item.get("est_reward_per_fill") or 0.0) for item in records)
-            fills_count = len(records)
-            avg_reward = (rewards_earned_24h / fills_count) if fills_count else None
+            fill_records = [item for item in records if item.get("event_type") == "fill"]
+            fills_count = len(fill_records)
+            avg_reward = (
+                sum(float(item.get("est_reward_per_fill") or 0.0) for item in fill_records) / fills_count
+            ) if fills_count else None
             self.log_event(
                 "reward_pnl_snapshot",
                 {
                     "rewards_earned_24h": rewards_earned_24h,
                     "fills_count": fills_count,
                     "avg_reward_per_fill": avg_reward,
+                    "cancel_estimate_count": len(records) - fills_count,
                 },
             )
             self._last_reward_snapshot_ts = now
+
+    def _build_reward_estimate_record(
+        self,
+        state: dict[str, Any],
+        event_ts: float,
+        executed_size: Optional[float],
+        event_type: str,
+    ) -> Optional[dict[str, Any]]:
+        if not state.get("reward_eligible") or not state.get("place_ts"):
+            return None
+        reward_rate = _to_optional_float(state.get("reward_rate_per_day"))
+        size = _to_optional_float(executed_size)
+        if reward_rate is None or size is None or size <= 0:
+            return None
+        fair_value = _to_optional_float(state.get("fair_value"))
+        price = _to_optional_float(state.get("price"))
+        rewards_max_spread = _to_optional_float(state.get("rewards_max_spread"))
+        mid_dist_to_fair = abs(price - fair_value) if price is not None and fair_value is not None else None
+        quality = 1.0
+        if rewards_max_spread and rewards_max_spread > 0 and mid_dist_to_fair is not None:
+            quality = max(0.0, (rewards_max_spread - mid_dist_to_fair) / rewards_max_spread)
+        time_on_book_sec = max(event_ts - float(state.get("place_ts") or event_ts), 0.0)
+        est_reward_per_fill = reward_rate * (time_on_book_sec / 86400.0) * (size / 100.0) * quality
+        return {
+            "ts": event_ts,
+            "event_type": event_type,
+            "market": state.get("market"),
+            "size": size,
+            "reward_rate_per_day": reward_rate,
+            "mid_dist_to_fair": mid_dist_to_fair,
+            "rewards_max_spread": rewards_max_spread,
+            "quality": quality,
+            "time_on_book_sec": time_on_book_sec,
+            "est_reward_per_fill": est_reward_per_fill,
+        }
 
     def estimate_avg_basis(self, market: str, outcome: str, shares: float) -> Optional[float]:
         return self._fifo_average_price(market, outcome, shares, mutate=False)

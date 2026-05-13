@@ -799,6 +799,7 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             reward_eligible=reward_status["eligible"],
             reward_rate_per_day=market.reward_rate_per_day,
             fair_value=quote.fair_value,
+            rewards_max_spread=market.rewards_max_spread,
             placement_mark=book.midpoint if book.midpoint is not None else quote.fair_value,
         )
     if ask_response is not None:
@@ -813,6 +814,7 @@ def process_market(context: BotContext, market: MarketConfig, mark_prices: dict[
             reward_eligible=reward_status["eligible"],
             reward_rate_per_day=market.reward_rate_per_day,
             fair_value=quote.fair_value,
+            rewards_max_spread=market.rewards_max_spread,
             placement_mark=book.midpoint if book.midpoint is not None else quote.fair_value,
         )
     context.analytics.log_event(
@@ -874,21 +876,30 @@ def process_unwind_market(
     signal: Any,
 ) -> None:
     if inventory.balance_retry_pending:
-        if inventory.balance_retry_deadline > time.time():
-            context.analytics.log_event(
-                "unwind_skip",
-                {
-                    "market": market.slug,
-                    "reason": "balance_retry_pending",
-                    "mode": mode,
-                    "aggressive": aggressive,
-                    "retry_deadline": inventory.balance_retry_deadline,
-                },
-            )
-            context.analytics.note_skip_reason(market.slug, "balance_retry_pending")
-            return
-        inventory.balance_retry_pending = False
-        inventory.balance_retry_deadline = 0.0
+        if time.time() < inventory.balance_retry_deadline:
+            live_balance = get_live_conditional_balance(context, market.yes_token_id)
+            if live_balance is not None:
+                sync_inventory_balance(market, inventory, market.yes_token_id, live_balance)
+            if live_balance is not None and live_balance >= EXCHANGE_MIN_ORDER_SIZE:
+                inventory.balance_retry_pending = False
+                inventory.balance_retry_deadline = 0.0
+            else:
+                context.analytics.log_event(
+                    "unwind_skip",
+                    {
+                        "market": market.slug,
+                        "reason": "balance_retry_pending",
+                        "mode": mode,
+                        "aggressive": aggressive,
+                        "retry_deadline": inventory.balance_retry_deadline,
+                        "live_balance": live_balance,
+                    },
+                )
+                context.analytics.note_skip_reason(market.slug, "balance_retry_pending")
+                return
+        else:
+            inventory.balance_retry_pending = False
+            inventory.balance_retry_deadline = 0.0
     if reason == "drawdown limit breached":
         context.control.disable("risk:drawdown")
         context.analytics.log_event("drawdown_kill_switch", {"market": market.slug, "reason": reason})
@@ -1451,7 +1462,7 @@ def recover_from_sell_balance_rejection(
     )
     if placeable is None or placeable + 1e-9 < EXCHANGE_MIN_ORDER_SIZE:
         inventory.balance_retry_pending = True
-        inventory.balance_retry_deadline = time.time() + 30.0
+        inventory.balance_retry_deadline = time.time() + 60.0
         return
     inventory.balance_retry_pending = False
     inventory.balance_retry_deadline = 0.0
@@ -2342,6 +2353,50 @@ def maybe_handle_dust_position(context: BotContext, market: MarketConfig, invent
             f"recoverable_usdc={recoverable_usdc:.4f} status={status}"
         )
         return False
+    yes_unpaired = 0 < inventory.yes_shares < EXCHANGE_MIN_ORDER_SIZE and inventory.no_shares < 1e-6
+    no_unpaired = 0 < inventory.no_shares < EXCHANGE_MIN_ORDER_SIZE and inventory.yes_shares < 1e-6
+    if yes_unpaired or no_unpaired:
+        inventory.unpaired_dust_cycles = getattr(inventory, "unpaired_dust_cycles", 0) + 1
+        if inventory.unpaired_dust_cycles >= 20:
+            unpaired_size = inventory.yes_shares if yes_unpaired else inventory.no_shares
+            unpaired_side = "YES" if yes_unpaired else "NO"
+            mark_estimate = estimate_outcome_recovery_price(inventory, unpaired_side)
+            try:
+                book = get_market_book(context, market.yes_token_id)
+                if book and book.midpoint:
+                    mark_estimate = book.midpoint if yes_unpaired else (1.0 - book.midpoint)
+            except Exception:
+                pass
+            realized_loss = unpaired_size * mark_estimate
+            inventory.realized_pnl -= realized_loss
+            if yes_unpaired:
+                inventory.yes_shares = 0.0
+            else:
+                inventory.no_shares = 0.0
+            inventory.unpaired_dust_cycles = 0
+            context.released_markets.add(market.slug)
+            context.analytics.log_event(
+                "dust_writeoff_unpaired",
+                {
+                    "market": market.slug,
+                    "side": unpaired_side,
+                    "size": unpaired_size,
+                    "mark_estimate": mark_estimate,
+                    "realized_loss": realized_loss,
+                },
+            )
+            print(
+                f"[{market.slug}] unpaired dust written off: "
+                f"{unpaired_side}={unpaired_size:.4f} loss={realized_loss:.4f}"
+            )
+            if context.telegram.is_enabled():
+                context.telegram.send_message(
+                    f"Dust write-off: {market.slug}\n"
+                    f"side={unpaired_side} size={unpaired_size:.4f} loss=${realized_loss:.4f}"
+                )
+            return True
+        return False
+    inventory.unpaired_dust_cycles = 0
     if 0 < inventory.yes_shares < EXCHANGE_MIN_ORDER_SIZE or 0 < inventory.no_shares < EXCHANGE_MIN_ORDER_SIZE:
         context.analytics.log_event(
             "dust_residual_position",
@@ -2443,6 +2498,7 @@ def record_order_placement_event(
     reward_eligible: bool,
     reward_rate_per_day: Optional[float],
     fair_value: Optional[float],
+    rewards_max_spread: Optional[float] = None,
     placement_mark: Optional[float] = None,
 ) -> None:
     order_id, status, _ = extract_order_response_metadata(response)
@@ -2460,6 +2516,7 @@ def record_order_placement_event(
         reward_eligible=reward_eligible,
         reward_rate_per_day=reward_rate_per_day,
         fair_value=fair_value,
+        rewards_max_spread=normalize_reward_spread_limit(rewards_max_spread),
         placement_mark=placement_mark,
     )
 
