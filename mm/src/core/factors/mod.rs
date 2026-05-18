@@ -142,13 +142,13 @@ impl FactorEngine {
         let Some(market) = state.market.symbols.get(&pair.symbol) else {
             return None;
         };
-        // Use microprice (BBO size-weighted mid) when available, blended by config weight.
         let Some(raw_mid) = market.mid_price() else {
             return None;
         };
-        let mid = if let Some(mp) = market.microprice() {
+        let microprice = market.microprice().unwrap_or(raw_mid);
+        let signal_mid = if market.microprice().is_some() {
             let w = parsed.factors.microprice_weight;
-            w * mp + (Decimal::ONE - w) * raw_mid
+            w * microprice + (Decimal::ONE - w) * raw_mid
         } else {
             raw_mid
         };
@@ -161,8 +161,8 @@ impl FactorEngine {
         let previous_mid_timestamp = symbol_state.last_mid_timestamp;
 
         if let Some(prev_mid) = previous_mid {
-            if prev_mid > Decimal::ZERO && mid > Decimal::ZERO {
-                let log_return = (mid / prev_mid).ln();
+            if prev_mid > Decimal::ZERO && signal_mid > Decimal::ZERO {
+                let log_return = (signal_mid / prev_mid).ln();
                 let mean_prev = symbol_state.ewma_mean.unwrap_or(log_return);
                 let mean = alpha * log_return + (Decimal::ONE - alpha) * mean_prev;
                 let diff = log_return - mean_prev;
@@ -178,9 +178,9 @@ impl FactorEngine {
             }
         }
 
-        symbol_state.last_mid = Some(mid);
+        symbol_state.last_mid = Some(signal_mid);
         symbol_state.last_mid_timestamp = Some(now);
-        symbol_state.mid_history.push_back((now, mid));
+        symbol_state.mid_history.push_back((now, signal_mid));
         let mid_history_cutoff = now - Duration::seconds(45);
         while symbol_state
             .mid_history
@@ -197,7 +197,9 @@ impl FactorEngine {
                 *prev_mid > Decimal::ZERO
                     && now.signed_duration_since(*prev_ts) <= Duration::seconds(1)
             })
-            .map(|(prev_mid, _)| ((mid - prev_mid).abs() / prev_mid) * Decimal::from(10_000u64))
+            .map(|(prev_mid, _)| {
+                ((signal_mid - prev_mid).abs() / prev_mid) * Decimal::from(10_000u64)
+            })
             .filter(|move_bps| *move_bps > Decimal::from(30u64))
             .is_some();
         let drift_30s_cutoff = now - Duration::seconds(30);
@@ -205,8 +207,10 @@ impl FactorEngine {
             .mid_history
             .iter()
             .rev()
-            .find(|(timestamp, past_mid)| *timestamp <= drift_30s_cutoff && *past_mid > Decimal::ZERO)
-            .map(|(_, past_mid)| ((mid - *past_mid) / *past_mid) * Decimal::from(10_000u64));
+            .find(|(timestamp, past_mid)| {
+                *timestamp <= drift_30s_cutoff && *past_mid > Decimal::ZERO
+            })
+            .map(|(_, past_mid)| ((signal_mid - *past_mid) / *past_mid) * Decimal::from(10_000u64));
 
         let volatility = symbol_state.ewma_variance.sqrt().unwrap_or(Decimal::ZERO);
         let volume_window = Duration::seconds(config.factors.volume_window_secs);
@@ -235,6 +239,27 @@ impl FactorEngine {
             .iter()
             .filter(|trade| trade.timestamp >= n_trade_window_start)
             .count();
+        let ofi_window_start = now - Duration::seconds(30);
+        let ofi_buy_volume: Decimal = market
+            .recent_trades
+            .iter()
+            .filter(|trade| trade.timestamp >= ofi_window_start)
+            .filter(|trade| matches!(trade.taker_side, Some(crate::domain::Side::Bid)))
+            .map(|trade| trade.quantity)
+            .sum();
+        let ofi_sell_volume: Decimal = market
+            .recent_trades
+            .iter()
+            .filter(|trade| trade.timestamp >= ofi_window_start)
+            .filter(|trade| matches!(trade.taker_side, Some(crate::domain::Side::Ask)))
+            .map(|trade| trade.quantity)
+            .sum();
+        let ofi_total = ofi_buy_volume + ofi_sell_volume;
+        let ofi_30s = if ofi_total.is_zero() {
+            Decimal::ZERO
+        } else {
+            ((ofi_buy_volume - ofi_sell_volume) / ofi_total).clamp(-Decimal::ONE, Decimal::ONE)
+        };
 
         // VPIN: only feed newly-seen trades into the bucket tracker so we don't
         // double-count the entire rolling window on every compute cycle.
@@ -447,14 +472,12 @@ impl FactorEngine {
             .max(Decimal::ZERO);
 
         let time_multiplier = time_of_day_multiplier(now);
-        // Microprice (effective BBO size-weighted mid, already blended with raw_mid).
-        let microprice = mid;
         let price_index = match pair.price_source {
             PriceSource::Mark => {
                 if let Some(mark_price) = market.mark_price {
                     mark_price
                 } else {
-                    microprice
+                    raw_mid
                 }
             }
             PriceSource::Spot => {
@@ -469,10 +492,10 @@ impl FactorEngine {
                         spot
                     }
                 } else {
-                    microprice
+                    raw_mid
                 }
             }
-            PriceSource::Mid => microprice,
+            PriceSource::Mid => raw_mid,
         };
         let base_volatility_addon = factor_spread_addon(parsed, volatility);
         let volatility_addon =
@@ -572,6 +595,7 @@ impl FactorEngine {
         };
 
         Some(FactorSnapshot {
+            raw_mid,
             price_index,
             raw_volatility: volatility,
             volatility: effective_volatility_addon,
@@ -587,6 +611,7 @@ impl FactorEngine {
             microprice,
             mid_drift_30s_bps,
             fill_rate_skew,
+            ofi_30s,
             vpin,
             funding_lean,
             kappa_estimate,

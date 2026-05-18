@@ -29,7 +29,7 @@ use crate::{
         health::HealthTracker,
         hedging::HedgeSimulator,
         quoting::avellaneda_stoikov::generate_quotes,
-        quoting::strategy_mode::{evaluate_gate, SniperConfig, SniperState},
+        quoting::strategy_mode::{evaluate_gate, SniperConfig, SniperState, StrategyMode},
         risk::{proportional_vol_widening, run_security_checks, CircuitBreaker},
         runtime_control::RuntimeControl,
         state::BotState,
@@ -585,6 +585,7 @@ where
         let mut state = BotState::new(
             self.parsed.venue.maker_fee_rate,
             self.parsed.runtime.max_orderbook_depth,
+            self.parsed.runtime.bbo_stale_secs,
         );
         state.apply_private_event(PrivateEvent::OpenOrders(initial_orders));
         if self.config.runtime.dry_run && self.config.runtime.restore_dry_run_state {
@@ -1311,6 +1312,53 @@ where
                         health.record_ws_discrepancy();
                     }
                     state.apply_market_event(event.clone());
+                    if !self.config.runtime.dry_run {
+                        let cota_cancel_order_ids =
+                            cancel_on_trade_against_book_order_ids(&state, &event);
+                        if !cota_cancel_order_ids.is_empty() {
+                            let cancel_set: HashSet<String> =
+                                cota_cancel_order_ids.iter().cloned().collect();
+                            let cancel_ts = Utc::now();
+                            let canceled_orders: Vec<_> = state
+                                .open_orders
+                                .values()
+                                .filter(|order| {
+                                    order.order_id
+                                        .as_ref()
+                                        .map(|order_id| cancel_set.contains(order_id))
+                                        .unwrap_or(false)
+                                })
+                                .cloned()
+                                .collect();
+                            for order in &canceled_orders {
+                                self.persist_cancel_event(build_cancel_event(
+                                    order,
+                                    "trade_against_book",
+                                    cancel_ts,
+                                    self.config.runtime.dry_run,
+                                    &live_quote_metadata,
+                                ))?;
+                            }
+                            self.exchange.cancel_orders(cota_cancel_order_ids.clone()).await?;
+                            state.open_orders.retain(|_, order| {
+                                order.order_id
+                                    .as_ref()
+                                    .map(|order_id| !cancel_set.contains(order_id))
+                                    .unwrap_or(true)
+                            });
+                            live_quote_metadata.retain(|_, meta| {
+                                meta.order_id
+                                    .as_ref()
+                                    .map(|order_id| !cancel_set.contains(order_id))
+                                    .unwrap_or(true)
+                            });
+                            let now_inst = Instant::now();
+                            for order_id in cota_cancel_order_ids {
+                                pending_cancel_order_ids.insert(order_id, now_inst);
+                            }
+                            last_generation_at = None;
+                        }
+                    }
                     if let Some(symbol) = market_event_symbol(&event) {
                         self.maybe_persist_mid_price_sample(
                             &state,
@@ -1583,11 +1631,7 @@ where
                     fill.timestamp,
                     self.config.runtime.dry_run,
                 );
-                self.handle_completed_markouts(
-                    fill_tracker,
-                    completed_markouts,
-                    auto_pause_state,
-                )?;
+                self.handle_completed_markouts(fill_tracker, completed_markouts, auto_pause_state)?;
             }
         }
         if let Some(fill_store) = self.fill_store.as_ref().as_ref() {
@@ -1951,10 +1995,7 @@ where
                     Side::Bid
                 };
                 let market = state.market.symbols.get(&pair.symbol);
-                let parsed_pair = self
-                    .parsed
-                    .pair(&pair.symbol)
-                    .expect("pair parsed");
+                let parsed_pair = self.parsed.pair(&pair.symbol).expect("pair parsed");
                 let close_reference_price = market
                     .and_then(|market| {
                         market
@@ -2367,6 +2408,164 @@ where
             // Flow spike pause — latch-based to prevent oscillation.
             // Enter: ≥2 consecutive cycles above threshold.
             // Exit: position cleared to zero (commitment released only when flat).
+            // Quote-suppression circuit breakers and unwind-only degradations.
+            let vol_bps = volatility_bps(factor_snapshot.raw_volatility);
+            let pos_ratio_abs = if parsed_pair.max_position_base <= Decimal::ZERO {
+                Decimal::ZERO
+            } else {
+                current_position.abs() / parsed_pair.max_position_base
+            };
+            let danger_score = danger_composite_score(
+                vol_bps,
+                factor_snapshot.regime,
+                pos_ratio_abs,
+                factor_snapshot.vpin,
+                self.parsed.risk.max_volatility_bps_to_quote,
+            );
+            if danger_score >= 3 {
+                if treat_as_position {
+                    warn!(
+                        symbol = %pair.symbol,
+                        position = %current_position,
+                        vol_bps = %vol_bps,
+                        regime = ?factor_snapshot.regime,
+                        pos_ratio_abs = %pos_ratio_abs,
+                        vpin = %factor_snapshot.vpin,
+                        danger_score,
+                        "compound danger regime detected while holding position; switching to unwind-only quoting"
+                    );
+                    unwind_only = true;
+                } else {
+                    warn!(
+                        symbol = %pair.symbol,
+                        vol_bps = %vol_bps,
+                        regime = ?factor_snapshot.regime,
+                        pos_ratio_abs = %pos_ratio_abs,
+                        vpin = %factor_snapshot.vpin,
+                        danger_score,
+                        "compound danger regime detected; skipping fresh quoting"
+                    );
+                    self.persist_strategy_snapshot(build_strategy_snapshot(
+                        state,
+                        &pair.symbol,
+                        self.config.runtime.dry_run,
+                        "skip",
+                        Some("skip_danger_composite"),
+                        None,
+                        current_position,
+                        position_price,
+                        has_position,
+                        false,
+                        stale_maker_unwind,
+                        false,
+                        degraded,
+                        state.market.symbols.get(&pair.symbol),
+                        Some(&factor_snapshot),
+                        Some(bid_lvl0_multiplier),
+                        Some(ask_lvl0_multiplier),
+                        0,
+                        &[],
+                    ))?;
+                    continue;
+                }
+            }
+            if danger_score < 3 {
+                if vol_bps > self.parsed.risk.max_volatility_bps_to_quote {
+                    if treat_as_position {
+                        warn!(
+                            symbol = %pair.symbol,
+                            position = %current_position,
+                            vol_bps = %vol_bps,
+                            threshold_bps = %self.parsed.risk.max_volatility_bps_to_quote,
+                            "volatility circuit breaker tripped while holding position; switching to unwind-only quoting"
+                        );
+                        unwind_only = true;
+                    } else {
+                        warn!(
+                            symbol = %pair.symbol,
+                            vol_bps = %vol_bps,
+                            threshold_bps = %self.parsed.risk.max_volatility_bps_to_quote,
+                            "volatility circuit breaker tripped; skipping quotes"
+                        );
+                        self.persist_strategy_snapshot(build_strategy_snapshot(
+                            state,
+                            &pair.symbol,
+                            self.config.runtime.dry_run,
+                            "skip",
+                            Some("skip_high_vol"),
+                            None,
+                            current_position,
+                            position_price,
+                            has_position,
+                            false,
+                            stale_maker_unwind,
+                            false,
+                            degraded,
+                            state.market.symbols.get(&pair.symbol),
+                            Some(&factor_snapshot),
+                            Some(bid_lvl0_multiplier),
+                            Some(ask_lvl0_multiplier),
+                            0,
+                            &[],
+                        ))?;
+                        continue;
+                    }
+                }
+                if factor_snapshot.regime == MarketRegime::VolatileBalanced
+                    && factor_snapshot.regime_intensity > Decimal::new(2, 1)
+                {
+                    if treat_as_position {
+                        warn!(
+                            symbol = %pair.symbol,
+                            position = %current_position,
+                            regime_intensity = %factor_snapshot.regime_intensity,
+                            "volatile-balanced regime intensified while holding position; switching to unwind-only quoting"
+                        );
+                        unwind_only = true;
+                    } else {
+                        warn!(
+                            symbol = %pair.symbol,
+                            regime_intensity = %factor_snapshot.regime_intensity,
+                            "volatile-balanced regime intensity exceeded threshold; skipping quotes"
+                        );
+                        self.persist_strategy_snapshot(build_strategy_snapshot(
+                            state,
+                            &pair.symbol,
+                            self.config.runtime.dry_run,
+                            "skip",
+                            Some("skip_volatile_balanced"),
+                            None,
+                            current_position,
+                            position_price,
+                            has_position,
+                            false,
+                            stale_maker_unwind,
+                            false,
+                            degraded,
+                            state.market.symbols.get(&pair.symbol),
+                            Some(&factor_snapshot),
+                            Some(bid_lvl0_multiplier),
+                            Some(ask_lvl0_multiplier),
+                            0,
+                            &[],
+                        ))?;
+                        continue;
+                    }
+                }
+                if pos_ratio_abs > Decimal::new(15, 2) && vol_bps > Decimal::from(400u64) {
+                    warn!(
+                        symbol = %pair.symbol,
+                        position = %current_position,
+                        pos_ratio_abs = %pos_ratio_abs,
+                        vol_bps = %vol_bps,
+                        "inventory is large in a volatile market; forcing unwind-only quoting"
+                    );
+                    unwind_only = true;
+                }
+            }
+            // Flow spike pause: latch-based to prevent oscillation.
+            // Enter: 2 consecutive cycles above threshold.
+            // Exit: position cleared to zero (commitment released only when flat).
             let flow_spike_threshold = self.parsed.factors.flow_spike_pause_threshold;
             if flow_spike_threshold > Decimal::ZERO {
                 let spike_active = factor_snapshot.flow_direction.abs() > flow_spike_threshold
@@ -2535,26 +2734,74 @@ where
             );
             let generated_quote_count = quotes.len();
             let drift_bps = market.and_then(|market| market.mid_drift_bps(Duration::from_secs(5)));
+            let drift_30s_bps = quote_factor_snapshot.mid_drift_30s_bps;
+            let effective_strategy_mode = effective_strategy_mode(
+                parsed_pair.strategy_mode,
+                current_position,
+                parsed_pair.flat_dust_threshold,
+                factor_snapshot.vpin,
+                factor_snapshot.ofi_30s,
+                self.parsed.factors.asymmetric_vpin_gate,
+            );
             let gate = {
                 let sniper_state = sniper_states.entry(pair.symbol.clone()).or_default();
-                evaluate_gate(
-                    parsed_pair.strategy_mode,
+                let gate_now = Instant::now().into();
+                let drift_skip_window = Duration::from_secs(5);
+                let drift_skip_threshold_bps = Decimal::from(15u64);
+                if let Some(drift_30s_bps) = drift_30s_bps {
+                    if drift_30s_bps < -drift_skip_threshold_bps {
+                        sniper_state.drift_skip_bid_until = Some(gate_now + drift_skip_window);
+                    } else if drift_30s_bps > drift_skip_threshold_bps {
+                        sniper_state.drift_skip_ask_until = Some(gate_now + drift_skip_window);
+                    }
+                }
+                let mut gate = evaluate_gate(
+                    effective_strategy_mode,
                     current_position,
                     parsed_pair.flat_dust_threshold,
+                    parsed_pair.position_emergency_ratio,
+                    parsed_pair.max_position_base,
                     SniperConfig {
                         drift_threshold_bps: parsed_pair.sniper_drift_threshold_bps,
                         window: Duration::from_secs(parsed_pair.sniper_window_secs),
                     },
                     drift_bps,
                     sniper_state,
-                    Instant::now().into(),
-                )
+                    gate_now,
+                );
+                if sniper_state
+                    .drift_skip_bid_until
+                    .map(|until| until > gate_now)
+                    .unwrap_or(false)
+                {
+                    gate.bid_enabled = false;
+                }
+                if sniper_state
+                    .drift_skip_ask_until
+                    .map(|until| until > gate_now)
+                    .unwrap_or(false)
+                {
+                    gate.ask_enabled = false;
+                }
+                gate
             };
+            let (bid_size_mult, ask_size_mult) = size_skew_mode_multipliers(
+                effective_strategy_mode,
+                current_position,
+                parsed_pair.max_position_base,
+            );
             let quotes: Vec<_> = quotes
                 .into_iter()
                 .filter(|quote| match quote.side {
                     Side::Bid => gate.bid_enabled,
                     Side::Ask => gate.ask_enabled,
+                })
+                .map(|mut quote| {
+                    quote.quantity *= match quote.side {
+                        Side::Bid => bid_size_mult,
+                        Side::Ask => ask_size_mult,
+                    };
+                    quote
                 })
                 .collect();
 
@@ -3620,6 +3867,54 @@ fn adverse_bbo_requote_threshold_bps(
     adverse_bbo_gap_threshold_bps(own_inside_spread_bps(current_orders, state, symbol))
 }
 
+fn cancel_on_trade_against_book_order_ids(state: &BotState, event: &MarketEvent) -> Vec<String> {
+    let MarketEvent::Trade {
+        symbol,
+        price,
+        taker_side,
+        ..
+    } = event
+    else {
+        return Vec::new();
+    };
+    let Some(taker_side) = taker_side else {
+        return Vec::new();
+    };
+    let Some(market) = state.market.symbols.get(symbol) else {
+        return Vec::new();
+    };
+
+    let adverse_side = match taker_side {
+        Side::Ask
+            if market
+                .best_bid
+                .map(|best_bid| *price < best_bid)
+                .unwrap_or(false) =>
+        {
+            Some(Side::Bid)
+        }
+        Side::Bid
+            if market
+                .best_ask
+                .map(|best_ask| *price > best_ask)
+                .unwrap_or(false) =>
+        {
+            Some(Side::Ask)
+        }
+        _ => None,
+    };
+    let Some(adverse_side) = adverse_side else {
+        return Vec::new();
+    };
+
+    state
+        .open_orders
+        .values()
+        .filter(|order| order.symbol == *symbol && order.side == adverse_side)
+        .filter_map(|order| order.order_id.clone())
+        .collect()
+}
+
 fn should_cancel_on_adverse_bbo_move(
     current_orders: &HashMap<String, crate::domain::OpenOrder>,
     state: &BotState,
@@ -4538,6 +4833,75 @@ fn market_event_source(event: &MarketEvent) -> &'static str {
     }
 }
 
+fn size_skew_mode_multipliers(
+    mode: StrategyMode,
+    current_position: Decimal,
+    max_position_base: Decimal,
+) -> (Decimal, Decimal) {
+    if mode != StrategyMode::SizeSkew || max_position_base <= Decimal::ZERO {
+        return (Decimal::ONE, Decimal::ONE);
+    }
+
+    let inv_skew = current_position / max_position_base;
+    let min_mult = Decimal::new(1, 1);
+    let max_mult = Decimal::from(2u64);
+    let bid_size_mult = (Decimal::ONE - inv_skew).clamp(min_mult, max_mult);
+    let ask_size_mult = (Decimal::ONE + inv_skew).clamp(min_mult, max_mult);
+    (bid_size_mult, ask_size_mult)
+}
+
+fn volatility_bps(raw_volatility: Decimal) -> Decimal {
+    raw_volatility * Decimal::from(10_000u64)
+}
+
+fn danger_composite_score(
+    vol_bps: Decimal,
+    regime: MarketRegime,
+    pos_ratio_abs: Decimal,
+    vpin: Decimal,
+    max_volatility_bps_to_quote: Decimal,
+) -> u8 {
+    let mut score = 0;
+    if vol_bps > max_volatility_bps_to_quote {
+        score += 2;
+    }
+    if regime == MarketRegime::VolatileBalanced {
+        score += 1;
+    }
+    if pos_ratio_abs > Decimal::new(50, 2) {
+        score += 1;
+    }
+    if vpin > Decimal::new(35, 2) && vpin < Decimal::new(55, 2) {
+        score += 1;
+    }
+    score
+}
+
+fn effective_strategy_mode(
+    configured_mode: StrategyMode,
+    current_position: Decimal,
+    dust_threshold: Decimal,
+    vpin: Decimal,
+    ofi_30s: Decimal,
+    asymmetric_vpin_gate: Decimal,
+) -> StrategyMode {
+    if configured_mode != StrategyMode::Asymmetric {
+        return configured_mode;
+    }
+
+    if current_position.abs() <= dust_threshold || vpin < asymmetric_vpin_gate {
+        return StrategyMode::SizeSkew;
+    }
+
+    if (current_position > Decimal::ZERO && ofi_30s < Decimal::ZERO)
+        || (current_position < Decimal::ZERO && ofi_30s > Decimal::ZERO)
+    {
+        StrategyMode::Asymmetric
+    } else {
+        StrategyMode::SizeSkew
+    }
+}
+
 fn top_of_book_json(
     book: &std::collections::BTreeMap<Decimal, Decimal>,
     descending: bool,
@@ -4653,3 +5017,100 @@ fn symbol_tracks_hyperliquid(config: &AppConfig, symbol: &str) -> bool {
 }
 
 fn log_dry_run_orders(_desired: &[OrderRequest]) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{MarketRegime, OpenOrder, Side};
+
+    #[test]
+    fn asymmetric_mode_only_stays_one_sided_under_high_vpin_and_aligned_ofi() {
+        let gated = effective_strategy_mode(
+            StrategyMode::Asymmetric,
+            Decimal::ONE,
+            Decimal::new(1, 3),
+            Decimal::new(8, 1),
+            -Decimal::new(6, 1),
+            Decimal::new(7, 1),
+        );
+        assert_eq!(gated, StrategyMode::Asymmetric);
+
+        let fallback = effective_strategy_mode(
+            StrategyMode::Asymmetric,
+            Decimal::ONE,
+            Decimal::new(1, 3),
+            Decimal::new(5, 1),
+            -Decimal::new(6, 1),
+            Decimal::new(7, 1),
+        );
+        assert_eq!(fallback, StrategyMode::SizeSkew);
+    }
+
+    #[test]
+    fn cancel_on_trade_against_book_targets_the_adverse_side() {
+        let mut state = BotState::new(Decimal::ZERO, 10, 5);
+        let symbol_state = state.market.symbols.entry("HYPE".to_string()).or_default();
+        symbol_state.best_bid = Some(Decimal::from(100u64));
+        symbol_state.best_ask = Some(Decimal::from(101u64));
+        symbol_state.last_bid_update_at = Some(Instant::now());
+        symbol_state.last_ask_update_at = Some(Instant::now());
+
+        state.open_orders.insert(
+            "bid-1".to_string(),
+            OpenOrder {
+                order_id: Some("bid-1".to_string()),
+                symbol: "HYPE".to_string(),
+                side: Side::Bid,
+                ..OpenOrder::default()
+            },
+        );
+        state.open_orders.insert(
+            "ask-1".to_string(),
+            OpenOrder {
+                order_id: Some("ask-1".to_string()),
+                symbol: "HYPE".to_string(),
+                side: Side::Ask,
+                ..OpenOrder::default()
+            },
+        );
+
+        let cancel_ids = cancel_on_trade_against_book_order_ids(
+            &state,
+            &MarketEvent::Trade {
+                symbol: "HYPE".to_string(),
+                price: Decimal::from(99u64),
+                quantity: Decimal::ONE,
+                taker_side: Some(Side::Ask),
+                timestamp: Utc::now(),
+            },
+        );
+
+        assert_eq!(cancel_ids, vec!["bid-1".to_string()]);
+    }
+
+    #[test]
+    fn danger_composite_score_trips_on_compound_loss_signals() {
+        let score = danger_composite_score(
+            Decimal::from(650u64),
+            MarketRegime::VolatileBalanced,
+            Decimal::new(55, 2),
+            Decimal::new(4, 1),
+            Decimal::from(600u64),
+        );
+
+        assert_eq!(score, 5);
+    }
+
+    #[test]
+    fn danger_composite_score_stays_low_for_isolated_signal() {
+        let score = danger_composite_score(
+            Decimal::from(350u64),
+            MarketRegime::Quiet,
+            Decimal::new(10, 2),
+            Decimal::new(2, 1),
+            Decimal::from(600u64),
+        );
+
+        assert_eq!(score, 0);
+    }
+}

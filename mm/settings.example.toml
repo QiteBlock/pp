@@ -1,0 +1,157 @@
+[venue]
+kind = "hibachi"
+api_base_url = "https://api.hibachi.xyz"
+data_api_base_url = "https://data-api.hibachi.xyz"
+ws_market_url = "wss://data-api.hibachi.xyz/ws/market"
+ws_account_url = "wss://api.hibachi.xyz/ws/account"
+account_id = 140
+api_key = "REPLACE_ME"
+private_key = "REPLACE_ME"
+auth_mode = "exchange_managed"
+user_agent = "market-making-bot/0.1.0"
+maker_fee_ratio = "0"
+max_fee_rate = "0.0005"
+creation_deadline_ms = 15000
+price_multiplier = "4294967296"
+grvt_auth_base_url = "https://edge.grvt.io"
+grvt_market_data_base_url = "https://market-data.grvt.io"
+grvt_trading_base_url = "https://trades.grvt.io"
+grvt_market_ws_url = "wss://market-data.grvt.io/ws/full"
+grvt_trading_ws_url = "wss://trades.grvt.io/ws/full"
+grvt_account_id = ""
+grvt_sub_account_id = ""
+grvt_private_key = ""
+grvt_chain_id = "325"
+grvt_builder_id = ""
+grvt_builder_fee = "0"
+
+[runtime]
+dry_run = true
+restore_dry_run_state = true
+reconcile_interval_ms = 1500
+generation_min_interval_ms = 1500
+stale_market_data_ms = 5000
+websocket_send_timeout_ms = 5000
+max_orderbook_depth = 100
+
+[network]
+private_rest_min_interval_ms = 200
+retry_max_attempts = 4
+retry_initial_backoff_ms = 250
+retry_max_backoff_ms = 2000
+websocket_reconnect_backoff_ms = 1000
+
+[model]
+born_inf_bps = "3"
+born_sup_bps = "12"
+overnight_born_inf_bps = "3"
+overnight_start_hour_utc = 0
+overnight_end_hour_utc = 6
+v0 = "2.0"
+mu = "0.5"
+sigma = "2.7"
+n_points = 1
+min_step_price = "0.001"
+min_step_volume = "0.01"
+min_trade_amount = "5"
+position_size_skew_weight = "0.6"
+position_spread_multiplier = "2.0"
+position_dead_zone = "0.001"
+price_sensitivity_threshold = "0.005"
+price_sensitivity_scaling_factor = "0.75"
+volume_sensitivity_threshold = "0.10"
+volatility_cut_threshold = "0.015"
+index_forward_buffer_bps = "1"
+max_spread_bps = "15"
+prevent_spread_crossing = true
+cancel_orders_crossing_mid = true
+as_gamma = "0.1"
+as_kappa = "3000.0"
+as_time_horizon = "0.5"
+inventory_lean_bps = "12.0"
+as_vol_cap = "0.002"
+online_kappa = "true"
+kappa_min_cycles = "200"
+fill_rate_window_secs = "300"
+fill_rate_skew_threshold = "3.0"
+fill_rate_competitive_bps = "2.0"
+funding_lean_weight = "0"
+post_fill_widen_secs = "15"
+post_fill_widen_multiplier = "1.4"
+vpin_widen_multiplier = "1.3"
+
+[risk]
+max_abs_position_usd = "500"
+max_symbol_position_usd = "500"
+max_drawdown_usd = "30"
+max_open_orders = 20
+emergency_widening_bps = "5"
+circuit_breaker_cooldown_ms = 2000
+emergency_skew_start = "0.65"
+emergency_skew_max = "1.50"
+max_correlated_position_usd = "500"
+emergency_unwind_threshold = "0.8"
+emergency_unwind_cycles = 5
+stale_position_timeout_secs = 600
+stale_position_bid_hold_secs = 300
+stale_position_ask_hold_secs = 60
+stale_position_close_slippage_cap_bps = "50"
+stale_position_close_chunk_base = "50"
+
+[factors]
+volume_window_secs = 30
+n_trade_window_secs = 30
+n_trade_quote_threshold = 0
+volatility_ewma_alpha = "0.2"
+volatility_spread_weight = "25"
+inventory_skew_weight = "2.0"
+volume_size_weight = "0.01"
+flow_imbalance_weight = "0.15"
+trade_velocity_alpha = "0.35"
+trade_velocity_burst_threshold = "2"
+bbo_spread_vol_weight = "0.1"
+inventory_risk_constant = "300"
+inventory_skew_convexity = "1.0"
+regime_min_dwell_secs = 10
+cross_symbol_vol_weight = "0.0"
+volatility_floor = "0.0005"
+ob_imbalance_weight = "2.0"
+ob_imbalance_depth = 10
+bbo_spread_cap_bps = "20"
+flow_spike_pause_threshold = "0.97"
+toxic_regime_block_new_positions_secs = 420
+toxic_regime_block_new_positions_intensity = "0.7"
+regime_intensity_alpha = "0.2"
+microprice_weight = "1.0"
+cex_reference_lean_weight = "0"
+vpin_bucket_size = "0"
+vpin_n_buckets = 20
+vpin_widen_threshold = "0"
+
+[storage]
+enabled = true
+db_path = "data/fills-live-test.db"
+
+[hedging]
+hyperliquid_taker_fee_rate = "0.000432"
+
+[[pairs]]
+symbol = "HYPE/USDT-P"
+enabled = true
+max_position_base = "10"
+unwind_only_enter_ratio = "0.75"
+unwind_only_exit_ratio = "0.60"
+price_source = "mid"
+post_only = true
+service_on = true
+side_filter = "both"
+hyperliquid_symbol = "HYPE"
+binance_symbol = "hypeusdt"
+ioc_trigger_ratio = "0.5"
+strategy_mode = "size_skew"
+flat_dust_threshold = "0.5"
+
+[telegram]
+enabled = false
+bot_token = "REPLACE_ME"
+chat_id = "REPLACE_ME"

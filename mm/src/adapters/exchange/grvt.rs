@@ -29,7 +29,7 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{client::IntoClientRequest, Message as WsMessage},
 };
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::{
     adapters::{
@@ -731,13 +731,14 @@ impl GrvtClient {
             self.config.grvt_chain_id.parse::<u64>().unwrap_or(325),
         )?;
         let signer = format!("{:#x}", wallet.address());
+        let wire_time_in_force = match request.time_in_force {
+            TimeInForce::GoodTillTime => "GOOD_TILL_TIME",
+            TimeInForce::ImmediateOrCancel => "IMMEDIATE_OR_CANCEL",
+        };
         let mut order = json!({
             "sub_account_id": self.config.grvt_sub_account_id,
             "is_market": request.order_type == OrderType::Market,
-            "time_in_force": match request.time_in_force {
-                TimeInForce::GoodTillTime => "GOOD_TILL_TIME",
-                TimeInForce::ImmediateOrCancel => "IMMEDIATE_OR_CANCEL",
-            },
+            "time_in_force": wire_time_in_force,
             "post_only": request.post_only,
             "reduce_only": false,
             "legs": [{
@@ -773,6 +774,21 @@ impl GrvtClient {
             order["builder"] = Value::String(self.config.grvt_builder_id.clone());
             order["builder_fee"] = Value::String(self.config.grvt_builder_fee.clone());
         }
+
+        info!(
+            venue = "grvt",
+            symbol = %request.symbol,
+            side = ?request.side,
+            level_index = request.level_index,
+            order_type = ?request.order_type,
+            requested_time_in_force = ?request.time_in_force,
+            wire_time_in_force = wire_time_in_force,
+            requested_post_only = request.post_only,
+            wire_post_only = request.post_only,
+            quantity = %normalized_request.quantity,
+            price = ?normalized_request.price,
+            "placing order with adapter flags"
+        );
 
         Ok(order)
     }

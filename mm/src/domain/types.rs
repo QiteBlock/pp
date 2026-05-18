@@ -211,6 +211,7 @@ pub enum PrivateEvent {
 
 #[derive(Clone, Debug)]
 pub struct FactorSnapshot {
+    pub raw_mid: Decimal,
     pub price_index: Decimal,
     pub raw_volatility: Decimal,
     pub volatility: Decimal,
@@ -240,6 +241,9 @@ pub struct FactorSnapshot {
     /// Signed fill-rate skew [-1, 1]: positive = bid fills faster, negative = ask fills faster.
     /// Derived from a rolling window of bid vs ask fill counts.
     pub fill_rate_skew: Decimal,
+    /// Signed 30-second order-flow imbalance [-1, 1]: positive = buyer aggression,
+    /// negative = seller aggression.
+    pub ofi_30s: Decimal,
     /// VPIN ∈ [0, 1]: high values indicate informed trading / adverse selection risk.
     pub vpin: Decimal,
     /// Funding-rate lean in bps: positive shifts reservation ask-ward (collect long funding),
@@ -262,6 +266,7 @@ pub struct FactorSnapshot {
 impl Default for FactorSnapshot {
     fn default() -> Self {
         Self {
+            raw_mid: Decimal::ZERO,
             price_index: Decimal::ZERO,
             raw_volatility: Decimal::ZERO,
             volatility: Decimal::ZERO,
@@ -277,6 +282,7 @@ impl Default for FactorSnapshot {
             microprice: Decimal::ZERO,
             mid_drift_30s_bps: None,
             fill_rate_skew: Decimal::ZERO,
+            ofi_30s: Decimal::ZERO,
             vpin: Decimal::ZERO,
             funding_lean: Decimal::ZERO,
             kappa_estimate: None,

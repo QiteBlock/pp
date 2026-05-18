@@ -11,6 +11,7 @@ pub enum StrategyMode {
     #[default]
     Mm,
     Asymmetric,
+    SizeSkew,
     Sniper,
 }
 
@@ -21,6 +22,7 @@ impl FromStr for StrategyMode {
         match raw.trim().to_ascii_lowercase().as_str() {
             "mm" => Ok(Self::Mm),
             "asymmetric" => Ok(Self::Asymmetric),
+            "size_skew" => Ok(Self::SizeSkew),
             "sniper" => Ok(Self::Sniper),
             other => bail!("unsupported strategy_mode: {other}"),
         }
@@ -37,14 +39,18 @@ pub struct SniperConfig {
 pub struct SniperState {
     pub snipe_bid_until: Option<Instant>,
     pub snipe_ask_until: Option<Instant>,
+    pub drift_skip_bid_until: Option<Instant>,
+    pub drift_skip_ask_until: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GateReason {
+    EmergencyTwoSided,
     MmTwoSided,
     AsymmetricFlatTwoSided,
     AsymmetricLongAskOnly,
     AsymmetricShortBidOnly,
+    SizeSkewTwoSided,
     SniperIdle,
     SniperBidWindow,
     SniperAskWindow,
@@ -58,10 +64,12 @@ pub enum GateReason {
 impl GateReason {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::EmergencyTwoSided => "emergency_two_sided",
             Self::MmTwoSided => "mm_two_sided",
             Self::AsymmetricFlatTwoSided => "asymmetric_flat_two_sided",
             Self::AsymmetricLongAskOnly => "asymmetric_long_ask_only",
             Self::AsymmetricShortBidOnly => "asymmetric_short_bid_only",
+            Self::SizeSkewTwoSided => "size_skew_two_sided",
             Self::SniperIdle => "sniper_idle",
             Self::SniperBidWindow => "sniper_bid_window",
             Self::SniperAskWindow => "sniper_ask_window",
@@ -85,16 +93,31 @@ pub fn evaluate_gate(
     mode: StrategyMode,
     position: Decimal,
     dust_threshold: Decimal,
+    emergency_ratio: Decimal,
+    max_position_base: Decimal,
     sniper: SniperConfig,
     drift_bps: Option<Decimal>,
     sniper_state: &mut SniperState,
     now: Instant,
 ) -> QuoteGate {
+    if max_position_base > Decimal::ZERO && position.abs() >= max_position_base * emergency_ratio {
+        return QuoteGate {
+            bid_enabled: true,
+            ask_enabled: true,
+            reason: GateReason::EmergencyTwoSided,
+        };
+    }
+
     match mode {
         StrategyMode::Mm => QuoteGate {
             bid_enabled: true,
             ask_enabled: true,
             reason: GateReason::MmTwoSided,
+        },
+        StrategyMode::SizeSkew => QuoteGate {
+            bid_enabled: true,
+            ask_enabled: true,
+            reason: GateReason::SizeSkewTwoSided,
         },
         StrategyMode::Asymmetric => {
             if position.abs() <= dust_threshold {
@@ -176,6 +199,8 @@ mod tests {
             StrategyMode::Mm,
             Decimal::ZERO,
             Decimal::ZERO,
+            Decimal::new(85, 2),
+            Decimal::ONE,
             SniperConfig {
                 drift_threshold_bps: Decimal::from(10u64),
                 window: Duration::from_secs(5),
@@ -197,6 +222,8 @@ mod tests {
             StrategyMode::Asymmetric,
             Decimal::ONE,
             Decimal::new(1, 3),
+            Decimal::new(85, 2),
+            Decimal::from(10u64),
             SniperConfig {
                 drift_threshold_bps: Decimal::from(10u64),
                 window: Duration::from_secs(5),
@@ -213,6 +240,8 @@ mod tests {
             StrategyMode::Asymmetric,
             -Decimal::ONE,
             Decimal::new(1, 3),
+            Decimal::new(85, 2),
+            Decimal::from(10u64),
             SniperConfig {
                 drift_threshold_bps: Decimal::from(10u64),
                 window: Duration::from_secs(5),
@@ -227,6 +256,29 @@ mod tests {
     }
 
     #[test]
+    fn size_skew_mode_keeps_both_sides_enabled() {
+        let now = Instant::now();
+        let mut sniper_state = SniperState::default();
+        let gate = evaluate_gate(
+            StrategyMode::SizeSkew,
+            Decimal::ONE,
+            Decimal::new(1, 3),
+            Decimal::new(85, 2),
+            Decimal::from(10u64),
+            SniperConfig {
+                drift_threshold_bps: Decimal::from(10u64),
+                window: Duration::from_secs(5),
+            },
+            None,
+            &mut sniper_state,
+            now,
+        );
+        assert!(gate.bid_enabled);
+        assert!(gate.ask_enabled);
+        assert_eq!(gate.reason, GateReason::SizeSkewTwoSided);
+    }
+
+    #[test]
     fn sniper_mode_opens_bid_window_on_negative_drift() {
         let now = Instant::now();
         let mut sniper_state = SniperState::default();
@@ -234,6 +286,8 @@ mod tests {
             StrategyMode::Sniper,
             Decimal::ZERO,
             Decimal::ZERO,
+            Decimal::new(85, 2),
+            Decimal::ONE,
             SniperConfig {
                 drift_threshold_bps: Decimal::from(10u64),
                 window: Duration::from_secs(5),
@@ -255,6 +309,8 @@ mod tests {
             StrategyMode::Sniper,
             Decimal::ONE,
             Decimal::new(1, 3),
+            Decimal::new(85, 2),
+            Decimal::from(10u64),
             SniperConfig {
                 drift_threshold_bps: Decimal::from(10u64),
                 window: Duration::from_secs(5),
@@ -266,5 +322,28 @@ mod tests {
         assert!(!gate.bid_enabled);
         assert!(gate.ask_enabled);
         assert_eq!(gate.reason, GateReason::SniperLongUnwindOnly);
+    }
+
+    #[test]
+    fn emergency_override_enables_both_sides_regardless_of_mode() {
+        let now = Instant::now();
+        let mut sniper_state = SniperState::default();
+        let gate = evaluate_gate(
+            StrategyMode::Asymmetric,
+            Decimal::new(9, 1),
+            Decimal::new(1, 3),
+            Decimal::new(85, 2),
+            Decimal::ONE,
+            SniperConfig {
+                drift_threshold_bps: Decimal::from(10u64),
+                window: Duration::from_secs(5),
+            },
+            None,
+            &mut sniper_state,
+            now,
+        );
+        assert!(gate.bid_enabled);
+        assert!(gate.ask_enabled);
+        assert_eq!(gate.reason, GateReason::EmergencyTwoSided);
     }
 }

@@ -113,16 +113,21 @@ pub fn generate_quotes(
 
     // A-S reservation price: mid shifted by A-S term + inventory lean + ob_imbalance lean
     // + funding lean (positive = lean ask, i.e. subtract from mid).
-    let mid = factors.price_index;
+    let microprice_lean = factors.microprice - factors.raw_mid;
+    let fair_value = factors.price_index + microprice_lean * parsed.model.microprice_blend;
+    let mid = fair_value;
     let inventory_lean_frac = factors.inventory_lean_bps / Decimal::from(10_000u64);
     let ob_weight = parsed.factors.ob_imbalance_weight;
     // ob_imbalance_lean: at full imbalance (±1) and weight=1, shifts mid by ±ob_weight bps.
     let ob_lean_frac = factors.ob_imbalance * ob_weight / Decimal::from(10_000u64);
+    let ofi_lean_frac =
+        factors.ofi_30s * parsed.factors.ofi_alpha_weight / Decimal::from(10_000u64);
     // Funding lean: positive funding_lean shifts reservation down (lean short = offer more).
     let funding_lean_frac = factors.funding_lean / Decimal::from(10_000u64);
     let as_reservation_price = mid
         * (Decimal::ONE - pos_ratio * gamma_sigma2_t - pos_ratio * inventory_lean_frac
             + ob_lean_frac
+            + ofi_lean_frac
             - funding_lean_frac);
 
     // S6: volume_imbalance is purely a size scalar (>= 0).
@@ -243,11 +248,6 @@ pub fn generate_quotes(
     let max_skew = Decimal::new(3, 0);
     let bid_size_skew = (Decimal::ONE - size_skew).clamp(Decimal::new(2, 1), max_skew);
     let ask_size_skew = (Decimal::ONE + size_skew).clamp(Decimal::new(2, 1), max_skew);
-    let skip_bids_for_down_drift = factors
-        .mid_drift_30s_bps
-        .map(|drift_bps| drift_bps < -Decimal::from(8u64))
-        .unwrap_or(false);
-
     let mut quotes = Vec::with_capacity(model.n_points * 2);
     let side_notional_cap = max_quote_notional.map(|cap| cap * Decimal::from(2u64));
     let mut bid_running_total_notional = Decimal::ZERO;
@@ -330,9 +330,7 @@ pub fn generate_quotes(
             }
         }
 
-        if !skip_bids_for_down_drift
-            && matches!(pair.side_filter, SideFilter::Both | SideFilter::BidOnly)
-        {
+        if matches!(pair.side_filter, SideFilter::Both | SideFilter::BidOnly) {
             bid_running_total_notional += bid_size * bid_price;
             quotes.push(QuoteIntent {
                 symbol: pair.symbol.clone(),

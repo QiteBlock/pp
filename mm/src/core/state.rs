@@ -17,6 +17,7 @@ const MAX_FILL_HISTORY: usize = 10_000;
 /// Fills are processed first (they arrive before position snapshots); the settle
 /// window prevents a stale position snapshot from overwriting the fill-derived qty.
 const POSITION_SETTLE_AFTER_RECONNECT: Duration = Duration::from_secs(5);
+const DEFAULT_BBO_STALE_AFTER: Duration = Duration::from_secs(5);
 
 pub struct BotState {
     pub market: MarketState,
@@ -35,9 +36,9 @@ pub struct BotState {
 }
 
 impl BotState {
-    pub fn new(maker_fee_rate: Decimal, max_orderbook_depth: usize) -> Self {
+    pub fn new(maker_fee_rate: Decimal, max_orderbook_depth: usize, bbo_stale_secs: u64) -> Self {
         Self {
-            market: MarketState::new(max_orderbook_depth),
+            market: MarketState::new(max_orderbook_depth, bbo_stale_secs),
             open_orders: HashMap::new(),
             dry_run_orders: HashMap::new(),
             positions: HashMap::new(),
@@ -400,16 +401,25 @@ pub struct MarketState {
     pub last_updated: Option<DateTime<Utc>>,
     pub last_updated_at: Option<Instant>,
     max_orderbook_depth: usize,
+    bbo_stale_after: Duration,
 }
 
 impl MarketState {
-    pub fn new(max_orderbook_depth: usize) -> Self {
+    pub fn new(max_orderbook_depth: usize, bbo_stale_secs: u64) -> Self {
         Self {
             symbols: HashMap::new(),
             last_updated: None,
             last_updated_at: None,
             max_orderbook_depth,
+            bbo_stale_after: Duration::from_secs(bbo_stale_secs),
         }
+    }
+
+    fn symbol_state_mut(&mut self, symbol: String) -> &mut SymbolMarketState {
+        let bbo_stale_after = self.bbo_stale_after;
+        self.symbols
+            .entry(symbol)
+            .or_insert_with(|| SymbolMarketState::new(bbo_stale_after))
     }
 
     pub fn apply(&mut self, event: MarketEvent) {
@@ -421,6 +431,8 @@ impl MarketState {
                         symbol_state.best_ask = None;
                         symbol_state.bbo_bid_size = None;
                         symbol_state.bbo_ask_size = None;
+                        symbol_state.last_bid_update_at = None;
+                        symbol_state.last_ask_update_at = None;
                         symbol_state.mark_price = None;
                         symbol_state.spot_price = None;
                         symbol_state.last_trade_price = None;
@@ -440,7 +452,7 @@ impl MarketState {
                 price,
                 timestamp,
             } => {
-                let symbol_state = self.symbols.entry(symbol).or_default();
+                let symbol_state = self.symbol_state_mut(symbol);
                 symbol_state.prev_mid = symbol_state.mid_price();
                 symbol_state.mark_price = Some(price);
                 symbol_state.last_updated = Some(timestamp);
@@ -453,7 +465,7 @@ impl MarketState {
                 price,
                 timestamp,
             } => {
-                let symbol_state = self.symbols.entry(symbol).or_default();
+                let symbol_state = self.symbol_state_mut(symbol);
                 symbol_state.spot_price = Some(price);
                 symbol_state.last_updated = Some(timestamp);
                 symbol_state.last_updated_at = Some(Instant::now());
@@ -468,22 +480,24 @@ impl MarketState {
                 ask_size,
                 timestamp,
             } => {
-                let symbol_state = self.symbols.entry(symbol.clone()).or_default();
+                let now = Instant::now();
+                let symbol_state = self.symbol_state_mut(symbol.clone());
                 if bid > Decimal::ZERO && ask > Decimal::ZERO && bid <= ask {
-                    symbol_state.prev_mid = symbol_state.mid_price();
-                    symbol_state.best_bid = Some(bid);
-                    symbol_state.best_ask = Some(ask);
-                    if bid_size.is_some() {
-                        symbol_state.bbo_bid_size = bid_size;
-                    }
-                    if ask_size.is_some() {
-                        symbol_state.bbo_ask_size = ask_size;
-                    }
+                    let next_bid_size = bid_size.or(symbol_state.bbo_bid_size);
+                    let next_ask_size = ask_size.or(symbol_state.bbo_ask_size);
+                    apply_bbo_update(
+                        symbol_state,
+                        Some(bid),
+                        Some(ask),
+                        next_bid_size,
+                        next_ask_size,
+                        now,
+                    );
                     symbol_state.last_updated = Some(timestamp);
-                    symbol_state.last_updated_at = Some(Instant::now());
-                    symbol_state.last_bbo_update_at = Some(Instant::now());
+                    symbol_state.last_updated_at = Some(now);
+                    symbol_state.last_bbo_update_at = Some(now);
                     self.last_updated = Some(timestamp);
-                    self.last_updated_at = Some(Instant::now());
+                    self.last_updated_at = Some(now);
                 } else {
                     warn!(
                         symbol = %symbol,
@@ -498,7 +512,7 @@ impl MarketState {
                 rate,
                 timestamp: _,
             } => {
-                let symbol_state = self.symbols.entry(symbol).or_default();
+                let symbol_state = self.symbol_state_mut(symbol);
                 symbol_state.funding_rate = Some(rate);
             }
             MarketEvent::Trade {
@@ -508,7 +522,7 @@ impl MarketState {
                 timestamp,
                 taker_side,
             } => {
-                let symbol_state = self.symbols.entry(symbol).or_default();
+                let symbol_state = self.symbol_state_mut(symbol);
                 symbol_state.last_trade_price = Some(price);
                 symbol_state.last_trade_quantity = Some(quantity);
                 symbol_state.recent_trades.push_back(RecentTrade {
@@ -531,31 +545,37 @@ impl MarketState {
                 asks,
                 timestamp,
             } => {
-                let symbol_state = self.symbols.entry(symbol).or_default();
+                let max_orderbook_depth = self.max_orderbook_depth;
+                let now = Instant::now();
+                let symbol_state = self.symbol_state_mut(symbol);
                 symbol_state.bids = bids;
                 symbol_state.asks = asks;
-                prune_book_depth(&mut symbol_state.bids, self.max_orderbook_depth, true);
-                prune_book_depth(&mut symbol_state.asks, self.max_orderbook_depth, false);
+                prune_book_depth(&mut symbol_state.bids, max_orderbook_depth, true);
+                prune_book_depth(&mut symbol_state.asks, max_orderbook_depth, false);
                 prune_crossed_levels(&mut symbol_state.bids, &mut symbol_state.asks);
-                if let Some((best_bid, bid_qty)) = symbol_state.bids.iter().next_back() {
-                    symbol_state.best_bid = Some(*best_bid);
-                    symbol_state.bbo_bid_size = Some(*bid_qty);
-                } else {
-                    symbol_state.best_bid = None;
-                    symbol_state.bbo_bid_size = None;
-                }
-                if let Some((best_ask, ask_qty)) = symbol_state.asks.iter().next() {
-                    symbol_state.best_ask = Some(*best_ask);
-                    symbol_state.bbo_ask_size = Some(*ask_qty);
-                } else {
-                    symbol_state.best_ask = None;
-                    symbol_state.bbo_ask_size = None;
-                }
+                let next_bid = symbol_state
+                    .bids
+                    .iter()
+                    .next_back()
+                    .map(|(best_bid, bid_qty)| (*best_bid, *bid_qty));
+                let next_ask = symbol_state
+                    .asks
+                    .iter()
+                    .next()
+                    .map(|(best_ask, ask_qty)| (*best_ask, *ask_qty));
+                apply_bbo_update(
+                    symbol_state,
+                    next_bid.map(|(price, _)| price),
+                    next_ask.map(|(price, _)| price),
+                    next_bid.map(|(_, quantity)| quantity),
+                    next_ask.map(|(_, quantity)| quantity),
+                    now,
+                );
                 symbol_state.last_updated = Some(timestamp);
-                symbol_state.last_updated_at = Some(Instant::now());
-                symbol_state.last_bbo_update_at = Some(Instant::now());
+                symbol_state.last_updated_at = Some(now);
+                symbol_state.last_bbo_update_at = Some(now);
                 self.last_updated = Some(timestamp);
-                self.last_updated_at = Some(Instant::now());
+                self.last_updated_at = Some(now);
             }
             MarketEvent::OrderBookUpdate {
                 symbol,
@@ -563,7 +583,9 @@ impl MarketState {
                 asks,
                 timestamp,
             } => {
-                let symbol_state = self.symbols.entry(symbol).or_default();
+                let max_orderbook_depth = self.max_orderbook_depth;
+                let now = Instant::now();
+                let symbol_state = self.symbol_state_mut(symbol);
                 for (price, quantity) in bids {
                     if quantity.is_zero() {
                         symbol_state.bids.remove(&price);
@@ -578,28 +600,32 @@ impl MarketState {
                         symbol_state.asks.insert(price, quantity);
                     }
                 }
-                prune_book_depth(&mut symbol_state.bids, self.max_orderbook_depth, true);
-                prune_book_depth(&mut symbol_state.asks, self.max_orderbook_depth, false);
+                prune_book_depth(&mut symbol_state.bids, max_orderbook_depth, true);
+                prune_book_depth(&mut symbol_state.asks, max_orderbook_depth, false);
                 prune_crossed_levels(&mut symbol_state.bids, &mut symbol_state.asks);
-                if let Some((best_bid, bid_qty)) = symbol_state.bids.iter().next_back() {
-                    symbol_state.best_bid = Some(*best_bid);
-                    symbol_state.bbo_bid_size = Some(*bid_qty);
-                } else {
-                    symbol_state.best_bid = None;
-                    symbol_state.bbo_bid_size = None;
-                }
-                if let Some((best_ask, ask_qty)) = symbol_state.asks.iter().next() {
-                    symbol_state.best_ask = Some(*best_ask);
-                    symbol_state.bbo_ask_size = Some(*ask_qty);
-                } else {
-                    symbol_state.best_ask = None;
-                    symbol_state.bbo_ask_size = None;
-                }
+                let next_bid = symbol_state
+                    .bids
+                    .iter()
+                    .next_back()
+                    .map(|(best_bid, bid_qty)| (*best_bid, *bid_qty));
+                let next_ask = symbol_state
+                    .asks
+                    .iter()
+                    .next()
+                    .map(|(best_ask, ask_qty)| (*best_ask, *ask_qty));
+                apply_bbo_update(
+                    symbol_state,
+                    next_bid.map(|(price, _)| price),
+                    next_ask.map(|(price, _)| price),
+                    next_bid.map(|(_, quantity)| quantity),
+                    next_ask.map(|(_, quantity)| quantity),
+                    now,
+                );
                 symbol_state.last_updated = Some(timestamp);
-                symbol_state.last_updated_at = Some(Instant::now());
-                symbol_state.last_bbo_update_at = Some(Instant::now());
+                symbol_state.last_updated_at = Some(now);
+                symbol_state.last_bbo_update_at = Some(now);
                 self.last_updated = Some(timestamp);
-                self.last_updated_at = Some(Instant::now());
+                self.last_updated_at = Some(now);
             }
             MarketEvent::ExternalBestBidAsk {
                 symbol,
@@ -610,7 +636,7 @@ impl MarketState {
                 ask_size,
                 timestamp,
             } => {
-                let symbol_state = self.symbols.entry(symbol).or_default();
+                let symbol_state = self.symbol_state_mut(symbol);
                 symbol_state.external_quotes.insert(
                     venue,
                     ExternalQuoteState {
@@ -627,7 +653,6 @@ impl MarketState {
     }
 }
 
-#[derive(Default)]
 pub struct SymbolMarketState {
     pub mark_price: Option<Decimal>,
     pub spot_price: Option<Decimal>,
@@ -648,7 +673,16 @@ pub struct SymbolMarketState {
     pub last_updated: Option<DateTime<Utc>>,
     pub last_updated_at: Option<Instant>,
     pub last_bbo_update_at: Option<Instant>,
+    pub last_bid_update_at: Option<Instant>,
+    pub last_ask_update_at: Option<Instant>,
     pub external_quotes: HashMap<ExternalVenue, ExternalQuoteState>,
+    bbo_stale_after: Duration,
+}
+
+impl Default for SymbolMarketState {
+    fn default() -> Self {
+        Self::new(DEFAULT_BBO_STALE_AFTER)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -668,7 +702,40 @@ impl ExternalQuoteState {
 }
 
 impl SymbolMarketState {
+    pub fn new(bbo_stale_after: Duration) -> Self {
+        Self {
+            mark_price: None,
+            spot_price: None,
+            best_bid: None,
+            best_ask: None,
+            bbo_bid_size: None,
+            bbo_ask_size: None,
+            funding_rate: None,
+            last_trade_price: None,
+            last_trade_quantity: None,
+            bids: BTreeMap::new(),
+            asks: BTreeMap::new(),
+            prev_mid: None,
+            recent_trades: VecDeque::new(),
+            last_updated: None,
+            last_updated_at: None,
+            last_bbo_update_at: None,
+            last_bid_update_at: None,
+            last_ask_update_at: None,
+            external_quotes: HashMap::new(),
+            bbo_stale_after,
+        }
+    }
+
+    fn bbo_is_stale(&self) -> bool {
+        side_is_stale(self.last_bid_update_at, self.bbo_stale_after)
+            || side_is_stale(self.last_ask_update_at, self.bbo_stale_after)
+    }
+
     pub fn mid_price(&self) -> Option<Decimal> {
+        if self.bbo_is_stale() {
+            return None;
+        }
         match (self.best_bid, self.best_ask) {
             (Some(bid), Some(ask)) => Some((bid + ask) / Decimal::from(2u64)),
             _ => None,
@@ -679,6 +746,9 @@ impl SymbolMarketState {
     /// Formula: bid * (ask_size / total) + ask * (bid_size / total)
     /// Returns None when BBO prices or sizes are absent.
     pub fn microprice(&self) -> Option<Decimal> {
+        if self.bbo_is_stale() {
+            return None;
+        }
         let bid = self.best_bid?;
         let ask = self.best_ask?;
         let bid_size = self.bbo_bid_size?;
@@ -714,6 +784,37 @@ impl SymbolMarketState {
     }
 }
 
+fn apply_bbo_update(
+    symbol_state: &mut SymbolMarketState,
+    best_bid: Option<Decimal>,
+    best_ask: Option<Decimal>,
+    bid_size: Option<Decimal>,
+    ask_size: Option<Decimal>,
+    updated_at: Instant,
+) {
+    let bid_changed = symbol_state.best_bid != best_bid;
+    let ask_changed = symbol_state.best_ask != best_ask;
+    if bid_changed || ask_changed {
+        symbol_state.prev_mid = symbol_state.mid_price();
+    }
+    if bid_changed {
+        symbol_state.last_bid_update_at = Some(updated_at);
+    }
+    if ask_changed {
+        symbol_state.last_ask_update_at = Some(updated_at);
+    }
+    symbol_state.best_bid = best_bid;
+    symbol_state.best_ask = best_ask;
+    symbol_state.bbo_bid_size = bid_size;
+    symbol_state.bbo_ask_size = ask_size;
+}
+
+fn side_is_stale(last_update_at: Option<Instant>, stale_after: Duration) -> bool {
+    last_update_at
+        .map(|updated_at| updated_at.elapsed() > stale_after)
+        .unwrap_or(true)
+}
+
 pub fn prune_book_depth(book: &mut BTreeMap<Decimal, Decimal>, max_depth: usize, descending: bool) {
     if max_depth == 0 || book.len() <= max_depth {
         return;
@@ -743,8 +844,7 @@ fn prune_crossed_levels(
     bids: &mut BTreeMap<Decimal, Decimal>,
     asks: &mut BTreeMap<Decimal, Decimal>,
 ) {
-    let (Some((&top_bid, _)), Some((&top_ask, _))) =
-        (bids.iter().next_back(), asks.iter().next())
+    let (Some((&top_bid, _)), Some((&top_ask, _))) = (bids.iter().next_back(), asks.iter().next())
     else {
         return;
     };
@@ -769,5 +869,51 @@ fn maybe_shrink_recent_trades(trades: &mut VecDeque<RecentTrade>) {
     let capacity = trades.capacity();
     if capacity > len.saturating_mul(2).max(2_048) {
         trades.shrink_to_fit();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mid_price_and_microprice_return_none_when_either_side_is_stale() {
+        let mut symbol_state = SymbolMarketState::new(Duration::from_secs(3));
+        symbol_state.best_bid = Some(Decimal::from(99u64));
+        symbol_state.best_ask = Some(Decimal::from(101u64));
+        symbol_state.bbo_bid_size = Some(Decimal::ONE);
+        symbol_state.bbo_ask_size = Some(Decimal::ONE);
+        symbol_state.last_bid_update_at = Some(Instant::now() - Duration::from_secs(4));
+        symbol_state.last_ask_update_at = Some(Instant::now());
+
+        assert_eq!(symbol_state.mid_price(), None);
+        assert_eq!(symbol_state.microprice(), None);
+    }
+
+    #[test]
+    fn same_price_bbo_update_does_not_refresh_side_timestamps() {
+        let mut symbol_state = SymbolMarketState::new(Duration::from_secs(5));
+        let prior_bid_update = Instant::now() - Duration::from_secs(2);
+        let prior_ask_update = Instant::now() - Duration::from_secs(2);
+        symbol_state.best_bid = Some(Decimal::from(99u64));
+        symbol_state.best_ask = Some(Decimal::from(101u64));
+        symbol_state.bbo_bid_size = Some(Decimal::ONE);
+        symbol_state.bbo_ask_size = Some(Decimal::ONE);
+        symbol_state.last_bid_update_at = Some(prior_bid_update);
+        symbol_state.last_ask_update_at = Some(prior_ask_update);
+
+        apply_bbo_update(
+            &mut symbol_state,
+            Some(Decimal::from(99u64)),
+            Some(Decimal::from(101u64)),
+            Some(Decimal::from(2u64)),
+            Some(Decimal::from(3u64)),
+            Instant::now(),
+        );
+
+        assert_eq!(symbol_state.last_bid_update_at, Some(prior_bid_update));
+        assert_eq!(symbol_state.last_ask_update_at, Some(prior_ask_update));
+        assert_eq!(symbol_state.bbo_bid_size, Some(Decimal::from(2u64)));
+        assert_eq!(symbol_state.bbo_ask_size, Some(Decimal::from(3u64)));
     }
 }

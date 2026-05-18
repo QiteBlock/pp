@@ -25,7 +25,7 @@ use tokio_tungstenite::{
     connect_async,
     tungstenite::{client::IntoClientRequest, Message as WsMessage},
 };
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     adapters::{
@@ -742,21 +742,37 @@ impl OrderExecutor for HibachiClient {
                 .with_context(|| format!("missing instrument metadata for {}", request.symbol))?;
             let nonce = self.now_nonce()?;
             let signature = self.sign_order(&request, instrument, nonce)?;
+            let wire_order_flags = if request.post_only {
+                Some("POST_ONLY".to_string())
+            } else {
+                None
+            };
+            let wire_time_in_force = match request.time_in_force {
+                TimeInForce::GoodTillTime => None,
+                TimeInForce::ImmediateOrCancel => Some("IOC".to_string()),
+            };
+            info!(
+                venue = "hibachi",
+                symbol = %request.symbol,
+                side = ?request.side,
+                level_index = request.level_index,
+                order_type = ?request.order_type,
+                requested_time_in_force = ?request.time_in_force,
+                wire_time_in_force = wire_time_in_force.as_deref().unwrap_or("NONE"),
+                requested_post_only = request.post_only,
+                wire_post_only = wire_order_flags.as_deref().unwrap_or("NONE"),
+                quantity = %request.quantity,
+                price = ?request.price,
+                "placing order with adapter flags"
+            );
             payload_orders.push(CreateOrderPayload {
                 action: "place".to_string(),
                 creation_deadline: None,
                 max_fees_percent: self.config.max_fee_rate.clone(),
                 nonce,
-                order_flags: if request.post_only {
-                    Some("POST_ONLY".to_string())
-                } else {
-                    None
-                },
+                order_flags: wire_order_flags,
                 order_type: request.order_type,
-                time_in_force: match request.time_in_force {
-                    TimeInForce::GoodTillTime => None,
-                    TimeInForce::ImmediateOrCancel => Some("IOC".to_string()),
-                },
+                time_in_force: wire_time_in_force,
                 price: request.price,
                 quantity: request.quantity,
                 side: request.side,

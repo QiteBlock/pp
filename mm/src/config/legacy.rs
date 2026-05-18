@@ -47,8 +47,14 @@ impl AppConfig {
         if parsed.hedging.hyperliquid_taker_fee_rate < Decimal::ZERO {
             bail!("hedging.hyperliquid_taker_fee_rate must be non-negative");
         }
+        if parsed.risk.max_volatility_bps_to_quote < Decimal::ZERO {
+            bail!("risk.max_volatility_bps_to_quote must be non-negative");
+        }
         if parsed.runtime.reconcile_interval_ms == 0 {
             bail!("runtime.reconcile_interval_ms must be > 0");
+        }
+        if parsed.runtime.bbo_stale_secs == 0 {
+            bail!("runtime.bbo_stale_secs must be > 0");
         }
         if parsed.runtime.websocket_send_timeout_ms == 0 {
             bail!("runtime.websocket_send_timeout_ms must be > 0");
@@ -66,6 +72,11 @@ impl AppConfig {
         {
             bail!("model.price_sensitivity_scaling_factor must be within [0, 1]");
         }
+        if parsed.model.microprice_blend < Decimal::ZERO
+            || parsed.model.microprice_blend > Decimal::ONE
+        {
+            bail!("model.microprice_blend must be within [0, 1]");
+        }
         if parsed.risk.stale_position_close_slippage_cap_bps < Decimal::ZERO {
             bail!("risk.stale_position_close_slippage_cap_bps must be non-negative");
         }
@@ -76,6 +87,14 @@ impl AppConfig {
             || parsed.factors.regime_intensity_alpha > Decimal::ONE
         {
             bail!("factors.regime_intensity_alpha must be within (0, 1]");
+        }
+        if parsed.factors.asymmetric_vpin_gate < Decimal::ZERO
+            || parsed.factors.asymmetric_vpin_gate > Decimal::ONE
+        {
+            bail!("factors.asymmetric_vpin_gate must be within [0, 1]");
+        }
+        if parsed.factors.ofi_alpha_weight < Decimal::ZERO {
+            bail!("factors.ofi_alpha_weight must be non-negative");
         }
         if parsed.factors.ob_imbalance_depth > parsed.runtime.max_orderbook_depth {
             bail!(
@@ -99,6 +118,14 @@ impl AppConfig {
                     pair.symbol
                 );
             }
+            if pair.position_emergency_ratio <= Decimal::ZERO
+                || pair.position_emergency_ratio > Decimal::ONE
+            {
+                bail!(
+                    "pair {} position_emergency_ratio must be within (0, 1]",
+                    pair.symbol
+                );
+            }
             if pair.unwind_only_exit_ratio < Decimal::ZERO
                 || pair.unwind_only_exit_ratio >= pair.unwind_only_enter_ratio
             {
@@ -114,7 +141,10 @@ impl AppConfig {
                 );
             }
             if pair.flat_dust_threshold < Decimal::ZERO {
-                bail!("pair {} flat_dust_threshold must be non-negative", pair.symbol);
+                bail!(
+                    "pair {} flat_dust_threshold must be non-negative",
+                    pair.symbol
+                );
             }
             if pair.sniper_drift_threshold_bps < Decimal::ZERO {
                 bail!(
@@ -123,7 +153,10 @@ impl AppConfig {
                 );
             }
             if matches!(pair.strategy_mode, StrategyMode::Sniper) && pair.sniper_window_secs == 0 {
-                bail!("pair {} sniper_window_secs must be > 0 in sniper mode", pair.symbol);
+                bail!(
+                    "pair {} sniper_window_secs must be > 0 in sniper mode",
+                    pair.symbol
+                );
             }
         }
         Ok(())
@@ -140,6 +173,7 @@ impl AppConfig {
             },
             runtime: ParsedRuntimeConfig {
                 reconcile_interval_ms: self.runtime.reconcile_interval_ms,
+                bbo_stale_secs: self.runtime.bbo_stale_secs,
                 websocket_send_timeout_ms: self.runtime.websocket_send_timeout_ms,
                 max_orderbook_depth: self.runtime.max_orderbook_depth,
                 restore_dry_run_state: self.runtime.restore_dry_run_state,
@@ -221,6 +255,10 @@ impl AppConfig {
                     "model.fill_rate_competitive_bps",
                     &self.model.fill_rate_competitive_bps,
                 )?,
+                microprice_blend: parse_decimal(
+                    "model.microprice_blend",
+                    &self.model.microprice_blend,
+                )?,
                 vpin_widen_multiplier: parse_decimal(
                     "model.vpin_widen_multiplier",
                     &self.model.vpin_widen_multiplier,
@@ -261,6 +299,10 @@ impl AppConfig {
                 max_drawdown_usd: parse_decimal(
                     "risk.max_drawdown_usd",
                     &self.risk.max_drawdown_usd,
+                )?,
+                max_volatility_bps_to_quote: parse_decimal(
+                    "risk.max_volatility_bps_to_quote",
+                    &self.risk.max_volatility_bps_to_quote,
                 )?,
                 emergency_widening_bps: parse_decimal(
                     "risk.emergency_widening_bps",
@@ -316,6 +358,10 @@ impl AppConfig {
                 flow_imbalance_weight: parse_decimal(
                     "factors.flow_imbalance_weight",
                     &self.factors.flow_imbalance_weight,
+                )?,
+                ofi_alpha_weight: parse_decimal(
+                    "factors.ofi_alpha_weight",
+                    &self.factors.ofi_alpha_weight,
                 )?,
                 trade_velocity_alpha: parse_decimal(
                     "factors.trade_velocity_alpha",
@@ -389,6 +435,10 @@ impl AppConfig {
                     "factors.vpin_widen_threshold",
                     &self.factors.vpin_widen_threshold,
                 )?,
+                asymmetric_vpin_gate: parse_decimal(
+                    "factors.asymmetric_vpin_gate",
+                    &self.factors.asymmetric_vpin_gate,
+                )?,
             },
             hedging: ParsedHedgingConfig {
                 hyperliquid_taker_fee_rate: parse_decimal(
@@ -406,6 +456,10 @@ impl AppConfig {
                             &format!("pairs.{}.max_position_base", pair.symbol),
                             &pair.max_position_base,
                         )?,
+                        position_emergency_ratio: parse_decimal(
+                            &format!("pairs.{}.position_emergency_ratio", pair.symbol),
+                            &pair.position_emergency_ratio,
+                        )?,
                         unwind_only_enter_ratio: parse_decimal(
                             &format!("pairs.{}.unwind_only_enter_ratio", pair.symbol),
                             &pair.unwind_only_enter_ratio,
@@ -418,15 +472,14 @@ impl AppConfig {
                             &format!("pairs.{}.ioc_trigger_ratio", pair.symbol),
                             &pair.ioc_trigger_ratio,
                         )?,
-                        strategy_mode: pair
-                            .strategy_mode
-                            .parse::<StrategyMode>()
-                            .with_context(|| {
+                        strategy_mode: pair.strategy_mode.parse::<StrategyMode>().with_context(
+                            || {
                                 format!(
                                     "invalid strategy_mode for pairs.{}: {}",
                                     pair.symbol, pair.strategy_mode
                                 )
-                            })?,
+                            },
+                        )?,
                         sniper_drift_threshold_bps: parse_decimal(
                             &format!("pairs.{}.sniper_drift_threshold_bps", pair.symbol),
                             &pair.sniper_drift_threshold_bps,
@@ -481,6 +534,7 @@ pub struct ParsedVenueConfig {
 #[derive(Clone, Debug)]
 pub struct ParsedRuntimeConfig {
     pub reconcile_interval_ms: u64,
+    pub bbo_stale_secs: u64,
     pub websocket_send_timeout_ms: u64,
     pub max_orderbook_depth: usize,
     pub restore_dry_run_state: bool,
@@ -521,6 +575,8 @@ pub struct ParsedModelConfig {
     pub fill_rate_skew_threshold: Decimal,
     /// Extra competitiveness added on the slow-filling side (bps).
     pub fill_rate_competitive_bps: Decimal,
+    /// Blend weight used to mix microprice lean into the reservation price.
+    pub microprice_blend: Decimal,
     /// Spread multiplier at VPIN = 1 (linear interpolation above vpin_widen_threshold).
     pub vpin_widen_multiplier: Decimal,
     /// Funding-rate lean weight.
@@ -540,6 +596,7 @@ pub struct ParsedRiskConfig {
     pub max_abs_position_usd: Decimal,
     pub max_symbol_position_usd: Decimal,
     pub max_drawdown_usd: Decimal,
+    pub max_volatility_bps_to_quote: Decimal,
     pub emergency_widening_bps: Decimal,
     pub emergency_skew_start: Decimal,
     pub emergency_skew_max: Decimal,
@@ -561,6 +618,8 @@ pub struct ParsedFactorConfig {
     pub inventory_skew_weight: Decimal,
     pub volume_size_weight: Decimal,
     pub flow_imbalance_weight: Decimal,
+    /// Reservation-price shift in bps at full 30s OFI = 1.
+    pub ofi_alpha_weight: Decimal,
     pub trade_velocity_alpha: Decimal,
     pub trade_velocity_burst_threshold: Decimal,
     pub bbo_spread_vol_weight: Decimal,
@@ -596,6 +655,8 @@ pub struct ParsedFactorConfig {
     pub vpin_n_buckets: usize,
     /// VPIN threshold above which quotes widen.
     pub vpin_widen_threshold: Decimal,
+    /// Minimum VPIN required before asymmetric mode may become one-sided.
+    pub asymmetric_vpin_gate: Decimal,
 }
 
 #[derive(Clone, Debug)]
@@ -607,6 +668,7 @@ pub struct ParsedHedgingConfig {
 pub struct ParsedPairConfig {
     pub symbol: String,
     pub max_position_base: Decimal,
+    pub position_emergency_ratio: Decimal,
     pub unwind_only_enter_ratio: Decimal,
     pub unwind_only_exit_ratio: Decimal,
     pub ioc_trigger_ratio: Decimal,
@@ -709,6 +771,10 @@ fn default_emergency_unwind_threshold() -> String {
     "0.8".to_string()
 }
 
+fn default_max_volatility_bps_to_quote() -> String {
+    "600".to_string()
+}
+
 fn default_emergency_unwind_cycles() -> usize {
     5
 }
@@ -730,6 +796,10 @@ fn default_stale_position_close_slippage_cap_bps() -> String {
 }
 
 fn default_empty_quote_alert_cycles() -> usize {
+    5
+}
+
+fn default_bbo_stale_secs() -> u64 {
     5
 }
 
@@ -797,12 +867,20 @@ fn default_microprice_weight() -> String {
     "1.0".to_string()
 }
 
+fn default_microprice_blend() -> String {
+    "0.3".to_string()
+}
+
 fn default_vpin_bucket_size() -> String {
     "0".to_string()
 }
 
 fn default_vpin_n_buckets() -> usize {
     20
+}
+
+fn default_asymmetric_vpin_gate() -> String {
+    "0.7".to_string()
 }
 
 fn default_fill_rate_window_secs() -> String {
@@ -813,8 +891,16 @@ fn default_fill_rate_skew_threshold() -> String {
     "3.0".to_string()
 }
 
+fn default_ofi_alpha_weight() -> String {
+    "10.0".to_string()
+}
+
 fn default_unwind_only_enter_ratio() -> String {
     "0.75".to_string()
+}
+
+fn default_position_emergency_ratio() -> String {
+    "0.85".to_string()
 }
 
 fn default_unwind_only_exit_ratio() -> String {
@@ -859,6 +945,8 @@ pub struct RuntimeConfig {
     pub reconcile_interval_ms: u64,
     pub generation_min_interval_ms: u64,
     pub stale_market_data_ms: i64,
+    #[serde(default = "default_bbo_stale_secs")]
+    pub bbo_stale_secs: u64,
     #[serde(default = "default_websocket_send_timeout_ms")]
     pub websocket_send_timeout_ms: u64,
     #[serde(default = "default_max_orderbook_depth")]
@@ -936,6 +1024,8 @@ pub struct ModelConfig {
     /// Extra spread competitiveness added on the slow-filling side when skew triggers (bps).
     #[serde(default = "default_zero_string")]
     pub fill_rate_competitive_bps: String,
+    #[serde(default = "default_microprice_blend")]
+    pub microprice_blend: String,
     /// Spread multiplier applied when VPIN ≥ vpin_widen_threshold (at VPIN=1). 1 = disabled.
     #[serde(default = "default_one_string")]
     pub vpin_widen_multiplier: String,
@@ -963,6 +1053,8 @@ pub struct RiskConfig {
     pub max_abs_position_usd: String,
     pub max_symbol_position_usd: String,
     pub max_drawdown_usd: String,
+    #[serde(default = "default_max_volatility_bps_to_quote")]
+    pub max_volatility_bps_to_quote: String,
     pub max_open_orders: usize,
     pub emergency_widening_bps: String,
     #[serde(default = "default_zero_string")]
@@ -1007,6 +1099,8 @@ pub struct FactorConfig {
     pub volume_size_weight: String,
     #[serde(default = "default_zero_string")]
     pub flow_imbalance_weight: String,
+    #[serde(default = "default_ofi_alpha_weight")]
+    pub ofi_alpha_weight: String,
     #[serde(default = "default_zero_string")]
     pub trade_velocity_alpha: String,
     #[serde(default = "default_zero_string")]
@@ -1060,6 +1154,8 @@ pub struct FactorConfig {
     /// VPIN level above which spreads widen by `vpin_widen_multiplier`. 0 = disabled.
     #[serde(default = "default_zero_string")]
     pub vpin_widen_threshold: String,
+    #[serde(default = "default_asymmetric_vpin_gate")]
+    pub asymmetric_vpin_gate: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1087,6 +1183,8 @@ pub struct PairConfig {
     pub symbol: String,
     pub enabled: bool,
     pub max_position_base: String,
+    #[serde(default = "default_position_emergency_ratio")]
+    pub position_emergency_ratio: String,
     #[serde(default = "default_unwind_only_enter_ratio")]
     pub unwind_only_enter_ratio: String,
     #[serde(default = "default_unwind_only_exit_ratio")]
